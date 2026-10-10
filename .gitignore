@@ -4,3 +4,4 @@
 /fuzz/corpus/
 /fuzz/Cargo.lock
 /local/
+/scripts/__pycache__/

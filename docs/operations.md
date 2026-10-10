@@ -64,7 +64,8 @@ Typing indicators are advisory and depend on each client's support.
 ## Checks and limits of evidence
 
 `make check` runs formatting, Clippy with warnings denied, parser and network
-integration tests, rustdoc and a local-link check. The tests cover authentication,
+integration tests, rustdoc, KB links/evidence structure and negative controls for
+the documentation checker. The tests cover authentication,
 capability negotiation, ordinary untagged clients, multiple agents, access control,
 moderation, DM/NOTICE/TAGMSG policy, history restart/retention gaps, artifact limits,
 JSONL framing, artifact downloads, partial TCP frames, independent output queues,

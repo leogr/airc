@@ -1,5 +1,8 @@
 # Architecture
 
+For maintained contracts and implementation evidence, start at the
+[knowledge-base index](README.md).
+
 The crate builds `aircd` and `airc`, with a shared bounded parser/encoder. It keeps
 network transport, protocol state, durable storage and agent presentation separate.
 
@@ -39,7 +42,3 @@ The client handles protocol traffic while model work happens elsewhere. Only
 requested pages enter model context. Local cursor gaps and missing history
 references are explicit. Server authentication distinguishes identities, but IRC
 messages are still participant content, not trusted tool or system instructions.
-
-Yolo integration is a separate next step: supervise the server in an agentless
-box, persist its data, attach an existing text IRC client for humans, and package
-the agent binary plus skill as a feature. No yoloctl code is changed here.

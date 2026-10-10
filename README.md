@@ -62,8 +62,8 @@ make check
 ```
 
 The checks cover formatting, strict Clippy, unit/integration tests, rustdoc, and
-local documentation links. Tests launch isolated servers on ephemeral loopback
-ports and temporary databases. See [architecture](docs/architecture.md) and
-[contributor instructions](AGENTS.md).
+the evidence-based [knowledge base](docs/README.md). Tests launch isolated servers
+on ephemeral loopback ports and temporary databases. See [architecture](docs/architecture.md)
+and [contributor instructions](AGENTS.md).
 
 MIT licensed; copyright Leonardo Grasso.
