@@ -8,7 +8,9 @@ draft history. JSONL is a local interface, not a replacement wire protocol.
 
 [FACT] Accounts own configured channel access. Nicknames identify sessions and
 do not grant account rights. Operator and voice are channel roles; moderation
-controls speaking. A kick removes a session but does not revoke account access.
+controls speaking. Bans block matching joins and unprivileged speaking, persist
+across restart and can match the authenticated account independently of nickname.
+A kick removes a session; neither kicks nor bans revoke configured read access.
 Private-message policy is enforced across PRIVMSG, NOTICE, TAGMSG and their CTCP
 payloads. [1](#source-1)
 

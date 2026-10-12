@@ -1,8 +1,8 @@
-use super::Event;
+use super::{Event, ban};
 use crate::{
     config::Config,
     protocol::{Message, fold, valid_nick},
-    store::{Record, Store},
+    store::{Ban, Record, Store},
 };
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -48,6 +48,7 @@ struct Channel {
     name: String,
     moderated: bool,
     topic: String,
+    bans: BTreeMap<String, Ban>,
     members: BTreeMap<u64, Role>,
 }
 
@@ -65,12 +66,23 @@ impl State {
         for c in &config.channels {
             let key = fold(&c.name);
             let (moderated, topic) = store.channel(&key)?;
+            let bans = store.bans(&key, ban::MAX_BANS)?;
+            for entry in &bans {
+                ensure!(
+                    ban::normalize(&entry.mask).as_deref() == Some(entry.mask.as_str()),
+                    "invalid stored ban mask"
+                );
+            }
             channels.insert(
                 key,
                 Channel {
                     name: c.name.clone(),
                     moderated,
                     topic,
+                    bans: bans
+                        .into_iter()
+                        .map(|entry| (entry.mask.clone(), entry))
+                        .collect(),
                     members: BTreeMap::new(),
                 },
             );
@@ -392,7 +404,7 @@ impl State {
                 &self.config.server_name.clone(),
                 env!("CARGO_PKG_VERSION"),
                 "+",
-                "mnotv",
+                "bmnotv",
             ],
         );
         self.numeric(
@@ -402,7 +414,8 @@ impl State {
                 "CHANTYPES=#",
                 "CASEMAPPING=rfc1459",
                 "PREFIX=(ov)@+",
-                "CHANMODES=,,,mnt",
+                "CHANMODES=b,,,mnt",
+                &format!("MAXLIST=b:{}", ban::MAX_BANS),
                 "NICKLEN=24",
                 "CHANNELLEN=48",
                 "UTF8ONLY",
@@ -566,8 +579,12 @@ impl State {
             self.numeric(id, "403", &[name, "No accessible channel"]);
             return;
         }
-        let c = self.channels.get_mut(&key).unwrap();
+        let c = &self.channels[&key];
         if c.members.contains_key(&id) {
+            return;
+        }
+        if self.banned(id, &key) {
+            self.numeric(id, "474", &[name, "Cannot join channel (+b)"]);
             return;
         }
         let op = self
@@ -578,6 +595,7 @@ impl State {
             .unwrap()
             .operators
             .contains(&account);
+        let c = self.channels.get_mut(&key).unwrap();
         c.members.insert(id, Role { op, voice: false });
         let name = c.name.clone();
         let peers = c.members.keys().copied().collect::<Vec<_>>();
@@ -609,6 +627,21 @@ impl State {
             self.numeric(id, "442", &[name, "You are not on that channel"]);
             false
         }
+    }
+
+    fn banned(&self, id: u64, channel: &str) -> bool {
+        let prefix = self.prefix(id);
+        self.channels[channel]
+            .bans
+            .keys()
+            .any(|mask| ban::matches(mask, &prefix))
+    }
+
+    fn may_speak(&self, id: u64, channel: &str) -> bool {
+        let c = &self.channels[channel];
+        c.members
+            .get(&id)
+            .is_some_and(|r| r.op || r.voice || (!c.moderated && !self.banned(id, channel)))
     }
     fn operator(&mut self, id: u64, name: &str) -> bool {
         if !self.member(id, name) {
@@ -719,11 +752,7 @@ impl State {
                 }
                 return Ok(());
             };
-            if !c
-                .members
-                .get(&id)
-                .is_some_and(|r| !c.moderated || r.op || r.voice)
-            {
+            if !self.may_speak(id, &key) {
                 if !notice {
                     self.numeric(id, "404", &[&target, "Cannot send to channel"]);
                 }
@@ -786,9 +815,6 @@ impl State {
             self.numeric(id, "324", &[&name, modes]);
             return Ok(());
         }
-        if !self.operator(id, &name) {
-            return Ok(());
-        }
         let mut adding = true;
         let mut index = 2;
         for mode in p[1].chars() {
@@ -804,11 +830,75 @@ impl State {
                 'n' | 't' if adding => continue,
                 _ => {}
             }
+            if mode == 'b' && p.get(index).is_none() {
+                let bans = self.channels[&key]
+                    .bans
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for entry in bans {
+                    self.numeric(
+                        id,
+                        "367",
+                        &[&name, &entry.mask, &entry.set_by, &entry.set_at.to_string()],
+                    );
+                }
+                self.numeric(id, "368", &[&name, "End of channel ban list"]);
+                continue;
+            }
+            if !self.operator(id, &name) {
+                return Ok(());
+            }
             let mut params = vec![
                 name.clone(),
                 format!("{}{mode}", if adding { '+' } else { '-' }),
             ];
             match mode {
+                'b' => {
+                    let raw = &p[index];
+                    index += 1;
+                    let Some(mask) = ban::normalize(raw) else {
+                        self.numeric(
+                            id,
+                            "696",
+                            &[
+                                &name,
+                                "b",
+                                "*",
+                                "Invalid ban mask (maximum 200 ASCII bytes)",
+                            ],
+                        );
+                        continue;
+                    };
+                    let exists = self.channels[&key].bans.contains_key(&mask);
+                    if adding {
+                        if exists {
+                            continue;
+                        }
+                        if self.channels[&key].bans.len() >= ban::MAX_BANS {
+                            self.numeric(id, "478", &[&name, &mask, "Channel ban list is full"]);
+                            continue;
+                        }
+                        let entry = Ban {
+                            mask: mask.clone(),
+                            set_by: self.prefix(id),
+                            set_at: chrono::Utc::now().timestamp(),
+                        };
+                        self.store.add_ban(&key, &entry)?;
+                        self.channels
+                            .get_mut(&key)
+                            .unwrap()
+                            .bans
+                            .insert(mask.clone(), entry);
+                    } else {
+                        if !exists {
+                            continue;
+                        }
+                        self.store.remove_ban(&key, &mask)?;
+                        self.channels.get_mut(&key).unwrap().bans.remove(&mask);
+                    }
+                    params.push(mask);
+                }
                 'm' => {
                     let c = &self.channels[&key];
                     self.store.set_channel(&key, adding, &c.topic)?;
@@ -1173,9 +1263,9 @@ impl State {
         let sender = c
             .members
             .iter()
-            .find(|(id, r)| {
+            .find(|(id, _)| {
                 self.clients[id].account.as_deref() == Some(account)
-                    && (!c.moderated || r.op || r.voice)
+                    && self.may_speak(**id, &channel)
             })
             .map(|(id, _)| *id)
             .ok_or_else(|| {

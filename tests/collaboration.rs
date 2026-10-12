@@ -725,3 +725,264 @@ async fn client_quit_exits_with_stdin_still_open() {
     drop(input);
     server.shutdown().await.unwrap();
 }
+
+async fn ban_list(peer: &mut Peer, mode: &str) -> Vec<Message> {
+    peer.send(&format!("MODE #work {mode}")).await;
+    let mut entries = Vec::new();
+    loop {
+        let message = peer.next().await;
+        match message.command.as_str() {
+            "367" => entries.push(message),
+            "368" => return entries,
+            error if error.starts_with(['4', '5', '6']) => {
+                panic!("ban query failed: {message:?}");
+            }
+            _ => {}
+        }
+        assert!(entries.len() <= 100);
+    }
+}
+
+#[tokio::test]
+async fn ban_lists_are_member_readable_operator_mutable_and_bounded() {
+    let fixture = Fixture::new();
+    let server = fixture.start().await;
+    let mut human = Peer::login(&server, "human", false).await;
+    let support = human.until("005").await;
+    assert!(support.params.contains(&"CHANMODES=b,,,mnt".into()));
+    assert!(support.params.contains(&"MAXLIST=b:100".into()));
+    human.join().await;
+    let mut alice = Peer::login(&server, "alice", false).await;
+    alice.send("MODE #work b").await;
+    alice.until("442").await; // Even an authorized account must join first.
+    alice.join().await;
+    for mode in ["b", "+b", "-b"] {
+        assert!(ban_list(&mut alice, mode).await.is_empty());
+    }
+    for mode in ["+b", "-b"] {
+        alice.send(&format!("MODE #work {mode} *!bob@airc")).await;
+        alice.until("482").await;
+    }
+    human.send("MODE #work +b BoB").await;
+    assert_eq!(human.until("MODE").await.params, ["#work", "+b", "bob!*@*"]);
+    let entries = ban_list(&mut alice, "b").await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        &entries[0].params[1..4],
+        ["#work", "bob!*@*", "human!human@airc"]
+    );
+    assert!(entries[0].params[4].parse::<i64>().unwrap() > 0);
+    human.send("MODE #work +b BOB!*@*").await; // Duplicate, preserving setter/time.
+    let unchanged = ban_list(&mut human, "b").await;
+    assert_eq!(unchanged[0].params[1..], entries[0].params[1..]);
+    human.send("MODE #work -b BOB").await;
+    human.until("MODE").await;
+    assert!(ban_list(&mut human, "b").await.is_empty());
+
+    for mask in ["$a:alice".to_owned(), "a".repeat(201), "a!b!c".to_owned()] {
+        human.send(&format!("MODE #work +b {mask}")).await;
+        human.until("696").await;
+    }
+    for n in 0..100 {
+        human.send(&format!("MODE #work +b absent{n}")).await;
+        human.until("MODE").await;
+    }
+    human.send("MODE #work +b overflow").await;
+    human.until("478").await;
+    assert_eq!(ban_list(&mut human, "b").await.len(), 100);
+    human.send("MODE #work -b absent0").await;
+    human.until("MODE").await;
+    human.send("MODE #work +b replacement").await;
+    human.until("MODE").await;
+    assert_eq!(ban_list(&mut human, "b").await.len(), 100);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bans_enforce_join_speech_and_upload_without_revoking_account_reads() {
+    let fixture = Fixture::new();
+    let server = fixture.start().await;
+    let mut human = Peer::login(&server, "human", true).await;
+    human.join().await;
+    let mut alice = Peer::login(&server, "alice", true).await;
+    alice.join().await;
+    let http = reqwest::Client::new();
+    let endpoint = format!(
+        "http://{}/v1/channels/%23work/artifacts",
+        server.artifact_address.unwrap()
+    );
+    let upload = || {
+        http.post(&endpoint)
+            .basic_auth("alice", Some(TOKEN))
+            .header("x-airc-filename", "result.txt")
+            .body("test result")
+            .send()
+    };
+    human.send("MODE #work +b *!alice@airc").await;
+    human.until("MODE").await;
+    alice.until("MODE").await;
+    alice.send("NICK renamed").await;
+    alice.until("NICK").await;
+    for line in ["PRIVMSG #work :blocked", "@+typing=active TAGMSG #work"] {
+        alice.send(line).await;
+        alice.until("404").await;
+    }
+    alice.send("NOTICE #work :silent denial").await;
+    alice.send("PING :notice barrier").await;
+    assert_eq!(alice.next().await.command, "PONG");
+    assert_eq!(upload().await.unwrap().status(), 403);
+    assert!(
+        human
+            .history("CHATHISTORY LATEST #work * 100")
+            .await
+            .is_empty()
+    );
+
+    // A list ban does not kick existing members. Voice/operator exemptions
+    // follow IRC, and the same speaking decision gates HTTP announcements.
+    human.send("MODE #work +v renamed").await;
+    human.until("MODE").await;
+    alice.until("MODE").await;
+    alice.send("PRIVMSG #work :voiced").await;
+    assert_eq!(alice.until("PRIVMSG").await.params[1], "voiced");
+    let response = upload().await.unwrap();
+    assert_eq!(response.status(), 201);
+    let value: serde_json::Value = response.json().await.unwrap();
+    let url = value["url"].as_str().unwrap();
+    human.send("MODE #work -v+o renamed renamed").await;
+    human.until("MODE").await;
+    human.until("MODE").await;
+    alice.until("MODE").await;
+    alice.until("MODE").await;
+    alice.send("PRIVMSG #work :operator").await;
+    loop {
+        if alice.until("PRIVMSG").await.params[1] == "operator" {
+            break;
+        }
+    }
+    human.send("KICK #work renamed :leave").await;
+    human.until("KICK").await;
+    alice.until("KICK").await;
+    alice.send("JOIN #work").await;
+    alice.until("474").await;
+    assert_eq!(upload().await.unwrap().status(), 403);
+    assert_eq!(
+        http.get(url)
+            .basic_auth("alice", Some(TOKEN))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    human.send("MODE #work -b *!ALICE@airc").await;
+    human.until("MODE").await;
+    alice.join().await;
+    alice.send("PRIVMSG #work :allowed again").await;
+    assert_eq!(alice.until("PRIVMSG").await.params[1], "allowed again");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn ban_metadata_and_removal_survive_restart() {
+    let fixture = Fixture::new();
+    let server = fixture.start().await;
+    let mut human = Peer::login(&server, "human", false).await;
+    human.join().await;
+    human.send("MODE #work +b *!alice@airc").await;
+    human.until("MODE").await;
+    let entries = ban_list(&mut human, "b").await;
+    server.shutdown().await.unwrap();
+    let server = fixture.start().await;
+    let mut human = Peer::login(&server, "human", false).await;
+    human.join().await;
+    assert_eq!(ban_list(&mut human, "b").await[0].params, entries[0].params);
+    let mut alice = Peer::login(&server, "alice", false).await;
+    alice.send("JOIN #work").await;
+    alice.until("474").await;
+    human.send("MODE #work -b *!alice@airc").await;
+    human.until("MODE").await;
+    server.shutdown().await.unwrap();
+    let server = fixture.start().await;
+    let mut alice = Peer::login(&server, "alice", false).await;
+    alice.join().await;
+    assert!(ban_list(&mut alice, "b").await.is_empty());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn schema_one_migrates_without_losing_state_and_newer_versions_are_refused() {
+    let fixture = Fixture::new();
+    let database = &fixture.config.database;
+    {
+        // Original schema, before the ban table existed.
+        let db = rusqlite::Connection::open(database).unwrap();
+        db.execute_batch(
+            "CREATE TABLE messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, channel TEXT NOT NULL, time TEXT NOT NULL, message TEXT NOT NULL);
+             CREATE TABLE channels (name TEXT PRIMARY KEY, moderated INTEGER NOT NULL, topic TEXT NOT NULL DEFAULT '');
+             CREATE TABLE artifacts (id TEXT PRIMARY KEY, channel TEXT NOT NULL, filename TEXT NOT NULL, data BLOB NOT NULL, time TEXT NOT NULL);
+             INSERT INTO channels VALUES ('#work', 1, 'retained topic');
+             PRAGMA user_version=1;"
+        ).unwrap();
+        let time = chrono::Utc::now().to_rfc3339();
+        let mut message = Message::new("PRIVMSG", ["#work", "retained message"]);
+        message.prefix = Some("alice!alice@airc".into());
+        message.tags.insert("msgid".into(), "old-message".into());
+        message.tags.insert("time".into(), time.clone());
+        db.execute(
+            "INSERT INTO messages(id,channel,time,message) VALUES ('old-message','#work',?1,?2)",
+            rusqlite::params![time, serde_json::to_string(&message).unwrap()],
+        )
+        .unwrap();
+        db.execute("INSERT INTO artifacts VALUES ('12345678-1234-4234-8234-123456789012','#work','old.txt',?1,?2)", rusqlite::params![b"retained bytes", time]).unwrap();
+    }
+    let server = fixture.start().await;
+    let mut human = Peer::login(&server, "human", true).await;
+    human.send("JOIN #work").await;
+    assert_eq!(human.until("332").await.params[2], "retained topic");
+    human.until("366").await;
+    human.send("MODE #work").await;
+    assert_eq!(human.until("324").await.params[2], "+mnt");
+    let messages = human.history("CHATHISTORY LATEST #work * 100").await;
+    assert_eq!(messages[0].params[1], "retained message");
+    assert_eq!(messages[0].tags["msgid"], "old-message");
+    let url = format!(
+        "http://{}/v1/artifacts/12345678-1234-4234-8234-123456789012",
+        server.artifact_address.unwrap()
+    );
+    let artifact = reqwest::Client::new()
+        .get(url)
+        .basic_auth("alice", Some(TOKEN))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(artifact.status(), 200);
+    assert_eq!(artifact.bytes().await.unwrap(), "retained bytes");
+    assert!(ban_list(&mut human, "b").await.is_empty());
+    server.shutdown().await.unwrap();
+    {
+        let db = rusqlite::Connection::open(database).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        db.execute_batch("PRAGMA user_version=3;").unwrap();
+    }
+    let error = server::start(fixture.config.clone())
+        .await
+        .err()
+        .expect("newer schema was accepted");
+    assert!(error.to_string().contains("schema is newer"), "{error:#}");
+    let db = rusqlite::Connection::open(database).unwrap();
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}

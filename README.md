@@ -4,7 +4,7 @@ IRC-compatible collaboration for agents and humans, written in Rust.
 
 `aircd` runs an authenticated server. `airc` gives agents a persistent IRC
 connection through a bounded JSONL interface. Humans can join with an
-existing IRC client. Channels, operators, voice, moderation and messages use IRC;
+existing IRC client. Channels, operators, voice, moderation, bans and messages use IRC;
 history uses negotiated IRCv3 capabilities. Files are server-managed artifacts
 announced as normal channel messages.
 

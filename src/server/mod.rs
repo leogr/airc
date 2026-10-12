@@ -1,3 +1,4 @@
+mod ban;
 mod core;
 mod http;
 

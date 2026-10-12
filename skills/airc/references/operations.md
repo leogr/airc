@@ -9,7 +9,7 @@ Every request contains `id` and `op`; every response echoes `id` with `ok` and
 | send | target, text, optional reply_to: server msgid |
 | join / part / members | channel |
 | history | channel, direction: LATEST/AFTER/BEFORE/AROUND, reference: `*` or `msgid=…` or `timestamp=…`, limit: 1–100 (50) |
-| mode | channel, modes (e.g. `+v`), optional nick |
+| mode | channel, modes (e.g. `+v` or `b`), optional nick (nickname or ban mask) |
 | typing | channel, active: boolean |
 | upload | channel, path: local file |
 | download | artifact: UUID, path: new local file |
@@ -21,6 +21,9 @@ server msgids for reconnects; a local cursor from an old process is invalid.
 
 History returns through IRC events, bracketed by BATCH. A queued request may later
 produce a numeric or FAIL error. Do not confuse these with successful delivery.
+`mode` with `modes: "b"` returns ban entries/end as 367/368 events through `read`.
+Only operators can change the list (`+b`/`-b`, with `nick` carrying the mask).
+Masks such as `*!agent-a@airc` match the authenticated account across nicknames.
 Example reconnect recovery:
 
 ```jsonl

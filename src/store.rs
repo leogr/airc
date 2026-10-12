@@ -22,6 +22,13 @@ pub struct Artifact {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone)]
+pub struct Ban {
+    pub mask: String,
+    pub set_by: String,
+    pub set_at: i64,
+}
+
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -39,7 +46,7 @@ impl Store {
         let mut db = Connection::open(&config.database)?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 1, "database schema is newer than this binary");
+        ensure!(version <= 2, "database schema is newer than this binary");
         db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction()?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, channel TEXT NOT NULL, time TEXT NOT NULL, message TEXT NOT NULL);
@@ -47,7 +54,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS channels (name TEXT PRIMARY KEY, moderated INTEGER NOT NULL, topic TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, channel TEXT NOT NULL, filename TEXT NOT NULL, data BLOB NOT NULL, time TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS artifacts_channel ON artifacts(channel, time);
-            PRAGMA user_version=1;")?;
+            CREATE TABLE IF NOT EXISTS bans (channel TEXT NOT NULL REFERENCES channels(name), mask TEXT NOT NULL, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, PRIMARY KEY(channel, mask));
+            PRAGMA user_version=2;")?;
         for c in &config.channels {
             tx.execute(
                 "INSERT OR IGNORE INTO channels(name, moderated) VALUES (?1, ?2)",
@@ -74,6 +82,38 @@ impl Store {
         self.db.execute(
             "UPDATE channels SET moderated=?2, topic=?3 WHERE name=?1",
             params![name, moderated, topic],
+        )?;
+        Ok(())
+    }
+
+    pub fn bans(&self, channel: &str, limit: usize) -> Result<Vec<Ban>> {
+        let mut statement = self.db.prepare(
+            "SELECT mask,set_by,set_at FROM bans WHERE channel=?1 ORDER BY mask LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![channel, (limit + 1) as i64], |r| {
+            Ok(Ban {
+                mask: r.get(0)?,
+                set_by: r.get(1)?,
+                set_at: r.get(2)?,
+            })
+        })?;
+        let bans = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(bans.len() <= limit, "stored channel ban list exceeds limit");
+        Ok(bans)
+    }
+
+    pub fn add_ban(&self, channel: &str, ban: &Ban) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO bans(channel,mask,set_by,set_at) VALUES (?1,?2,?3,?4)",
+            params![channel, ban.mask, ban.set_by, ban.set_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_ban(&self, channel: &str, mask: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM bans WHERE channel=?1 AND mask=?2",
+            params![channel, mask],
         )?;
         Ok(())
     }

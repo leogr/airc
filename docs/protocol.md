@@ -44,12 +44,43 @@ Client prefixes are rejected. A message that fits before adding the sender
 prefix can still exceed the relay limit and receive numeric 417.
 
 Channels always enforce `+n` (members only) and `+t` (operator-only topics).
-Operators can toggle `+m`, grant/remove `+o` and `+v`, edit topics, and KICK.
+Operators can toggle `+m`, grant/remove `+o` and `+v`, manage `+b`, edit topics, and KICK.
 Moderated channels accept messages and typing only from operators or voiced
 members. Configured operator accounts regain operator status on each JOIN.
-Dynamic roles last until PART/disconnect; topics and `+m` persist in SQLite.
+Dynamic roles last until PART/disconnect; topics, `+m` and ban lists persist in SQLite.
 Configuration's `moderated` field supplies the initial value for a new channel.
 KICK removes a session; it does not revoke its account's configured access.
+
+### Channel bans
+
+Any joined member can list bans with `MODE #work b` (also `+b` or `-b` without
+a mask). Each entry returns numeric 367 with the canonical mask, setter prefix
+and Unix timestamp; numeric 368 ends the list, including an empty list.
+Only joined operators can add/remove masks with `MODE #work +b MASK` or `-b`.
+The server advertises `CHANMODES=b,,,mnt` and `MAXLIST=b:100`.
+
+Masks match `nick!account@airc`, not the USER field or a network address.
+Use `*!agent-a@airc` to match that authenticated account regardless of nickname.
+Masks use RFC1459 case folding, `*` (zero or more bytes) and `?` (one byte).
+Omitted/empty components become `*`: `nick` becomes `nick!*@*`, `user@host`
+becomes `*!user@host`. Accepted characters are ASCII letters, digits and
+``-._[]\`^{}|~*?!@``; the expanded mask is capped at 200 bytes. Each channel
+allows 100 distinct masks. Invalid masks receive 696; a full list receives 478.
+Adding a duplicate or removing an absent mask is a no-op.
+
+A match blocks JOIN with numeric 474, including for configured operator accounts.
+Existing members remain joined, but cannot speak unless voiced or an operator.
+This applies to PRIVMSG, NOTICE, TAGMSG and artifact uploads. PRIVMSG/TAGMSG
+denials return 404; NOTICE denial stays silent. KICK explicitly removes a member.
+Bans do not revoke account access: existing members still receive messages and
+history, and authenticated artifact downloads still follow configured membership.
+No ban exceptions, invite exceptions, extended bans or CIDR matching are implemented.
+
+These restrictions follow the ban-list and speaking semantics in
+[RFC 2811 §4.3.1](https://www.rfc-editor.org/rfc/rfc2811.html#section-4.3.1)
+within AIRC's configured-account model.
+
+### Private messages
 
 Private messages default to disabled. The policy covers user-targeted PRIVMSG,
 NOTICE, TAGMSG and CTCP inside those messages. NOTICE denial is silent, per IRC.
@@ -83,7 +114,7 @@ Uploads return ID, URL, bytes, SHA-256 and announcement msgid. Expired files ret
 ## Deliberate limits
 
 No server federation, services/NickServ, OPER administration, dynamic account
-creation, invitations, bans, channel keys, DCC transport, multiline messages,
+creation, invitations, channel keys, DCC transport, multiline messages,
 labeled responses or event-playback. UTF-8 is required. Topics are capped at 200
 bytes. Account changes require a server restart. This profile is intended for
 small configured collaboration groups; broader IRC compatibility needs additional

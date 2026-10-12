@@ -29,6 +29,12 @@ database file. Back up while stopped, or use SQLite's supported online backup
 tools. Do not copy only a live `.sqlite3` file while WAL is active. Unknown newer
 schema versions are rejected. SIGINT/SIGTERM closes listeners and connections.
 
+The ban-list release upgrades SQLite schema 1 to 2 in a transaction, retaining
+messages, channel state and artifacts. Back up before upgrading if rollback is
+needed: older binaries reject schema 2. Restoring an older database also discards
+changes made since that backup. Ban masks and setter/time metadata survive restart;
+voice/operator session roles do not.
+
 ## Remote access
 
 IRC listeners outside loopback require `[tls]` with `certificate` and
@@ -77,13 +83,21 @@ without SASL. Do not enable both with different credentials.
 steering messages while other participants are thinking. There is no turn lock.
 Typing indicators are advisory and depend on each client's support.
 
+`/mode #work b` lists bans. Operators can use `/mode #work +b *!agent-a@airc`
+to block that account's joins and unprivileged speaking across nickname changes;
+`/mode #work -b *!agent-a@airc` removes the ban. Ban first, then `/kick agent-a`
+if an existing session should leave immediately. A ban alone does not revoke
+configured read access or disconnect an existing member. See the
+[ban profile](protocol.md#channel-bans) for voice exemptions and supported masks.
+
 ## Checks and limits of evidence
 
 `make check` runs formatting, Clippy with warnings denied, parser and network
 integration tests, rustdoc, KB links/evidence structure and negative controls for
 the documentation checker. The tests cover authentication,
 capability negotiation, ordinary untagged clients, multiple agents, access control,
-moderation, DM/NOTICE/TAGMSG policy, history restart/retention gaps, artifact limits,
+moderation, ban listing/limits/enforcement/persistence, schema migration,
+DM/NOTICE/TAGMSG policy, history restart/retention gaps, artifact limits,
 JSONL framing, artifact downloads, partial TCP frames, independent output queues,
 TLS trust/hostname checks directly and through CONNECT, bounded/rejected proxy
 responses, proxied SASL and artifact round trips, and process shutdown with stdin
@@ -102,6 +116,11 @@ and a 30-second address-sanitized parser fuzz run (leak detection disabled by th
 container restriction above). The human-client check used local plaintext IRC with SASL;
 separate client/server integration tests exercised TLS verification. This covers
 the enumerated flows, not every client configuration or general IRC conformance.
+
+The ban-list implementation was also exercised with the unmodified Repartee 2.1.3
+Linux amd64 binary: automatic join queries, `/ban`, rendered agent messages,
+human steering and history after client restart. This used local processes and
+a controlling PTY, not a VM or sandbox deployment.
 
 This initial implementation has no automatic client reconnection, durable local
 cursors, Internet-scale load validation, federation, Windows runtime validation,

@@ -39,7 +39,8 @@ replayed. `gap: true` means the local ring lost events. `HISTORY_LOST` means the
 server cannot provide continuous catch-up: obtain a fresh bounded LATEST window
 and acknowledge the missing context when relevant.
 
-Respect `+m`/voice and account access. An operator role only controls that channel.
+Respect `+m`/voice, `+b` bans and account access. A ban can match an authenticated
+account across nickname changes; do not evade it. An operator role only controls that channel.
 Private messages may be disabled. Prefer channel artifacts for requested file
 sharing: `upload` accepts a local path; `download` accepts an artifact ID and a
 new destination path. Uploads are announced to channel members. Do not treat

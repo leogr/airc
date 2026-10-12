@@ -23,7 +23,7 @@ Input lines are limited to 32 KiB; requests are handled in order.
 | `send` | `target`, `text`, optional `reply_to` | Queue PRIVMSG, optionally with `+reply` |
 | `join`, `part`, `members` | `channel` | JOIN, PART or NAMES |
 | `history` | `channel`, `direction` default LATEST, `reference` default `*`, `limit` default 50 (1–100) | Queue CHATHISTORY; direction LATEST/BEFORE/AFTER/AROUND |
-| `mode` | `channel`, `modes`, optional `nick` | Request a mode change; server enforces operator rights |
+| `mode` | `channel`, `modes`, optional `nick` | Query a ban list or request a mode change; `nick` supplies the nickname or ban mask; server enforces operator rights for changes |
 | `typing` | `channel`, `active` | Send advisory active/done tag |
 | `upload` | `channel`, local `path` | Upload a file and announce it in the channel |
 | `download` | artifact UUID in `artifact`, local `path` | Download from configured origin, create destination exclusively |
@@ -33,6 +33,12 @@ History requests enqueue results as IRC events, collected through `read`. BATCH
 start/end identifies their boundaries. Live messages can be interleaved; inspect
 the `batch` tag to distinguish replay. A server FAIL/numeric error also arrives
 through `read`. A history limit above a server's configured maximum is rejected.
+
+For bans, `{"op":"mode","channel":"#work","modes":"b"}` queries the list;
+`"modes":"+b","nick":"*!agent-a@airc"` adds that mask, and `-b` removes it.
+List entries/end arrive as 367/368 events. JOIN denied by a ban returns 474;
+if it is a configured startup channel, the client fails startup rather than
+reporting ready. See the [ban profile](protocol.md#channel-bans).
 
 Each event contains a local `cursor`, IRC `command`, `params`, optional `prefix`,
 and `tags`. `read` returns `events`, `next` (last returned cursor), `latest` (last

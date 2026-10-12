@@ -9,7 +9,7 @@ working rules are in [AGENTS.md](../AGENTS.md).
 
 | Question | Entry spec | Implementation evidence |
 |---|---|---|
-| What can an authenticated participant see or send, and what remains ordinary IRC? | [Collaboration](specs/collaboration.md) | [Protocol and permissions](digests/protocol.md) |
+| What can an authenticated participant see or send; how do moderation and bans work? | [Collaboration](specs/collaboration.md) | [Protocol and permissions](digests/protocol.md) |
 | What persists, what expires, and how are credentials and artifacts protected? | [Runtime](specs/runtime.md) | [Storage and transport](digests/storage.md) |
 | How does an agent connect through a proxy, catch up, notice steering or recover a gap? | [Collaboration](specs/collaboration.md), [runtime](specs/runtime.md) | [Agent client](digests/agent-client.md) |
 
