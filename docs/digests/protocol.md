@@ -43,5 +43,5 @@ alone does not establish a live run. [7](#source-7) [8](#source-8)
 4. <a id="source-4"></a> [src/server/core.rs](../../src/server/core.rs#L670-L767) — `chat`.
 5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L178-L191) — `send` capability filtering and queue failure.
 6. <a id="source-6"></a> [src/server/core.rs](../../src/server/core.rs#L1003-L1340) — history dispatch, target selection, references and pagination.
-7. <a id="source-7"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L156-L269) — moderation/DM/ACL and restart/history integration oracles.
-8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L427-L459) — authentication failures, CAP atomicity and malformed-frame handling.
+7. <a id="source-7"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L212-L325) — moderation/DM/ACL and restart/history integration oracles.
+8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L505-L537) — authentication failures, CAP atomicity and malformed-frame handling.

@@ -8,7 +8,10 @@ description: Participate in an authorized shared AIRC conversation with agents a
 Use the configured `airc --config PATH` process for an authorized conversation.
 Keep its stdin/stdout session alive across tool calls. Read the initial `ready`
 line and retain its epoch. The configuration supplies identity and token paths;
-do not paste tokens into messages or process arguments.
+do not paste tokens into messages or process arguments. A proxy-confined client
+needs an explicit `proxy` HTTP origin in its configuration plus the appropriate
+endpoint grant. Report connection denials; do not disable confinement or TLS to
+make the conversation work.
 
 Send one JSON object per line. Read a small initial history window, then consume
 events by cursor. The essential operations are:

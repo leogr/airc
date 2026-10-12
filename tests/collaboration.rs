@@ -6,7 +6,7 @@ use airc::{
 };
 use std::time::Duration;
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -14,6 +14,60 @@ use tokio::{
 };
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+// Only forwards to this test's two listeners. No Internet access or credentials
+// in diagnostic output. Drop cancels the listener and every tunnel it owns.
+struct Proxy(tokio::task::JoinHandle<()>);
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+async fn proxy(server: &RunningServer) -> (String, Proxy) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let irc = server.address;
+    let http = server.artifact_address.unwrap();
+    let task = tokio::spawn(async move {
+        let mut tunnels = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut incoming, _) = accepted.unwrap();
+                    tunnels.spawn(async move {
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") {
+                            header.push(incoming.read_u8().await.unwrap());
+                            assert!(header.len() < 8192);
+                        }
+                        let text = std::str::from_utf8(&header).unwrap();
+                        let mut lines = text.splitn(2, "\r\n");
+                        let request: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+                        let is_connect = request[0] == "CONNECT";
+                        let url = reqwest::Url::parse(&if is_connect {
+                            format!("http://{}", request[1])
+                        } else {
+                            request[1].to_owned()
+                        }).unwrap();
+                        let destination = if is_connect { irc } else { http };
+                        assert_eq!(url.port(), Some(destination.port()));
+                        let mut outgoing = TcpStream::connect(destination).await.unwrap();
+                        if is_connect {
+                            incoming.write_all(b"HTTP/1.1 200 Connected\r\n\r\n").await.unwrap();
+                        } else {
+                            let path = url.path();
+                            let rewritten = format!("{} {} HTTP/1.1\r\n{}", request[0], path, lines.next().unwrap());
+                            outgoing.write_all(rewritten.as_bytes()).await.unwrap();
+                        }
+                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                    });
+                }
+                Some(result) = tunnels.join_next(), if !tunnels.is_empty() => { result.unwrap(); }
+            }
+        }
+    });
+    (url, Proxy(task))
+}
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -68,6 +122,7 @@ impl Fixture {
             tls: false,
             allow_insecure: false,
             ca_certificate: None,
+            proxy: None,
             account: name.into(),
             token_file: token,
             nick: name.into(),
@@ -337,9 +392,20 @@ async fn artifact_access_limits_and_moderation() {
 
 #[tokio::test]
 async fn sasl_client_and_jsonl_frontend() {
+    frontend_scenario(false).await;
+}
+
+#[tokio::test]
+async fn proxy_sasl_and_artifact_round_trip() {
+    frontend_scenario(true).await;
+}
+
+async fn frontend_scenario(proxied: bool) {
     let fixture = Fixture::new();
     let server = fixture.start().await;
-    let config = fixture.client_config(&server, "alice");
+    let (proxy_url, _proxy) = proxy(&server).await;
+    let mut config = fixture.client_config(&server, "alice");
+    config.proxy = proxied.then(|| proxy_url.clone());
     let mut connection = client::connect(&config).await.unwrap();
     loop {
         if connection.inbound.recv().await.unwrap().command == "366" {
@@ -359,7 +425,18 @@ async fn sasl_client_and_jsonl_frontend() {
         }
     }
     drop(connection);
-    let config = fixture.client_config(&server, "bob");
+    let mut config = fixture.client_config(&server, "bob");
+    config.proxy = proxied.then_some(proxy_url);
+    if proxied {
+        // No local DNS route to this hostname: both IRC and artifact transport
+        // must use the configured proxy. The fixture maps only these ports.
+        config.host = "unresolvable.invalid".into();
+        config.allow_insecure = true;
+        config.artifact_url = Some(format!(
+            "http://unresolvable.invalid:{}",
+            server.artifact_address.unwrap().port()
+        ));
+    }
     let (mut requests, input) = tokio::io::duplex(65536);
     let (output, responses) = tokio::io::duplex(65536);
     let task = tokio::spawn(client::frontend(config, BufReader::new(input), output));
@@ -558,6 +635,15 @@ async fn optional_direct_messages_are_live_only() {
 
 #[tokio::test]
 async fn tls_requires_trust_and_checks_hostname() {
+    tls_scenario(false).await;
+}
+
+#[tokio::test]
+async fn proxy_tls_requires_trust_and_checks_hostname() {
+    tls_scenario(true).await;
+}
+
+async fn tls_scenario(proxied: bool) {
     let mut fixture = Fixture::new();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_path = fixture.dir.path().join("certificate.pem");
@@ -573,7 +659,9 @@ async fn tls_requires_trust_and_checks_hostname() {
         private_key: key_path,
     });
     let server = fixture.start().await;
+    let (proxy_url, _proxy) = proxy(&server).await;
     let mut config = fixture.client_config(&server, "alice");
+    config.proxy = proxied.then_some(proxy_url);
     config.tls = true;
     config.host = "localhost".into();
     assert!(

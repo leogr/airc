@@ -1,6 +1,6 @@
 # Storage, transport and server lifecycle
 
-Verification: `8d76633ca9a712a72b017dbf20871cad064a9bd6`; re-read cited symbols when behavior changes.
+Verification: `ff896508d5846918a15308b19c32cc03a7e625e4` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] Strict TOML configuration validates identifiers, account/channel references,
 resource limits and remote plaintext opt-ins before listeners start. Relative
@@ -41,9 +41,9 @@ continues receiving. [8](#source-8) [9](#source-9) [10](#source-10)
 3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L27-L191) — session roles, actor handling, timeouts, pruning and output queues.
 4. <a id="source-4"></a> [src/store.rs](../../src/store.rs#L30-L163) — schema ownership, append transactions, selection and pruning.
 5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L1155-L1218) — `artifact` checks, persistence and broadcast.
-6. <a id="source-6"></a> [src/transport.rs](../../src/transport.rs#L11-L53) — TLS acceptor and verified connection.
+6. <a id="source-6"></a> [src/transport.rs](../../src/transport.rs#L11-L85) — TLS acceptor and verified connection.
 7. <a id="source-7"></a> [src/server/http.rs](../../src/server/http.rs#L25-L175) — routes, authentication, transfer limits and response headers.
-8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L270-L336) — artifact ACL, moderation and size tests.
-9. <a id="source-9"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L515-L592) — persistent topic/moderation and TLS rejection tests.
+8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L326-L392) — artifact ACL, moderation and size tests.
+9. <a id="source-9"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L593-L681) — persistent topic/moderation and TLS rejection tests.
 10. <a id="source-10"></a> [src/server/core.rs](../../src/server/core.rs#L1342-L1398) — `slow_output_disconnects_only_that_client`.
-11. <a id="source-11"></a> [src/bin/aircd.rs](../../src/bin/aircd.rs#L59-L128) — `init` private directory, credentials and configuration creation.
+11. <a id="source-11"></a> [src/bin/aircd.rs](../../src/bin/aircd.rs#L59-L129) — `init` private directory, credentials and configuration creation.

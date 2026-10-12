@@ -82,6 +82,7 @@ fn init(directory: PathBuf) -> Result<()> {
             tls: false,
             allow_insecure: false,
             ca_certificate: None,
+            proxy: None,
             account: name.into(),
             token_file: PathBuf::from(format!("{name}.token")),
             nick: name.into(),

@@ -27,6 +27,7 @@ pub struct ClientConfig {
     #[serde(default)]
     pub allow_insecure: bool,
     pub ca_certificate: Option<PathBuf>,
+    pub proxy: Option<String>,
     pub account: String,
     pub token_file: PathBuf,
     pub nick: String,
@@ -48,6 +49,9 @@ impl ClientConfig {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(proxy) = &self.proxy {
+            transport::proxy_url(proxy)?;
+        }
         ensure!(
             valid_nick(&self.nick) && valid_nick(&self.account),
             "invalid nick or account"
@@ -123,6 +127,7 @@ async fn open_connection(config: &ClientConfig, token: &str) -> Result<Connectio
         config.port,
         config.tls,
         config.ca_certificate.as_deref(),
+        config.proxy.as_deref(),
     )
     .await?;
     let (reader, mut writer) = tokio::io::split(stream);
@@ -567,6 +572,9 @@ fn http_client(config: &ClientConfig) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none());
+    if let Some(proxy) = &config.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(transport::proxy_url(proxy)?)?);
+    }
     if let Some(path) = &config.ca_certificate {
         builder =
             builder.add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(path)?)?);
@@ -648,6 +656,7 @@ mod tests {
             tls: false,
             allow_insecure: false,
             ca_certificate: None,
+            proxy: None,
             account: "alice".into(),
             token_file: "unused".into(),
             nick: "alice".into(),

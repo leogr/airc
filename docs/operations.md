@@ -47,6 +47,22 @@ tokens; ordinary browsers can authenticate with HTTP Basic (account plus token).
 Downloads are attachment-only. Only explicitly configured members can retrieve
 files, even when a URL is copied outside the channel.
 
+## Proxy-confined clients
+
+Set `proxy = "http://PROXY_HOST:PORT"` in a client TOML file when its sandbox
+requires an HTTP proxy. IRC uses CONNECT to the configured destination; artifact
+requests use the same explicit proxy. The proxy URL accepts an HTTP origin only,
+without credentials, paths, query strings or fragments. No direct fallback or
+proxy authentication is implemented. Destination DNS resolution happens at the
+proxy. IRC does not implicitly read HTTP(S)_PROXY; artifact HTTP retains reqwest's
+environment proxy behavior when this setting is absent.
+
+A CONNECT reply is capped at 8 KiB. TCP/proxy/TLS setup has a ten-second deadline
+inside the existing twenty-second authentication deadline. TLS still verifies
+the destination hostname and trust chain through the tunnel; install the intended
+CA with `ca_certificate` when needed. Configure sandbox endpoint and executable
+grants separately. The proxy setting does not itself grant network access.
+
 ## Existing human clients
 
 AIRC supplies no human TUI. Configure an existing IRC client with SASL PLAIN,
@@ -69,7 +85,9 @@ the documentation checker. The tests cover authentication,
 capability negotiation, ordinary untagged clients, multiple agents, access control,
 moderation, DM/NOTICE/TAGMSG policy, history restart/retention gaps, artifact limits,
 JSONL framing, artifact downloads, partial TCP frames, independent output queues,
-TLS trust/hostname checks, and process shutdown with stdin still open.
+TLS trust/hostname checks directly and through CONNECT, bounded/rejected proxy
+responses, proxied SASL and artifact round trips, and process shutdown with stdin
+still open.
 
 The parser fuzz target lives in [fuzz](../fuzz/Cargo.toml). With cargo-fuzz and a
 nightly toolchain, run `cargo +nightly fuzz run protocol -- -max_total_time=60`.
@@ -87,4 +105,4 @@ the enumerated flows, not every client configuration or general IRC conformance.
 
 This initial implementation has no automatic client reconnection, durable local
 cursors, Internet-scale load validation, federation, Windows runtime validation,
-or built-in deployment orchestration. Preserve these limits when describing readiness.
+or built-in box orchestration. Preserve these limits when describing readiness.

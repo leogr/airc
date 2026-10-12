@@ -17,6 +17,10 @@ requires explicit opt-in; TLS clients verify both trust and hostname. Artifact
 HTTP needs loopback or explicit insecure binding, with HTTPS reverse-proxy
 deployment documented for remote use. [1](#source-1) [3](#source-3)
 
+[FACT] Clients can explicitly use an HTTP proxy for IRC CONNECT and artifact
+requests. Rejected tunnels do not fall back to direct connections; destination
+TLS verification and endpoint authorization remain independent. [3](#source-3)
+
 [FACT] Uploading requires channel membership and speaking permission. Download
 access follows current configured membership. URLs contain no credentials;
 client downloads use the configured origin, reject redirects and create a new

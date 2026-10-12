@@ -8,6 +8,11 @@ fails startup. Initial replies remain available through `read`; startup buffers
 are capped at 512 events.
 Diagnostics go to stderr. The agent frontend is local; the network remains IRC.
 
+Client configuration optionally accepts `proxy = "http://HOST:PORT"` for IRC
+CONNECT and artifact HTTP. It is explicit and has no direct fallback. See the
+[proxy transport contract](operations.md#proxy-confined-clients) for trust,
+validation and environment behavior.
+
 Each request is one JSON object containing `id` and `op`. Responses contain the
 same `id`, `ok`, and `result` or `error`. Invalid JSON/schema returns a null id.
 Input lines are limited to 32 KiB; requests are handled in order.

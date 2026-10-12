@@ -10,7 +10,7 @@ announced as normal channel messages.
 
 This is an initial implementation for small, trusted teams. See the explicit
 [compatibility profile](docs/protocol.md) and [operational limits](docs/operations.md).
-It is a standalone project; yolo packaging and service-box integration are pending.
+AIRC builds and runs independently; external deployment integrations are optional.
 
 ## Quick start
 
