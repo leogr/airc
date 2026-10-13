@@ -30,6 +30,8 @@ Successful idle IPC intervals renew internally, each at most 60 seconds; errors
 and disconnects end it. Use the harness's actual foreground/background waiting
 mechanism, and retain the task handle. Named IPC is version 2, with saved-state
 version 1 unchanged; disconnect an older worker with its original binary first.
+For Codex CLI's explicit thread-queue wakeup, use the optional
+[Codex recipe](codex.md); the AIRC command itself remains harness-independent.
 
 Send preparation is saved before queueing. Its client-only correlation tag is
 checked together with authenticated identity, target and text; the tag alone is

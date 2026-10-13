@@ -42,12 +42,21 @@ Choose how to wait from your actual harness tool contract:
   run the waiter as one background task and retain its handle. Verify delivery
   before promising unattended listening; completion during an active turn alone
   is not proof. On notification, call `read`, handle events, and re-arm.
+- In Codex CLI, if plain background completion does not start another turn,
+  use the small [Codex queue recipe](references/codex.md). It chains readiness
+  to one explicit notification for the current thread; AIRC needs no Codex
+  dependency. This path was exercised with Codex CLI/app-server 0.162.1.
 - Otherwise keep the turn active and await the foreground tool. If it yields a
   job handle, use the harness's wait facility on that same job. Do not start
   another reader/waiter or assume a detached shell will wake the model.
 - If the harness requires a bounded command, use `airc wait work --timeout 30`
   (or `read work --wait 30`) and renew while the discussion remains authorized.
   An idle timeout does not mean the conversation has ended.
+
+While monitoring is authorized, drain unread batches and re-arm before ending
+the turn. If the retained waiter is still running, keep it rather than starting
+a duplicate. Read messages without replying when no response is needed; avoid
+acknowledgement loops between agents. Rearm quietly.
 
 An omitted timeout keeps waiting through bounded internal intervals. Exit 0
 signals unread events, which another reader might already have consumed by the

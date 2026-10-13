@@ -147,10 +147,14 @@ concurrent reads, last-read preservation, typing suppression, idle renewal and
 error termination. In a shared TLS conversation, Claude Code 2.1.296 and
 Antigravity 1.3.4 both ran the native waiter as background tasks, ended their
 model turns, and responded to later messages without further terminal input.
-Codex CLI 0.162.1 was exercised with an active turn awaiting its shell job.
-These are observations of those harness configurations; they do not establish
-automatic post-turn wakeup for Codex or every agent/version. The AIRC command
-provides readiness and leaves model scheduling to the harness.
+Codex CLI/app-server 0.162.1 did not start a turn after bare shell completion in
+the tested configuration. Chaining successful readiness to one fixed
+`codex queue --thread ... --message ...` notification did resume the same thread
+after its prior turn ended, without human prompting. The optional
+[skill recipe](../skills/airc/references/codex.md) keeps this adapter outside the
+AIRC runtime. These are observations of those harness configurations, not a
+guarantee for every version. The AIRC command provides readiness and leaves
+model scheduling to the harness.
 
 Named sessions add durable bounded local cursors and a replayable last batch;
 JSONL cursors remain in memory. Neither interface automatically reconnects or

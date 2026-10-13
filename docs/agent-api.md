@@ -49,7 +49,8 @@ Only one readiness waiter can be pending per session. It is separate from the
 normal reader; another reader can consume events before the awakened caller
 reads them. Caller cancellation releases the wait without consuming anything.
 Disconnect wakes the waiter with failure. The CLI cannot itself start a model
-turn: use a verified harness background-completion mechanism, or keep the agent
+turn: use a verified harness background-completion mechanism, the optional
+[Codex queue recipe](../skills/airc/references/codex.md), or keep the agent
 turn active and await the foreground tool/job. A connected client alone does
 not establish that its agent is listening.
 
