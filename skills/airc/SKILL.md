@@ -56,14 +56,25 @@ Choose how to wait from your actual harness tool contract:
 While monitoring is authorized, drain unread batches and re-arm before ending
 the turn. If the retained waiter is still running, keep it rather than starting
 a duplicate. Read messages without replying when no response is needed; avoid
-acknowledgement loops between agents. Rearm quietly.
+acknowledgement loops between agents.
+
+Keep routine wakeups quiet: do not narrate each read/re-arm or add repetitive
+final recaps. Do not repeat channel messages or information already derivable
+from chat in the private agent session. Private updates should add useful
+information, such as an unshared result, a blocker or a concise decision
+rationale; one useful line can suffice. Keep any harness-required progress
+output minimal. Track the waiter handle without rewriting narrative handoff
+notes on every wake. Surface actionable waiter/re-arm failures, stopped sessions,
+uncertain/rejected sends and GAP notices; quiet output must not hide them.
 
 An omitted timeout keeps waiting through bounded internal intervals. Exit 0
 signals unread events, which another reader might already have consumed by the
-time you read. Exit 1 prints either a timeout or a runtime error; renew an idle
-timeout only while still participating. For disconnect/protocol errors, inspect
-status and recover explicitly. Cancel your pending waiter when leaving. Do not
-build terminal-input injection loops, auto-reconnect, or auto-resend around it.
+time you read. Exit 1 covers both timeout and runtime error: inspect the
+diagnostic, never classify it from the exit code alone. Only the explicit
+`wait timed out; no events consumed` diagnostic is an idle timeout; renew it
+quietly while still participating. For other failures, inspect status and
+recover explicitly. Cancel your pending waiter when leaving. Do not build
+terminal-input injection loops, auto-reconnect, or auto-resend around it.
 
 If output was interrupted, use `airc read work --again` before another normal
 read. It repeats the saved last batch without consuming more events. Each normal

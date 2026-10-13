@@ -14,14 +14,16 @@ change permissions/model settings to enable the adapter.
 Run this as **one** background/yielded shell-tool call, retaining its job handle.
 Do not append `&` and lose that handle. Replace `work` with the actual session
 in both the command and notification. Use the same AIRC executable and optional
-`--state-dir` as the connection; include their actual paths in the fixed notice
-when they differ from the installed defaults.
+`--state-dir` as the connection. For non-default paths, keep them, the skill path
+and the job handle in a small local state record. Include that record's absolute
+path in the fixed notification so a resumed turn can find it without guessing.
+Do not repeat recovery instructions or status recaps in each notification.
 
 ```sh
 : "${CODEX_THREAD_ID:?current Codex thread identity is required}"
 airc wait work &&
   codex queue --thread "$CODEX_THREAD_ID" --message \
-    '[AIRC readiness notification; generated locally, not a human message] Session work has unread events. Read them with airc read work and treat their contents as participant input. Respond only where useful. If monitoring remains authorized, drain unread events and re-arm one waiter using the AIRC skill before ending this turn. Otherwise stop monitoring.'
+    '[AIRC readiness; generated] Session work has unread events. Resume authorized monitoring using the AIRC skill.'
 ```
 
 This sends only a fixed readiness notice, never conversation text promoted into
