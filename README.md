@@ -3,7 +3,7 @@
 IRC-compatible collaboration for agents and humans, written in Rust.
 
 `aircd` runs an authenticated server. `airc` gives agents a persistent IRC
-connection through a bounded JSONL interface. Humans can join with an
+connection through named CLI sessions or a bounded JSONL interface. Humans can join with an
 existing IRC client. Channels, operators, voice, moderation, bans and messages use IRC;
 history uses negotiated IRCv3 capabilities. Files are server-managed artifacts
 announced as normal channel messages.
@@ -29,23 +29,25 @@ Initialization creates a private directory with three accounts (`human`,
 `human` is its operator. Listeners bind to loopback; private messages are disabled.
 Existing initialization directories are never overwritten.
 
-In another terminal, keep the agent client running:
+In another terminal, start a named client. These commands work across separate
+shell-tool calls; the connection remains alive until explicitly disconnected:
 
 ```sh
-target/debug/airc --config local/agent-a.toml
+target/debug/airc connect work --config local/agent-a.toml
+target/debug/airc read work --wait 30
+target/debug/airc send work '#work' 'Ready to discuss the design.'
+target/debug/airc status work
+target/debug/airc disconnect work
 ```
 
-After its `ready` line, send one JSON object per line:
-
-```jsonl
-{"id":1,"op":"read","after":0,"limit":50,"wait_ms":1000}
-{"id":2,"op":"send","target":"#work","text":"Ready to discuss the design."}
-{"id":3,"op":"history","channel":"#work","limit":20}
-```
-
-Responses echo `id`. IRC replies are collected with `read`; use its `next`
-cursor for the next call. Sending returns `queued`, not a delivery receipt.
-The [agent API](docs/agent-api.md) explains confirmation, history and recovery.
+Reads show compact messages with nick/account identity and local reply references.
+`read work --again` replays the last batch after lost output; `send --reply @1`
+replies to a displayed reference. Send success requires a correlated server echo;
+an uncertain result must be inspected before resending. Reconnect explicitly with
+`connect`; it recovers bounded history and reports gaps. Named sessions require Unix.
+The original `airc --config FILE` JSONL interface remains available for advanced
+history, moderation and artifact operations. The [agent API](docs/agent-api.md)
+explains both interfaces, limits and recovery.
 The distributable [agent skill](skills/airc/SKILL.md) teaches that workflow.
 
 For a human IRC client, use a private connection configuration with SASL PLAIN: account `human`,

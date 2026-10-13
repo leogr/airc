@@ -1,6 +1,6 @@
 # Protocol and permissions
 
-Verification: `c0bc1ed746f51ee2e5b3f415ca8f7f4d63c3408f` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `fcf4070322c2107d412f45ac90025a10a014f4eb` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] The parser accepts UTF-8, bounds the non-tag IRC message to 512 bytes,
 limits parameters to 15, decodes tag escapes, and rejects embedded CR/LF/NUL.
@@ -45,15 +45,26 @@ bounds, nickname changes, voice/operator exemptions, uploads and restart persist
 Tests define these oracles; their presence alone does not establish a live run.
 [7](#source-7) [8](#source-8) [10](#source-10)
 
+[FACT] Registered users can query up to five USERHOST nicknames using RFC1459
+folding. Numeric 302 returns `nick=+account@airc`, omitting unknown/unregistered
+users; no matches still yield an empty reply. Missing parameters return 461.
+The fixed `+` matches the unset AWAY profile; channel roles never imply IRC
+operator status. Tests cover these boundaries and case folding.
+[11](#source-11) [12](#source-12) [13](#source-13)
+
 ## Sources
 
 1. <a id="source-1"></a> [src/protocol.rs](../../src/protocol.rs#L7-L219) — `Message`, `fold`, name validation and `read_line`.
-2. <a id="source-2"></a> [src/server/core.rs](../../src/server/core.rs#L265-L573) — `command`, `register`, `cap`, `sasl`.
-3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L575-L1027) — `join`, membership/operator checks, `mode`, `topic`, `kick`.
-4. <a id="source-4"></a> [src/server/core.rs](../../src/server/core.rs#L703-L796) — `chat`.
+2. <a id="source-2"></a> [src/server/core.rs](../../src/server/core.rs#L265-L574) — `command`, `register`, `cap`, `sasl`.
+3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L576-L1028) — `join`, membership/operator checks, `mode`, `topic`, `kick`.
+4. <a id="source-4"></a> [src/server/core.rs](../../src/server/core.rs#L704-L797) — `chat`.
 5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L190-L202) — `send` capability filtering and queue failure.
-6. <a id="source-6"></a> [src/server/core.rs](../../src/server/core.rs#L1093-L1430) — history dispatch, target selection, references and pagination.
-7. <a id="source-7"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L212-L325) — moderation/DM/ACL and restart/history integration oracles.
-8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L505-L537) — authentication failures, CAP atomicity and malformed-frame handling.
+6. <a id="source-6"></a> [src/server/core.rs](../../src/server/core.rs#L1111-L1448) — history dispatch, target selection, references and pagination.
+7. <a id="source-7"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L243-L355) — moderation/DM/ACL and restart/history integration oracles.
+8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L536-L568) — authentication failures, CAP atomicity and malformed-frame handling.
 9. <a id="source-9"></a> [src/server/ban.rs](../../src/server/ban.rs#L1-L96) — bounded mask normalization, wildcard matching and boundary tests.
-10. <a id="source-10"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L729-L911) — ban listing, authorization, enforcement, exemptions, artifact access and persistence.
+10. <a id="source-10"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L760-L942) — ban listing, authorization, enforcement, exemptions, artifact access and persistence.
+
+11. <a id="source-11"></a> [src/server/core.rs](../../src/server/core.rs#L1074-L1089) — `userhost`.
+12. <a id="source-12"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L212-L240) — USERHOST identity, limits, unknown users and registration.
+13. <a id="source-13"></a> [Modern IRC client protocol](https://modern.ircdocs.horse/#userhost-message) — USERHOST and numeric 302 wire semantics; checked 2026-10-13.

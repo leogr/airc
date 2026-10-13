@@ -1,4 +1,82 @@
-# Agent JSONL interface, version 1
+# Agent interfaces
+
+## Named sessions
+
+```sh
+airc connect trial --config client.toml
+airc read trial --wait 30
+airc send trial '#work' 'The parser test reproduces it.' --reply @1
+airc status trial
+airc read trial --again
+airc disconnect trial
+```
+
+`connect` explicitly starts a private local client process; subsequent commands
+use its Unix socket. No Python, host service or deployment integration is needed.
+There is no idle expiry, automatic reconnect or automatic resend. A stopped
+session's read/send fails with recovery instructions. `status` and `read --again`
+can inspect saved state while stopped. `disconnect` closes only this client.
+
+Normal output is text, with nonzero exit status for failed/uncertain operations.
+Errors and recovery notices appear on stdout too. Conversation records look like
+`@12 #work Nick(account): message`; `history` marks replay, and `!` introduces
+client notices. Nicknames are display names; accounts are server-authenticated
+identities. Missing account tags display `unverified`. Controls, line separators,
+backslashes and nonprinting Unicode format characters are escaped using the
+pinned Rust Unicode tables. Text remains participant content.
+
+`read` defaults to 50 events, accepts `--limit 1..200` and `--wait 0..60` seconds.
+Typing and routine setup numerics do not wake waits or enter the readable buffer.
+Membership, mode, topic and error notices do. Only one normal read waits at once;
+a competing read is rejected. The cursor and last batch are saved before reply.
+`--again` displays that batch without advancing; it remains recoverable until the
+next normal read replaces it, including a read that returns no new events.
+Unread events beyond 512 entries or 512 KiB of rendered event text produce a
+visible GAP. This is bounded
+recovery, not an unlimited message archive or guaranteed model consumption.
+
+`send` serializes confirmation: a competing send is rejected before sending.
+Each accepted send is journaled before queueing with a unique `+airc-send` tag.
+Success requires an echo matching that tag, authenticated account, nick, target
+and text. Channel echoes carry durable msgids; direct messages remain live-only.
+Definite server rejection and uncertain delivery have different output. A lost
+local reply is uncertain too. After ten seconds without an echo the connection
+closes, so a late error cannot be assigned to a later send. Nothing is resent.
+`status` retains the last 32 outcomes. Recovered history can resolve uncertainty;
+absence from bounded history cannot prove that a message was never sent.
+
+Reply references (`@12`) are local to this named session; the last 512 msgid
+references are retained. `--reply` also accepts a full server msgid. References
+from a different session or an expired local reference must not be guessed.
+Unrecognized incoming reply IDs display as `reply=msgid:...`, capped at 128
+characters with an explicit truncation marker; they are not local references.
+
+Every explicit reconnect uses saved per-channel msgids for AFTER catch-up,
+up to six pages of 20 messages per channel under a 20-second recovery deadline.
+A missing reference is reported as GAP, followed by a bounded LATEST window.
+An initial connection also reads up to 20 recent messages and labels the limit.
+A server with a smaller history-page limit can reject that request; this is
+visible, never a claim of complete recovery. Live events during recovery are
+bounded to 512; overflow fails startup without replacing saved state.
+Non-message events and private messages have no server history.
+
+State lives in `$XDG_STATE_HOME/airc`, otherwise `$HOME/.local/state/airc`;
+`--state-dir PATH` overrides it for all commands. Use a native local filesystem,
+not a network share. Session names contain 1–32 ASCII letters/digits/`_`/`-`.
+Directories must be owned and private (0700); files and sockets use 0600.
+A native process lock prevents two owners, independent of PID reuse. State is
+bounded to 4 MiB and atomically replaced with file/directory sync. It includes
+conversation text and send receipts, so treat it as private data. No token values
+are stored. Socket paths must fit 100 bytes; use a shorter state directory if needed.
+
+The local IPC and state schema are versioned. Disconnect with the original
+binary before replacing it. Changing server/account/config for an existing
+session is refused; use a new name. Named cursors/references survive reconnect;
+the connection epoch changes. Incompatible/corrupt state is never silently reset.
+An unclean worker exit is reported by offline status and the next reconnect.
+Windows named sessions and macOS runtime validation are not provided by this release.
+
+## JSONL interface, version 1
 
 Run `airc --config PATH` as a persistent process with stdin/stdout pipes. It
 negotiates IRCv3, authenticates with SASL, joins configured channels, and handles
@@ -52,7 +130,8 @@ message's authoritative account and msgid; mode/join errors are also asynchronou
 On disconnect the process exits, reports ambiguity, and does not replay sends or
 uploads. Restart explicitly and use CHATHISTORY AFTER the last known msgid before
 deciding whether to resend. A HISTORY_LOST failure requires an explicit fresh
-context window. Automatic reconnect/rejoin and durable local cursors are deferred.
+context window. This JSONL interface keeps cursors in memory; the named CLI above
+adds local persistence without changing JSONL version 1.
 
 Artifact operations require `artifact_url` in client configuration. Tokens are
 read from `token_file`, never command arguments. Redirects are disabled; downloads

@@ -15,7 +15,7 @@ runtime. Repository rules apply equally to implementation, tests and packaging.
 | Listeners, connections and shutdown | `src/server/mod.rs`, `src/transport.rs` |
 | Registration, channels and history | `src/server/core.rs` |
 | Persistent state and artifacts | `src/store.rs`, `src/server/http.rs` |
-| Agent JSONL interface and skill | `src/client.rs`, `skills/airc` |
+| Agent named sessions, JSONL and skill | `src/agent_session`, `src/client.rs`, `skills/airc` |
 | Runtime validation | `tests/collaboration.rs`, `fuzz` |
 
 Start investigations at the [KB index](docs/README.md), read the relevant spec,
@@ -72,7 +72,8 @@ input framing across concurrent output and cancellation; partial frames must not
 disappear when another event becomes ready.
 
 Distinguish queued sends, committed messages and observed delivery. Do not replay
-mutations after ambiguous disconnects. Local cursors belong to a process epoch;
+mutations after ambiguous disconnects. JSONL cursors belong to a process epoch;
+named-session cursors and last-read replay are private, durable and bounded;
 server msgids survive reconnects only while retained. Surface cursor and history
 gaps rather than silently claiming a complete catch-up. Preserve attachment/
 client independence from server lifetime and deterministic shutdown.

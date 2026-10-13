@@ -266,7 +266,7 @@ impl State {
         let p = &m.params;
         let required = match m.command.as_str() {
             "NICK" | "PASS" | "AUTHENTICATE" | "JOIN" | "PART" | "PING" | "NAMES" | "WHO"
-            | "WHOIS" | "MODE" | "TOPIC" | "TAGMSG" | "KICK" => 1,
+            | "WHOIS" | "USERHOST" | "MODE" | "TOPIC" | "TAGMSG" | "KICK" => 1,
             "PRIVMSG" | "NOTICE" => 2,
             "USER" => 4,
             _ => 0,
@@ -352,6 +352,7 @@ impl State {
             "CHATHISTORY" => self.history(id, p)?,
             "WHO" => self.who(id, &p[0]),
             "WHOIS" => self.whois(id, &p[0]),
+            "USERHOST" => self.userhost(id, p),
             "LIST" => {
                 let account = self.clients[&id].account.clone().unwrap();
                 let list = self
@@ -1068,6 +1069,23 @@ impl State {
             }
         }
         self.numeric(id, "315", &[name, "End of WHO"]);
+    }
+
+    fn userhost(&mut self, id: u64, nicks: &[String]) {
+        // RFC 2812: at most five names, unknown/unregistered users omitted.
+        // Channel operators are not IRC operators; AWAY is not stored by AIRC.
+        let users = nicks
+            .iter()
+            .take(5)
+            .filter_map(|nick| {
+                self.clients
+                    .values()
+                    .find(|c| c.registered && fold(&c.nick) == fold(nick))
+            })
+            .map(|c| format!("{}=+{}@airc", c.nick, c.account.as_deref().unwrap()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.numeric(id, "302", &[&users]);
     }
 
     fn whois(&mut self, id: u64, nick: &str) {

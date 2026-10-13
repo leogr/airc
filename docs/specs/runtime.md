@@ -32,8 +32,15 @@ and complete retained catch-up establish different things. Recovery must inspect
 server history and surface missing context before choosing whether to resend.
 [1](#source-1) [2](#source-2) [3](#source-3)
 
+[FACT] Named clients are explicitly started local processes with private,
+versioned IPC and native owner locks. Bounded state is atomically synced before
+read-cursor or send-preparation replies. Stopped clients require explicit
+reconnect; saved uncertainty is not replay authority. [4](#source-4)
+
 ## Sources
 
 1. <a id="source-1"></a> [Storage, transport and lifecycle evidence](../digests/storage.md).
 2. <a id="source-2"></a> [History and protocol evidence](../digests/protocol.md).
 3. <a id="source-3"></a> [Client and artifact evidence](../digests/agent-client.md).
+
+4. <a id="source-4"></a> [Named session persistence](../digests/named-sessions.md).

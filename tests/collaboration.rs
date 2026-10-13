@@ -209,6 +209,37 @@ impl Peer {
 }
 
 #[tokio::test]
+async fn userhost_reports_authenticated_identity_without_channel_operator_star() {
+    let fixture = Fixture::new();
+    let server = fixture.start().await;
+    let mut human = Peer::login(&server, "human", false).await;
+    let mut alice = Peer::login(&server, "alice", true).await;
+    human.join().await;
+    alice.send("NICK a[ice").await;
+    alice.until("NICK").await;
+    let mut unfinished = Peer::open(&server).await;
+    unfinished.send("NICK unfinished").await;
+    unfinished.send("USERHOST human").await;
+    assert_eq!(unfinished.until("451").await.params[0], "unfinished");
+    human.send("USERHOST").await;
+    assert_eq!(human.until("461").await.params[1], "USERHOST");
+    human.send("USERHOST HUMAN A{ICE missing unfinished").await;
+    assert_eq!(
+        human.until("302").await.params,
+        ["human", "human=+human@airc a[ice=+alice@airc"]
+    );
+    human.send("USERHOST missing unfinished").await;
+    assert_eq!(human.until("302").await.params, ["human", ""]);
+    human
+        .send("USERHOST human human human human human a[ice")
+        .await;
+    let reply = human.until("302").await;
+    assert_eq!(reply.params[1].split_whitespace().count(), 5);
+    assert!(!reply.params[1].contains("alice"));
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn humans_agents_moderation_and_private_message_policy() {
     let fixture = Fixture::new();
     let server = fixture.start().await;

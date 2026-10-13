@@ -8,7 +8,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -105,6 +105,7 @@ impl ClientConfig {
 pub struct Connection {
     pub outbound: mpsc::Sender<Message>,
     pub inbound: mpsc::Receiver<Message>,
+    pub capabilities: BTreeSet<String>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Connection {
@@ -132,6 +133,7 @@ async fn open_connection(config: &ClientConfig, token: &str) -> Result<Connectio
     .await?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
+    let mut capabilities = BTreeSet::new();
     write_message(&mut writer, Message::new("CAP", ["LS", "302"])).await?;
     write_message(&mut writer, Message::new("NICK", [&config.nick])).await?;
     write_message(
@@ -173,6 +175,13 @@ async fn open_connection(config: &ClientConfig, token: &str) -> Result<Connectio
                 write_message(&mut writer, Message::new("CAP", ["REQ", &requested])).await?;
             }
             "CAP" if m.params.get(1).is_some_and(|s| s == "ACK") => {
+                capabilities.extend(
+                    m.params
+                        .last()
+                        .into_iter()
+                        .flat_map(|s| s.split_whitespace())
+                        .map(str::to_owned),
+                );
                 write_message(&mut writer, Message::new("AUTHENTICATE", ["PLAIN"])).await?;
             }
             "CAP" if m.params.get(1).is_some_and(|s| s == "NAK") => {
@@ -276,6 +285,7 @@ async fn open_connection(config: &ClientConfig, token: &str) -> Result<Connectio
     Ok(Connection {
         outbound,
         inbound,
+        capabilities,
         task,
     })
 }
@@ -668,6 +678,7 @@ mod tests {
         let mut connection = Connection {
             outbound,
             inbound,
+            capabilities: BTreeSet::new(),
             task: tokio::spawn(std::future::pending()),
         };
         let (request, mut input) = mpsc::channel(1);

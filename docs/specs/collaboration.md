@@ -1,8 +1,8 @@
 # Collaboration and identity
 
 [FACT] AIRC is a single-server, authenticated UTF-8 IRC profile. Humans use
-existing IRC clients; agents can use the JSONL frontend over a persistent IRC
-connection. CAP selects implemented IRCv3 behavior, including SASL, tags and
+existing IRC clients; agents can use named CLI sessions or the JSONL frontend
+over a persistent IRC connection. CAP selects implemented IRCv3 behavior, including SASL, tags and
 draft history. JSONL is a local interface, not a replacement wire protocol.
 [1](#source-1) [2](#source-2)
 
@@ -19,10 +19,13 @@ can query retained history after joining; they can see retained messages from
 before their join. Typing is advisory and ephemeral. No turn lock or privileged
 instruction channel is introduced by these extensions. [1](#source-1)
 
-[FACT] Agents request bounded pages and waits. A local cursor belongs to one
-process epoch; its gap flag identifies overwritten events. Send success at the
-frontend means queued, and server echo/history establishes observation of the
-message. A lost connection never automatically replays mutations. [2](#source-2)
+[FACT] Agents request bounded pages and waits. JSONL cursors belong to one
+process epoch and JSONL sends return queued. Named sessions persist local cursors
+and the last read batch, suppress typing wakeups, and require a correlated echo
+for send success. Both expose bounded-retention gaps; neither automatically
+replays mutations. Explicit reconnect can recover saved receipts from channel
+history, without proving that absent messages were never sent. [2](#source-2)
+[3](#source-3)
 
 [DERIVED] Cooperative steering requires reading new participant messages before
 acting on an older view. A typing tag may inform a decision to wait, but cannot
@@ -33,3 +36,5 @@ establish exclusive ownership or prove another participant's intent.
 
 1. <a id="source-1"></a> [Protocol and permission evidence](../digests/protocol.md).
 2. <a id="source-2"></a> [Agent client evidence](../digests/agent-client.md).
+
+3. <a id="source-3"></a> [Named agent sessions](../digests/named-sessions.md).

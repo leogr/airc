@@ -101,7 +101,11 @@ DM/NOTICE/TAGMSG policy, history restart/retention gaps, artifact limits,
 JSONL framing, artifact downloads, partial TCP frames, independent output queues,
 TLS trust/hostname checks directly and through CONNECT, bounded/rejected proxy
 responses, proxied SASL and artifact round trips, and process shutdown with stdin
-still open.
+still open. Named-client tests additionally cover persistent process lifetime,
+private state, stale sockets, read replay/serialization, typing waits, echo
+correlation, history recovery and faults before send/after commit/on timeout.
+USERHOST tests cover authenticated identities, registration, case folding and
+the five-name bound.
 
 The parser fuzz target lives in [fuzz](../fuzz/Cargo.toml). With cargo-fuzz and a
 nightly toolchain, run `cargo +nightly fuzz run protocol -- -max_total_time=60`.
@@ -122,6 +126,23 @@ Linux amd64 binary: automatic join queries, `/ban`, rendered agent messages,
 human steering and history after client restart. This used local processes and
 a controlling PTY, not a VM or sandbox deployment.
 
-This initial implementation has no automatic client reconnection, durable local
-cursors, Internet-scale load validation, federation, Windows runtime validation,
+The named-client and USERHOST changes were checked on Linux amd64 with Rust
+1.99.0 and unmodified Repartee 2.1.3 in a disposable Firecracker-hosted container.
+Its automatic and explicit USERHOST queries received numeric 302, and human
+steering reached two named clients; agent messages returned to Repartee. The
+fixture used private local accounts and loopback plaintext. Existing integration
+tests separately cover TLS/proxy verification; this live check did not exercise
+a remote TLS deployment. A fixed twenty-message unit fixture rendered 4,501
+JSON-event bytes versus 1,161 compact bytes. This measures neither model tokens
+nor total tool/model turns or billed usage.
+
+Claude Code 2.1.296 and Antigravity 1.3.4 also exercised the native commands
+through their shell tools on private loopback fixtures. The exercised paths
+included sends/replies, read replay, stopped-client errors, reconnect and explicit
+cleanup. These checks establish those CLI workflows, not general agent quality
+or token-cost savings.
+
+Named sessions add durable bounded local cursors and a replayable last batch;
+JSONL cursors remain in memory. Neither interface automatically reconnects or
+resends. This implementation has no Internet-scale load validation, federation, Windows runtime validation,
 or built-in box orchestration. Preserve these limits when describing readiness.

@@ -16,6 +16,7 @@ network transport, protocol state, durable storage and agent presentation separa
 | [store](../src/store.rs) | SQLite transactions, schema version and retention |
 | [HTTP](../src/server/http.rs) | Authenticated artifact transfer |
 | [client](../src/client.rs) | Persistent IRC session and bounded JSONL frontend |
+| [agent_session](../src/agent_session/mod.rs) | Explicit local session process, private IPC/state, compact reads and correlated sends |
 
 One state actor owns the SQLite connection and all protocol state. It runs on a
 blocking thread, outside Tokio's network workers. Socket readers send bounded

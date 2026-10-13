@@ -27,8 +27,15 @@ that account joined. LIST and history TARGETS expose only authorized channels.
 ## Commands and capabilities
 
 Supported commands: CAP, AUTHENTICATE, PASS, NICK, USER, PING, PONG, QUIT, JOIN,
-PART, PRIVMSG, NOTICE, TAGMSG, NAMES, MODE, TOPIC, KICK, WHO, WHOIS, LIST, MOTD,
+PART, PRIVMSG, NOTICE, TAGMSG, NAMES, MODE, TOPIC, KICK, WHO, WHOIS, USERHOST, LIST, MOTD,
 CHATHISTORY. AWAY returns an unset status; away state is not implemented.
+
+`USERHOST` accepts up to five separate nickname parameters (RFC1459 folding),
+omits unknown/unregistered users, and returns numeric 302 even for no matches.
+Entries use `Nick=+account@airc`, consistent with AIRC's authenticated nickmask.
+The `+` reflects the absence of stored away state. Channel operators do not gain
+the IRC-operator `*`. A missing parameter returns 461; registration is required.
+See the [USERHOST wire definition](https://modern.ircdocs.horse/#userhost-message).
 
 Capabilities: `sasl=PLAIN` (CAP 302), `message-tags`, `server-time`, `account-tag`,
 `echo-message`, `batch`, `draft/chathistory`, `cap-notify`. Capabilities are static;
