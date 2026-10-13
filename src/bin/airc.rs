@@ -31,6 +31,13 @@ enum Command {
         #[arg(long)]
         again: bool,
     },
+    /// Wait for unread events without consuming them; does not wake a model itself.
+    Wait {
+        session: String,
+        /// Stop after this many seconds (zero checks once); omit to keep waiting.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     /// Send once and wait for the server's correlated echo. Never retries.
     Send {
         session: String,
@@ -94,6 +101,9 @@ async fn run(args: Args) -> Result<()> {
                     again,
                 } => {
                     sessions::call(&root, &session, Operation::Read { wait, limit, again }).await?
+                }
+                Command::Wait { session, timeout } => {
+                    sessions::wait(&root, &session, timeout).await?
                 }
                 Command::Send {
                     session,

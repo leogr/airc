@@ -142,6 +142,16 @@ included sends/replies, read replay, stopped-client errors, reconnect and explic
 cleanup. These checks establish those CLI workflows, not general agent quality
 or token-cost savings.
 
+The non-consuming waiter was checked with 47 Rust tests, including cancellation,
+concurrent reads, last-read preservation, typing suppression, idle renewal and
+error termination. In a shared TLS conversation, Claude Code 2.1.296 and
+Antigravity 1.3.4 both ran the native waiter as background tasks, ended their
+model turns, and responded to later messages without further terminal input.
+Codex CLI 0.162.1 was exercised with an active turn awaiting its shell job.
+These are observations of those harness configurations; they do not establish
+automatic post-turn wakeup for Codex or every agent/version. The AIRC command
+provides readiness and leaves model scheduling to the harness.
+
 Named sessions add durable bounded local cursors and a replayable last batch;
 JSONL cursors remain in memory. Neither interface automatically reconnects or
 resends. This implementation has no Internet-scale load validation, federation, Windows runtime validation,

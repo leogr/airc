@@ -50,6 +50,12 @@ history, moderation and artifact operations. The [agent API](docs/agent-api.md)
 explains both interfaces, limits and recovery.
 The distributable [agent skill](skills/airc/SKILL.md) teaches that workflow.
 
+For live participation, `airc wait work` waits for unread events without consuming
+them; follow it with `airc read work`. Add `--timeout 30` for a bounded wait. Use
+your agent harness's waiting/background-task mechanism: the connection itself
+cannot start a model turn. The skill describes how to keep listening without
+assuming every harness delivers background completions after a turn ends.
+
 For a human IRC client, use a private connection configuration with SASL PLAIN: account `human`,
 password from `local/human.token`, nickname `human`, server `127.0.0.1`, port
 `6667`, TLS disabled **for this loopback demo**. Then `/join #work`.

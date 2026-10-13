@@ -1,8 +1,8 @@
 # Named agent sessions
 
-Verification: `fcf4070322c2107d412f45ac90025a10a014f4eb` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `27f727f80b97f0682b201e87d2d83ff2dc8125e9` and accompanying changes; re-read cited symbols when behavior changes.
 
-[FACT] The existing Rust binary supports explicit connect/read/send/status/
+[FACT] The existing Rust binary supports explicit connect/read/wait/send/status/
 disconnect commands alongside unchanged JSONL version 1. A spawned local Unix
 client keeps the existing SASL/TLS/proxy connection across shell invocations.
 It has no idle expiry, automatic reconnect or mutation replay. Named startup
@@ -16,6 +16,16 @@ file, file sync, rename and directory sync; schema/config identity mismatches
 fail rather than reset. Local IPC is versioned, size/time bounded and admits at
 most sixteen sockets. This is a same-user local interface, not a sandbox against
 processes with that user's authority. [2](#source-2) [3](#source-3)
+
+[FACT] `wait` uses read's unread-event predicate without changing the cursor or
+last-read cache. One readiness waiter can coexist with a reader; readiness is
+not a reservation. No timeout means renewing successful idle IPC waits of at
+most sixty seconds; errors/disconnects end the command. Optional timeout zero
+checks once. Exit 0 signals readiness; timeout/runtime failures exit 1 with
+visible diagnostics. Caller EOF releases the waiter. IPC version 2 requires an
+old worker's explicit disconnect before upgrade; saved state remains version 1.
+Harness wakeups are outside this CLI. [1](#source-1) [2](#source-2)
+[6](#source-6) [8](#source-8)
 
 [FACT] A buffer capped at 512 events and 512 KiB of rendered text retains
 compact conversation and membership/control
@@ -53,10 +63,11 @@ model tokens, billed usage or total agent turns. [6](#source-6) [7](#source-7)
 
 ## Sources
 
-1. <a id="source-1"></a> [src/bin/airc.rs](../../src/bin/airc.rs#L5-L146) — CLI dispatch, JSONL preservation and shutdown.
-2. <a id="source-2"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L97-L511) — process lifecycle, bounded IPC, ordered reads/sends and failure reporting.
+1. <a id="source-1"></a> [src/bin/airc.rs](../../src/bin/airc.rs#L5-L156) — CLI dispatch, JSONL preservation and shutdown.
+2. <a id="source-2"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L125-L588) — process lifecycle, bounded IPC, readiness/reads/sends and failure reporting.
 3. <a id="source-3"></a> [src/agent_session/storage.rs](../../src/agent_session/storage.rs#L18-L136) — ownership, native lock, bounded decode and durable publication.
 4. <a id="source-4"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L57-L423) — compact events, confirmation matching, references, cursor and receipts.
 5. <a id="source-5"></a> [src/agent_session/history.rs](../../src/agent_session/history.rs#L6-L194) — `recover`, bounded paging, live staging and overlap regression.
-6. <a id="source-6"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L145-L586) — named CLI and network-fault scenarios.
+6. <a id="source-6"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L145-L706) — named CLI, non-consuming wait/cancellation and network-fault scenarios.
 7. <a id="source-7"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L425-L578) — state, identity, control escaping and fixed-transcript tests.
+8. <a id="source-8"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L591-L646) — idle renewal, error termination and malformed readiness tests.

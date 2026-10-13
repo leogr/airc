@@ -26,13 +26,16 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    Wait {
+        wait: u64,
+    },
     Read {
         wait: u64,
         limit: usize,
@@ -60,6 +63,8 @@ pub struct Response {
     pub ok: bool,
     pub text: String,
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ready: Option<bool>,
 }
 impl Response {
     fn ok(text: impl Into<String>) -> Self {
@@ -67,6 +72,7 @@ impl Response {
             ok: true,
             text: text.into(),
             version: VERSION,
+            ready: None,
         }
     }
     fn error(text: impl Into<String>) -> Self {
@@ -74,6 +80,13 @@ impl Response {
             ok: false,
             text: format!("! {}\n", safe(&text.into())),
             version: VERSION,
+            ready: None,
+        }
+    }
+    fn readiness(ready: bool) -> Self {
+        Self {
+            ready: Some(ready),
+            ..Self::ok("")
         }
     }
 }
@@ -85,6 +98,10 @@ struct Call {
 struct WaitingRead {
     until: Instant,
     limit: usize,
+    reply: oneshot::Sender<Response>,
+}
+struct WaitingNotice {
+    until: Instant,
     reply: oneshot::Sender<Response>,
 }
 struct WaitingSend {
@@ -195,7 +212,7 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
         "session socket owner mismatch"
     );
     let wait = match &operation {
-        Operation::Read { wait, .. } => *wait + 5,
+        Operation::Read { wait, .. } | Operation::Wait { wait } => *wait + 5,
         Operation::Send { .. } => 15,
         _ => 5,
     };
@@ -250,7 +267,47 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
     }
 }
 
+/// Wait for unread events without advancing the cursor or replacing read replay.
+/// Each IPC wait is bounded; only successful idle responses renew the wait.
+pub async fn wait(root: &Path, name: &str, seconds: Option<u64>) -> Result<Response> {
+    let deadline = seconds
+        .map(|value| {
+            Instant::now()
+                .checked_add(Duration::from_secs(value))
+                .context("wait timeout is too large")
+        })
+        .transpose()?;
+    loop {
+        let remaining = deadline.map(|end| end.saturating_duration_since(Instant::now()));
+        // Round up so the last fractional second cannot become a busy poll.
+        let interval = remaining.map_or(60, |left| {
+            left.as_secs()
+                .saturating_add(u64::from(left.subsec_nanos() != 0))
+                .min(60)
+        });
+        let response = call(root, name, Operation::Wait { wait: interval }).await?;
+        if !response.ok {
+            return Ok(response);
+        }
+        match response.ready {
+            Some(true) => {
+                return Ok(Response::ok(format!(
+                    "Unread events available; run airc read {name}. No events consumed.\n"
+                )));
+            }
+            Some(false) => {}
+            None => bail!("session omitted wait readiness; no request was retried"),
+        }
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Ok(Response::error("wait timed out; no events consumed"));
+        }
+    }
+}
+
 fn validate(operation: &Operation) -> Result<()> {
+    if let Operation::Wait { wait } = operation {
+        ensure!(*wait <= 60, "internal wait requires 0–60 seconds");
+    }
     if let Operation::Read { wait, limit, again } = operation {
         ensure!(
             *wait <= 60 && (1..=200).contains(limit),
@@ -329,6 +386,7 @@ async fn serve(
     let (requests, mut request_rx) = mpsc::channel::<Call>(16);
     let mut clients = JoinSet::new();
     let mut reader: Option<WaitingRead> = None;
+    let mut waiter: Option<WaitingNotice> = None;
     let mut sender: Option<WaitingSend> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -370,6 +428,13 @@ async fn serve(
             }
             Some(call) = request_rx.recv() => {
                 match call.operation {
+                    Operation::Wait { wait } => {
+                        if waiter.as_ref().is_some_and(|w| !w.reply.is_closed()) {
+                            let _ = call.reply.send(Response::error("another waiter is active; keep one waiter per session"));
+                        } else {
+                            waiter = Some(WaitingNotice { until: Instant::now() + Duration::from_secs(wait), reply: call.reply });
+                        }
+                    }
                     Operation::Status => { let _ = call.reply.send(Response::ok(state.describe(true))); }
                     Operation::Disconnect => {
                         state.status = "explicitly disconnected".into();
@@ -408,6 +473,16 @@ async fn serve(
             }
             _ = tick.tick() => {},
         }
+        if waiter.as_ref().is_some_and(|w| w.reply.is_closed()) {
+            waiter = None;
+        }
+        if waiter
+            .as_ref()
+            .is_some_and(|w| state.has_unread() || Instant::now() >= w.until)
+        {
+            let waiting = waiter.take().unwrap();
+            let _ = waiting.reply.send(Response::readiness(state.has_unread()));
+        }
         if reader.as_ref().is_some_and(|r| r.reply.is_closed()) {
             reader = None;
         }
@@ -432,6 +507,9 @@ async fn serve(
     }
     if let Some(read) = reader {
         let _ = read.reply.send(Response::error(state.status.clone()));
+    }
+    if let Some(waiting) = waiter {
+        let _ = waiting.reply.send(Response::error(state.status.clone()));
     }
     // Every local socket has a bounded writer; allow replies to flush on quit.
     drop(request_rx);
@@ -508,4 +586,61 @@ async fn write_json(
     writer.write_all(&line).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn indefinite_wait_renews_only_a_successful_idle_response() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Storage::open(root.path(), "waiter").unwrap();
+        let listener = UnixListener::bind(store.socket()).unwrap();
+        let peer = tokio::spawn(async move {
+            for ready in [false, true] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let line = read_line(&mut socket, 16384).await.unwrap().unwrap();
+                let request: Request = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.version, VERSION);
+                assert!(matches!(request.operation, Operation::Wait { wait: 60 }));
+                write_json(socket.get_mut(), &Response::readiness(ready))
+                    .await
+                    .unwrap();
+            }
+        });
+        let response = timeout(Duration::from_secs(5), wait(root.path(), "waiter", None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.ok);
+        assert!(response.text.contains("airc read waiter"));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_does_not_retry_an_error_or_missing_readiness() {
+        for response in [Response::error("stopped"), Response::ok("malformed reply")] {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let store = Storage::open(root.path(), "waiter").unwrap();
+            let listener = UnixListener::bind(store.socket()).unwrap();
+            let peer = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                read_line(&mut socket, 16384).await.unwrap().unwrap();
+                write_json(socket.get_mut(), &response).await.unwrap();
+                assert!(
+                    timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let response = wait(root.path(), "waiter", None).await;
+            assert!(response.is_err() || !response.unwrap().ok);
+            peer.await.unwrap();
+        }
+    }
 }

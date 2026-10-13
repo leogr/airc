@@ -7,6 +7,7 @@
 | `airc connect NAME --config FILE` | Explicit persistent client and bounded initial/catch-up history; no mutation replay |
 | `airc read NAME --wait SECONDS --limit COUNT` | Wait 0–60 seconds (0); read 1–200 actionable events (50); typing does not wake |
 | `airc read NAME --again` | Repeat last saved batch, also while stopped; no cursor advance |
+| `airc wait NAME [--timeout SECONDS]` | Non-consuming readiness; default keeps waiting, zero checks once; exit 0 ready, 1 timeout/runtime error; does not wake a model itself |
 | `airc send NAME TARGET TEXT --reply REF` | Send once; optional local `@N` or full msgid reply; matching server echo required for success |
 | `airc status NAME` | Connection/saved state, last 32 outcomes and channel recovery anchors |
 | `airc disconnect NAME` | Close this connection; retain private local state |
@@ -22,6 +23,13 @@ read replaces the last-read cache, including when no events arrive. Use `--again
 before another normal read after lost output. Concurrent waiting reads and sends
 are rejected before consuming/sending. Non-message events are not recoverable
 from server history. Reads that overflow the local buffer report GAP.
+
+One readiness waiter can run alongside a normal reader; it never changes the
+cursor or last-read replay. It uses the same actionable-event filter as read.
+Successful idle IPC intervals renew internally, each at most 60 seconds; errors
+and disconnects end it. Use the harness's actual foreground/background waiting
+mechanism, and retain the task handle. Named IPC is version 2, with saved-state
+version 1 unchanged; disconnect an older worker with its original binary first.
 
 Send preparation is saved before queueing. Its client-only correlation tag is
 checked together with authenticated identity, target and text; the tag alone is

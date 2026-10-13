@@ -258,7 +258,7 @@ async fn typing_does_not_wake_read_and_concurrent_reader_is_rejected() {
             .await
             .unwrap(),
     );
-    socket.get_mut().write_all(b"{\"version\":1,\"operation\":{\"op\":\"read\",\"wait\":1,\"limit\":50,\"again\":false}}\n").await.unwrap();
+    socket.get_mut().write_all(b"{\"version\":2,\"operation\":{\"op\":\"read\",\"wait\":1,\"limit\":50,\"again\":false}}\n").await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let duplicate = f.cli(&["read", "trial"]).await;
     assert!(!duplicate.status.success());
@@ -282,12 +282,132 @@ async fn typing_does_not_wake_read_and_concurrent_reader_is_rejected() {
     let mut abandoned = UnixStream::connect(f.root.join("trial/client.sock"))
         .await
         .unwrap();
-    abandoned.write_all(b"{\"version\":1,\"operation\":{\"op\":\"read\",\"wait\":60,\"limit\":50,\"again\":false}}\n").await.unwrap();
+    abandoned.write_all(b"{\"version\":2,\"operation\":{\"op\":\"read\",\"wait\":60,\"limit\":50,\"again\":false}}\n").await.unwrap();
     drop(abandoned);
     send(&mut human, "actionable").await;
     let line = f.ok(&["read", "trial", "--wait", "2"]).await;
     assert!(line.contains("human(human): actionable"), "{line}");
     f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+async fn blocked_wait(f: &Fixture) -> BufReader<UnixStream> {
+    let mut socket = BufReader::new(
+        UnixStream::connect(f.root.join("trial/client.sock"))
+            .await
+            .unwrap(),
+    );
+    socket
+        .get_mut()
+        .write_all(b"{\"version\":2,\"operation\":{\"op\":\"wait\",\"wait\":60}}\n")
+        .await
+        .unwrap();
+    // Observe admission rather than assuming a sleep schedules the worker.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let probe = f.cli(&["wait", "trial", "--timeout", "0"]).await;
+            let text = String::from_utf8_lossy(&probe.stdout);
+            assert!(!probe.status.success(), "{text}");
+            if text.contains("another waiter") {
+                break;
+            }
+            assert!(text.contains("wait timed out"), "{text}");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    socket
+}
+
+#[tokio::test]
+async fn wait_is_non_consuming_ignores_typing_and_preserves_last_read() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    let initial = f.ok(&["read", "trial"]).await;
+    let idle = f.cli(&["wait", "trial", "--timeout", "0"]).await;
+    assert!(!idle.status.success());
+    assert!(String::from_utf8_lossy(&idle.stdout).contains("wait timed out"));
+    assert_eq!(f.ok(&["read", "trial", "--again"]).await, initial);
+
+    let mut waiting = blocked_wait(&f).await;
+    let mut typing = Message::new("TAGMSG", ["#work"]);
+    typing.tags.insert("+typing".into(), "active".into());
+    for _ in 0..30 {
+        human.outbound.send(typing.clone()).await.unwrap();
+    }
+    assert!(
+        timeout(Duration::from_millis(150), read_line(&mut waiting, 16384))
+            .await
+            .is_err()
+    );
+    // Waiting for readiness does not monopolize the separate read operation.
+    let latest = f.ok(&["read", "trial"]).await;
+    assert!(latest.contains("No new events"));
+    send(&mut human, "wake without consuming me").await;
+    let line = timeout(Duration::from_secs(5), read_line(&mut waiting, 16384))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["ready"], true);
+    assert_eq!(f.ok(&["read", "trial", "--again"]).await, latest);
+    // An unread event keeps readiness true until a normal read consumes it.
+    for args in [
+        vec!["wait", "trial"],
+        vec!["wait", "trial", "--timeout", "0"],
+    ] {
+        assert!(f.ok(&args).await.contains("Unread events available"));
+    }
+    let messages = f.ok(&["read", "trial"]).await;
+    assert_eq!(messages.matches("wake without consuming me").count(), 1);
+    assert!(
+        !f.cli(&["wait", "trial", "--timeout", "1"])
+            .await
+            .status
+            .success()
+    );
+    assert_eq!(f.ok(&["read", "trial", "--again"]).await, messages);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn canceled_wait_releases_its_slot_and_shutdown_wakes_waiter() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let canceled = blocked_wait(&f).await;
+    drop(canceled);
+    // Read-only status remains available while the canceled socket unwinds.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let probe = f.cli(&["wait", "trial", "--timeout", "0"]).await;
+            let text = String::from_utf8_lossy(&probe.stdout);
+            if text.contains("wait timed out") {
+                break;
+            }
+            assert!(text.contains("another waiter"), "{text}");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.ok(&["status", "trial"]).await.starts_with("connected"));
+    let mut waiting = blocked_wait(&f).await;
+    f.ok(&["disconnect", "trial"]).await;
+    let line = timeout(Duration::from_secs(5), read_line(&mut waiting, 16384))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(line.contains("explicitly disconnected"), "{line}");
+    let stopped = f.cli(&["wait", "trial"]).await;
+    assert!(!stopped.status.success());
+    assert!(String::from_utf8_lossy(&stopped.stdout).contains("is stopped"));
     server.shutdown().await.unwrap();
 }
 
@@ -334,7 +454,7 @@ async fn discarded_ipc_read_is_recoverable_and_stale_socket_is_not_a_live_sessio
             .await
             .unwrap(),
     );
-    stream.get_mut().write_all(b"{\"version\":1,\"operation\":{\"op\":\"read\",\"wait\":2,\"limit\":50,\"again\":false}}\n").await.unwrap();
+    stream.get_mut().write_all(b"{\"version\":2,\"operation\":{\"op\":\"read\",\"wait\":2,\"limit\":50,\"again\":false}}\n").await.unwrap();
     // Consume/discard the IPC result as a shell tool with lost stdout would.
     let line = read_line(&mut stream, 32768).await.unwrap().unwrap();
     let value: serde_json::Value = serde_json::from_str(&line).unwrap();

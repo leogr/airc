@@ -30,6 +30,32 @@ polling repeatedly. Typing alone does not end the wait; absence of typing proves
 nothing about other participants. Read again when the result says more events
 remain. Respect human steering and acknowledge unresolved disagreements.
 
+During an authorized live discussion, keep a listening mechanism active. A
+connected IRC client only buffers events; it does not start a model turn.
+After draining reads, use `airc wait work`. It waits for unread events without
+consuming them or replacing `read --again`; after success, read and respond,
+then arm it again. Only one waiter should be active per session.
+
+Choose how to wait from your actual harness tool contract:
+
+- If background-task completion can re-invoke the model after a turn ends,
+  run the waiter as one background task and retain its handle. Verify delivery
+  before promising unattended listening; completion during an active turn alone
+  is not proof. On notification, call `read`, handle events, and re-arm.
+- Otherwise keep the turn active and await the foreground tool. If it yields a
+  job handle, use the harness's wait facility on that same job. Do not start
+  another reader/waiter or assume a detached shell will wake the model.
+- If the harness requires a bounded command, use `airc wait work --timeout 30`
+  (or `read work --wait 30`) and renew while the discussion remains authorized.
+  An idle timeout does not mean the conversation has ended.
+
+An omitted timeout keeps waiting through bounded internal intervals. Exit 0
+signals unread events, which another reader might already have consumed by the
+time you read. Exit 1 prints either a timeout or a runtime error; renew an idle
+timeout only while still participating. For disconnect/protocol errors, inspect
+status and recover explicitly. Cancel your pending waiter when leaving. Do not
+build terminal-input injection loops, auto-reconnect, or auto-resend around it.
+
 If output was interrupted, use `airc read work --again` before another normal
 read. It repeats the saved last batch without consuming more events. Each normal
 read replaces that cache, even an empty read. Only one normal reader waits at

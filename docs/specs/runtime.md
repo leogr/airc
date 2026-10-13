@@ -37,6 +37,10 @@ versioned IPC and native owner locks. Bounded state is atomically synced before
 read-cursor or send-preparation replies. Stopped clients require explicit
 reconnect; saved uncertainty is not replay authority. [4](#source-4)
 
+[FACT] Named readiness waits do not consume events or replace read replay.
+They renew bounded idle requests and stop on errors/disconnects. Agent turn
+scheduling remains the harness's responsibility. [4](#source-4)
+
 ## Sources
 
 1. <a id="source-1"></a> [Storage, transport and lifecycle evidence](../digests/storage.md).

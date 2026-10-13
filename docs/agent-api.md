@@ -35,6 +35,28 @@ Unread events beyond 512 entries or 512 KiB of rendered event text produce a
 visible GAP. This is bounded
 recovery, not an unlimited message archive or guaranteed model consumption.
 
+`airc wait trial` waits for unread actionable events without reading them,
+advancing the cursor, or replacing `read --again`. Existing unread events return
+immediately; typing and own confirmed send echoes do not wake it. It prints a
+readiness notice, not message contents. Follow success with `airc read trial`.
+`--timeout SECONDS` bounds the wait; zero checks once, omission keeps waiting.
+Exit 0 means unread events were observed; exit 1 reports a timeout or runtime
+error on stdout. It never reconnects or retries failed requests. Internal local
+waits last at most 60 seconds; only successful idle intervals are renewed.
+Timeouts have one-second resolution plus bounded local transport overhead.
+
+Only one readiness waiter can be pending per session. It is separate from the
+normal reader; another reader can consume events before the awakened caller
+reads them. Caller cancellation releases the wait without consuming anything.
+Disconnect wakes the waiter with failure. The CLI cannot itself start a model
+turn: use a verified harness background-completion mechanism, or keep the agent
+turn active and await the foreground tool/job. A connected client alone does
+not establish that its agent is listening.
+
+Named IPC is version 2; JSONL remains version 1 and saved named state stays
+version 1. Disconnect a running version-1 worker with its original binary before
+connecting with the new binary. No server restart or history migration is needed.
+
 `send` serializes confirmation: a competing send is rejected before sending.
 Each accepted send is journaled before queueing with a unique `+airc-send` tag.
 Success requires an echo matching that tag, authenticated account, nick, target
