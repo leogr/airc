@@ -1,5 +1,6 @@
 //! Named, explicitly started local IRC clients. IPC never carries credentials.
 mod attention;
+mod channels;
 mod history;
 mod state;
 mod storage;
@@ -84,6 +85,58 @@ pub enum Operation {
     Back,
     Status,
     Disconnect,
+    /// Channel controls carry a caller-generated ID, bound before any network write.
+    Join {
+        channel: String,
+        operation_id: String,
+    },
+    Part {
+        channel: String,
+        operation_id: String,
+    },
+    Topic {
+        channel: String,
+        operation_id: String,
+        /// Absent queries, empty clears, other text sets; null is invalid.
+        #[serde(
+            default,
+            deserialize_with = "client::optional_text",
+            skip_serializing_if = "Option::is_none"
+        )]
+        text: Option<String>,
+    },
+}
+
+impl Operation {
+    fn control(&self) -> Option<channels::Request> {
+        let (kind, channel, operation_id, topic) = match self {
+            Self::Join {
+                channel,
+                operation_id,
+            } => (channels::Kind::Join, channel, operation_id, None),
+            Self::Part {
+                channel,
+                operation_id,
+            } => (channels::Kind::Part, channel, operation_id, None),
+            Self::Topic {
+                channel,
+                operation_id,
+                text,
+            } => (channels::Kind::Topic, channel, operation_id, text.clone()),
+            _ => return None,
+        };
+        Some(channels::Request {
+            operation_id: operation_id.clone(),
+            kind,
+            channel: channel.clone(),
+            topic,
+        })
+    }
+}
+
+/// A fresh caller-side control ID: 128 random bits as lowercase hex.
+pub fn operation_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,6 +205,12 @@ struct WaitingAvailability {
     until: Instant,
     expected: &'static str,
     reason: Option<String>,
+    reply: oneshot::Sender<Response>,
+}
+
+/// The pending channel control; its binding and intent are in saved state.
+struct WaitingControl {
+    until: Instant,
     reply: oneshot::Sender<Response>,
 }
 
@@ -259,8 +318,10 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
         Operation::Read { wait, .. } | Operation::Wait { wait, .. } => *wait + 5,
         Operation::Send { .. } => 60,
         Operation::Away { .. } | Operation::Back => 20,
+        Operation::Join { .. } | Operation::Part { .. } | Operation::Topic { .. } => 20,
         _ => 5,
     };
+    let control = operation.control().map(|request| request.operation_id);
     let uncertain = matches!(operation, Operation::Send { .. });
     let availability = matches!(operation, Operation::Away { .. } | Operation::Back);
     let disconnect = matches!(operation, Operation::Disconnect);
@@ -303,12 +364,17 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
             };
             Ok(Response::error(format!(
                 "{detail}; {}",
-                if uncertain {
-                    "send outcome uncertain. Inspect airc status and history before resending; nothing was retried"
+                if let Some(id) = control {
+                    format!(
+                        "channel control outcome unconfirmed for operation_id={id}; inspect airc status {name} for that operation before repeating it. Nothing was retried"
+                    )
+                } else if uncertain {
+                    "send outcome uncertain. Inspect airc status and history before resending; nothing was retried".into()
                 } else if availability {
                     "availability outcome unconfirmed; inspect WHO/WHOIS. Nothing was retried"
+                        .into()
                 } else {
-                    "request was not retried; use read --again to recover a previous read"
+                    "request was not retried; use read --again to recover a previous read".into()
                 }
             )))
         }
@@ -381,6 +447,9 @@ fn validate(operation: &Operation) -> Result<()> {
             crate::multiline::CLIENT_MAX_BYTES
         );
     }
+    if let Some(request) = operation.control() {
+        request.validate()?;
+    }
     Ok(())
 }
 
@@ -392,8 +461,12 @@ pub async fn worker(root: &Path, name: &str, config: &Path) -> Result<()> {
         let config = ClientConfig::load(config)?;
         let mut state = store.load()?.unwrap_or(State::new(&config)?);
         state.begin_epoch();
+        // The ORIGINAL configuration is the identity; only connection setup
+        // uses the saved followed channels.
         ensure!(state.identity == identity(&config)?, "session config changed; use a new session name to preserve old recovery state");
-        let mut connection = client::connect_with(&config, true).await?;
+        state.upgrade(&config)?;
+        let startup = client::connect_named(&config, &state.startup_channels()).await?;
+        let mut connection = startup.connection;
         ensure!(["message-tags", "account-tag", "echo-message", "batch", "draft/chathistory"].iter()
             .all(|cap| connection.capabilities.contains(*cap)), "named sessions need message-tags, account-tag, echo-message, batch and draft/chathistory");
         if state.status.starts_with("connected") {
@@ -402,7 +475,8 @@ pub async fn worker(root: &Path, name: &str, config: &Path) -> Result<()> {
         state.epoch = uuid::Uuid::new_v4().to_string();
         state.status = "connected; no automatic reconnect or resend".into();
         state.context(format!("connected as {}({}); epoch={}; history below is replay", config.nick, config.account, state.epoch));
-        history::recover(&mut connection, &mut state, &config.channels).await?;
+        state.start_channels(&startup.server_name, &startup.joined, &startup.refusals);
+        history::recover(&mut connection, &mut state, &startup.joined).await?;
         store.save(&state)?;
         match fs::remove_file(store.socket()) {
             Ok(()) => {}, Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}, Err(e) => return Err(e.into()),
@@ -456,6 +530,7 @@ async fn serve(
     let mut waiter: Option<WaitingNotice> = None;
     let mut sender: Option<WaitingSend> = None;
     let mut availability: Option<WaitingAvailability> = None;
+    let mut control: Option<WaitingControl> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -497,7 +572,14 @@ async fn serve(
                     let _ = pending.reply.send(Response::error(format!("availability rejected by server {}", message.command)));
                 }
                 let previous_sequence = state.sequence();
-                let confirmed = state.ingest(&message, false);
+                let (confirmed, settled) = state.ingest_live(&message);
+                if let Some((ok, text)) = settled
+                    && let Some(pending) = control.take()
+                {
+                    // Confirmation or refusal is durable before the IPC reply.
+                    store.save(state)?;
+                    let _ = pending.reply.send(if ok { Response::ok(format!("{}\n", safe(&text))) } else { Response::error(text) });
+                }
                 if sender.as_ref().is_some_and(|s| confirmed.as_deref() == Some(s.token.as_str())) {
                     let sent = sender.take().unwrap();
                     store.save(state)?;
@@ -507,7 +589,7 @@ async fn serve(
                     state.set_outcome(&sent.token, format!("rejected by server {} {}", message.command, message.params.join(" ")));
                     store.save(state)?;
                     let _ = sent.reply.send(Response::error(state.outcome(&sent.token)));
-                } else if confirmed.is_some() || state.sequence() != previous_sequence {
+                } else if state.take_dirty() || confirmed.is_some() || state.sequence() != previous_sequence {
                     // Persist changed state; echo/rejection paths already saved
                     // above. Typing/setup numerics require no filesystem writes.
                     store.save(state)?;
@@ -536,9 +618,32 @@ async fn serve(
                             let _ = call.reply.send(Response::error("another read is waiting; reads are serialized, retry after it finishes"));
                         } else { reader = Some(WaitingRead { until: Instant::now() + Duration::from_secs(wait), limit, reply: call.reply }); }
                     }
+                    op @ (Operation::Join { .. } | Operation::Part { .. } | Operation::Topic { .. }) => {
+                        let Some(request) = op.control() else { continue };
+                        // One pending slot across sends, availability and controls.
+                        let busy = (sender.is_some() || availability.is_some() || control.is_some())
+                            .then_some("another send, availability update or channel control awaits confirmation");
+                        match state.begin_control(request, busy) {
+                            Err(e) => { let _ = call.reply.send(Response::error(format!("not sent: {e:#}"))); }
+                            Ok(channels::Begin::Done { ok, text }) => {
+                                store.save(state)?;
+                                let _ = call.reply.send(if ok { Response::ok(format!("{}\n", safe(&text))) } else { Response::error(text) });
+                            }
+                            Ok(channels::Begin::Send(message)) => {
+                                store.save(state)?; // Bound ID and intent are durable BEFORE queuing.
+                                if connection.outbound.try_send(vec![message]).is_err() {
+                                    let text = state.unsent_control("connection queue unavailable").map_or_else(String::new, |(_, text)| text);
+                                    store.save(state)?;
+                                    let _ = call.reply.send(Response::error(text));
+                                } else {
+                                    control = Some(WaitingControl { until: Instant::now() + SEND_TIMEOUT, reply: call.reply });
+                                }
+                            }
+                        }
+                    }
                     op @ (Operation::Away { .. } | Operation::Back) => {
-                        if availability.is_some() || sender.is_some() {
-                            let _ = call.reply.send(Response::error("not sent: another send or availability update awaits confirmation"));
+                        if availability.is_some() || sender.is_some() || control.is_some() {
+                            let _ = call.reply.send(Response::error("not sent: another send, availability update or channel control awaits confirmation"));
                             continue;
                         }
                         let reason = match op { Operation::Away { reason } => Some(reason), _ => None };
@@ -555,8 +660,8 @@ async fn serve(
                         }
                     }
                     Operation::Send { target, text, reply } => {
-                        if availability.is_some() {
-                            let _ = call.reply.send(Response::error("not sent: an availability update awaits confirmation"));
+                        if availability.is_some() || control.is_some() {
+                            let _ = call.reply.send(Response::error("not sent: an availability update or channel control awaits confirmation"));
                             continue;
                         }
                         if sender.is_some() {
@@ -626,8 +731,33 @@ async fn serve(
             state.notice(state.status.clone());
             break; // Prevent a late rejection being assigned to a later send.
         }
+        if control.as_ref().is_some_and(|c| Instant::now() >= c.until) {
+            state.status = "channel control confirmation timed out; reconnect explicitly and inspect airc status; nothing was retried".into();
+            state.notice(state.status.clone());
+            break; // A late reply must never settle a later control.
+        }
+        // Setup barriers and the single JOIN history request advance on events and ticks.
+        if let Some(request) = state.channel_tick(std::time::Instant::now())
+            && connection.outbound.try_send(vec![request]).is_err()
+        {
+            state.history_unsent();
+        }
+        if state.take_dirty() {
+            store.save(state)?;
+        }
     }
+    let interrupted = control.map(|pending| {
+        (
+            pending,
+            state.interrupt_control("the connection ended before confirmation"),
+        )
+    });
     store.save(state)?;
+    if let Some((pending, text)) = interrupted {
+        let _ = pending.reply.send(Response::error(
+            text.unwrap_or_else(|| state.status.clone()),
+        ));
+    }
     if let Some(pending) = availability {
         let _ = pending.reply.send(Response::error(
             "availability outcome unconfirmed; connection ended; nothing was retried",
@@ -737,6 +867,43 @@ mod tests {
         assert!(response.ok);
         assert!(response.text.contains("airc read waiter"));
         peer.await.unwrap();
+    }
+
+    #[test]
+    fn channel_control_requests_are_strict_about_ids_channels_and_null_text() {
+        let id = operation_id();
+        assert!(channels::valid_operation_id(&id));
+        assert_ne!(id, operation_id());
+        let parse = |operation: serde_json::Value| {
+            serde_json::from_value::<Request>(
+                serde_json::json!({"version": VERSION, "operation": operation}),
+            )
+            .map_err(anyhow::Error::from)
+            .and_then(|request| validate(&request.operation).map(|()| request.operation))
+        };
+        let query =
+            parse(serde_json::json!({"op": "topic", "channel": "#a", "operation_id": id})).unwrap();
+        assert!(matches!(query, Operation::Topic { text: None, .. }));
+        assert!(
+            !serde_json::to_string(&query).unwrap().contains("text"),
+            "a query omits text"
+        );
+        let clear = parse(
+            serde_json::json!({"op": "topic", "channel": "#a", "operation_id": id, "text": ""}),
+        )
+        .unwrap();
+        assert!(matches!(clear, Operation::Topic { text: Some(ref t), .. } if t.is_empty()));
+        for invalid in [
+            serde_json::json!({"op": "topic", "channel": "#a", "operation_id": id, "text": null}),
+            serde_json::json!({"op": "topic", "channel": "#a", "operation_id": id, "text": "a\nb"}),
+            serde_json::json!({"op": "join", "channel": "#a"}),
+            serde_json::json!({"op": "join", "channel": "#a", "operation_id": id.to_uppercase()}),
+            serde_json::json!({"op": "join", "channel": "a", "operation_id": id}),
+            serde_json::json!({"op": "part", "channel": "#a", "operation_id": id, "text": "x"}),
+            serde_json::json!({"op": "join", "channel": "#a", "operation_id": id, "reason": "x"}),
+        ] {
+            assert!(parse(invalid.clone()).is_err(), "{invalid}");
+        }
     }
 
     #[tokio::test]

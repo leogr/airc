@@ -80,6 +80,28 @@ impl Store {
         )?)
     }
 
+    /// Prepare additions before live catalog publication. Existing rows retain
+    /// their topics, moderation, bans and history. A later staging failure may
+    /// leave inert rows, but rows alone never grant access to a channel.
+    pub fn add_channels(&mut self, channels: &[crate::config::Channel]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        for channel in channels {
+            tx.execute(
+                "INSERT OR IGNORE INTO channels(name, moderated) VALUES (?1, ?2)",
+                params![crate::protocol::fold(&channel.name), channel.moderated],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fault injection for staging tests only.
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str) -> Result<()> {
+        self.db.execute_batch(sql)?;
+        Ok(())
+    }
+
     pub fn set_channel(&self, name: &str, moderated: bool, topic: &str) -> Result<()> {
         self.db.execute(
             "UPDATE channels SET moderated=?2, topic=?3 WHERE name=?1",

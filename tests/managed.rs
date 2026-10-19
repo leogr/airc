@@ -296,6 +296,9 @@ fn both_binaries_print_the_same_feature_probe() {
         "unix-artifacts",
         "client-unix",
         "client-artifact-unix",
+        "channel-add-reload",
+        "client-topic",
+        "named-channels",
     ] {
         assert!(features.iter().any(|f| f == feature), "{feature}");
     }
@@ -703,5 +706,100 @@ async fn relative_configuration_names_resolve_unix_endpoints_from_the_file() {
         .unwrap();
     assert!(ready.contains("\"ready\""), "{ready}");
     child.kill().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+
+async fn command_on(connection: &mut client::Connection, command: &str) -> Message {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = connection.inbound.recv().await.unwrap();
+            if m.command == command {
+                break m;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {command}"))
+}
+
+#[tokio::test]
+async fn reload_adds_channels_and_removes_one_channel_acl_without_revoking_the_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = unix_config(dir.path());
+    let control_dir = dir.path().join("control");
+    std::fs::create_dir(&control_dir).unwrap();
+    let socket = control_dir.join("control.sock");
+    config.control_unix = Some(socket.clone());
+    config.membership_generation = Some(1);
+    let file = dir.path().join("server.toml");
+    render(&file, &config);
+    let server = server::start_file(&file).await.unwrap();
+    let incarnation = control(&socket, r#"{"op":"status"}"#).await["result"]["incarnation"].clone();
+    let mut bob = client::connect(&member(dir.path(), &config, "bob"))
+        .await
+        .unwrap();
+    // Generation 2 adds #ops; the applied #space catalog stays.
+    let mut added = config.clone();
+    added.channels.push(Channel {
+        name: "#ops".into(),
+        members: vec!["alice".into(), "bob".into()],
+        operators: vec![],
+        moderated: false,
+    });
+    added.membership_generation = Some(2);
+    let bytes = render(&file, &added);
+    let applied = control(&socket, r#"{"op":"reload"}"#).await;
+    assert_eq!(applied["result"]["applied_generation"], 2, "{applied}");
+    assert_eq!(applied["result"]["config_sha256"], sha256(&bytes));
+    assert_eq!(applied["result"]["incarnation"], incarnation);
+    bob.outbound
+        .send(vec![Message::new("JOIN", ["#ops"])])
+        .await
+        .unwrap();
+    // The startup JOIN #space may still be queued ahead of it.
+    while command_on(&mut bob, "JOIN").await.params[0] != "#ops" {}
+    // Generation 3 removes bob from #ops only: a KICK, not account revocation.
+    let mut removed = added.clone();
+    removed.channels[1].members.retain(|m| m != "bob");
+    removed.membership_generation = Some(3);
+    render(&file, &removed);
+    let applied = control(&socket, r#"{"op":"reload"}"#).await;
+    assert_eq!(
+        applied["result"]["disconnected"],
+        serde_json::json!([]),
+        "{applied}"
+    );
+    assert_eq!(
+        applied["result"]["kicked"],
+        serde_json::json!([{"channel": "#ops", "account": "bob"}])
+    );
+    let kick = command_on(&mut bob, "KICK").await;
+    assert_eq!(
+        (kick.params[0].as_str(), kick.params[1].as_str()),
+        ("#ops", "bob")
+    );
+    bob.outbound
+        .send(vec![Message::new("PRIVMSG", ["#space", "still here"])])
+        .await
+        .unwrap();
+    assert_eq!(
+        command_on(&mut bob, "PRIVMSG").await.params[1],
+        "still here"
+    );
+    bob.outbound
+        .send(vec![Message::new("JOIN", ["#ops"])])
+        .await
+        .unwrap();
+    assert_eq!(command_on(&mut bob, "403").await.params[1], "#ops");
+    // A -> A+B -> A+C: removing the applied #ops is refused; nothing changes.
+    let mut replaced = removed.clone();
+    replaced.channels[1].name = "#other".into();
+    replaced.membership_generation = Some(4);
+    render(&file, &replaced);
+    let refused = control(&socket, r#"{"op":"reload"}"#).await;
+    assert_eq!(refused["code"], "RESTART_REQUIRED", "{refused}");
+    let status = control(&socket, r#"{"op":"status"}"#).await;
+    assert_eq!(status["result"]["applied_generation"], 3);
+    assert_eq!(status["result"]["accounts"]["bob"]["connections"], 1);
     server.shutdown().await.unwrap();
 }

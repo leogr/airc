@@ -9,6 +9,8 @@ airc send trial '#work' 'The parser test reproduces it.' --reply @1
 airc send trial '#work' --stdin <<'TEXT'
 Multi-line text, code fences and long lines stay one message.
 TEXT
+airc join trial '#review'
+airc topic trial '#review'
 airc status trial
 airc read trial --again
 airc disconnect trial
@@ -57,6 +59,64 @@ Peer AWAY notifications are readable context and stay quiet in `messages` and
 working/paused/available state. Connection, explicit away and locally observed
 listening are separate facts. JSONL `who` supplies standard 352/315 roster
 rows; its `away`/`back` operations report queued, then 306/305 arrive as events.
+
+### Channels and topics
+
+```sh
+airc join trial '#review'
+airc topic trial '#review' --set 'Parser regression triage'
+airc topic trial '#review'
+airc part trial '#review'
+```
+
+The server's channel ACL decides access. A session keeps separate facts: a
+durable *followed* preference that explicit reconnect joins, *membership* proven
+on the current connection only, and per-channel refusal and quarantine evidence.
+A new session follows its configuration's `channels`; `join`/`part` change only
+the preference, never the configuration identity. Startup joins followed,
+unquarantined channels in order. A 403 or 474 refusal is recorded with a critical
+notice, the preference is kept and startup continues; the session stays
+connected even when every JOIN is refused or nothing is followed. Authentication,
+transport and setup-bound failures still fail `connect`.
+
+Each `join`, `part` or `topic` invocation generates a fresh 128-bit
+`operation_id` before contacting the worker. The worker saves the ID, exact
+request and intent before writing to the network, and the outcome before
+replying; results and `status` show the ID. Success requires this connection's
+authenticated self JOIN, PART or TOPIC (nick and account, exact channel and
+text) or, for a topic query, the server's 331/332 reply. Another connection of
+the same account cannot confirm it. A refusal restores the previous follow
+preference and exits nonzero. `join` of a channel joined on this connection,
+and `part` of one known absent, succeed without network output. After a lost
+reply, find that ID in `status`: a repeated invocation has its own ID and cannot
+claim the first outcome. A request repeating a retained ID returns its saved
+outcome without network output; a different request with that ID is refused.
+Nothing is retried automatically.
+
+One send, availability update or channel control is pending at a time; reads
+and waits continue. A control unconfirmed within 10 seconds closes the connection
+so a late reply cannot settle a later request, and its receipt becomes uncertain.
+An interrupted join or part quarantines that channel: reconnect does not join it
+until an explicit `join` or `part`. A KICK of this session marks the channel
+absent, keeps the preference, records the refusal, quarantines the channel and
+adds a critical notice; nothing rejoins automatically.
+
+A fresh live JOIN confirms membership, not history. The worker then fetches one
+LATEST page of up to 20 messages and 2 MiB of text per newly joined channel,
+one request at a time, within 20 seconds including queueing. Its records are
+`history` context that never wakes `wait` for ordinary messages; incomplete,
+failed and overflowing pages produce critical GAP notices. Status shows
+`queued`, `loading`, `complete`, `incomplete` or `unavailable`. A timeout or
+uncorrelated history reply stops further page fetches on that connection rather
+than misattribute them; reconnect to recover. Repeating `join` fetches nothing.
+
+`topic` alone queries; `--set TEXT` (1–200 UTF-8 bytes, no CR/LF/NUL) and
+`--clear` need channel-operator rights. After a JOIN the server sends the topic
+and member list, ending with 366. A query is refused unsent until that end of
+NAMES; a setup unfinished after 10 seconds leaves topic and roster evidence
+unknown and refuses queries until reconnect, without implying absence. The
+initial topic never replaces a newer authenticated TOPIC. Saved state tracks at
+most 128 channels and 32 control receipts.
 
 ### Multiline messages
 
@@ -147,7 +207,8 @@ from a different session or an expired local reference must not be guessed.
 Unrecognized incoming reply IDs display as `reply=msgid:...`, capped at 128
 characters with an explicit truncation marker; they are not local references.
 
-Every explicit reconnect uses saved per-channel msgids for AFTER catch-up,
+Every explicit reconnect uses saved per-channel msgids for AFTER catch-up of
+the channels it joined,
 up to six pages of at most 20 messages per channel under a 20-second recovery
 deadline. Byte-bounded pages can be short; paging stops at an empty page.
 
@@ -170,8 +231,11 @@ bounded to 16 MiB and atomically replaced with file/directory sync. It includes
 conversation text and send receipts, so treat it as private data. No token values
 are stored. Socket paths must fit 100 bytes; use a shorter state directory if needed.
 
-The local IPC and state schema are versioned. Disconnect with the original
-binary before replacing it. Changing server/account/config for an existing
+The local IPC and state schema are versioned. Saved state version 2 adds the
+channel fields; version 1 stays readable, and the next explicit `connect`
+upgrades it, following the original configured channels. IPC stays version 2:
+channel controls are additive operations that older workers reject unapplied.
+Disconnect with the original binary before replacing it. Changing server/account/config for an existing
 session is refused; use a new name. Named cursors/references survive reconnect;
 the connection epoch changes. Incompatible/corrupt state is never silently reset.
 An unclean worker exit is reported by offline status and the next reconnect.
@@ -304,6 +368,12 @@ rules, with these differences:
   inspect history before deciding.
 - Request lines may be up to 2 MiB. The ring keeps at most 512 events and
   8 MiB; a read page stops before 1 MiB but always holds one event.
+- `{"id":…,"op":"topic","channel":"#c"}` queries a topic; `"text":""` clears it
+  and other text (1–200 UTF-8 bytes, no CR/LF/NUL) sets it; `null` is invalid.
+  The reply is the usual queued acknowledgment. A query's 331/332 and a set's
+  echo, `TOPIC` from this connection's `nick!account@airc` with the same channel
+  and text, arrive through `read`; another connection of the account proves
+  nothing. Version 1 rejects `topic` without queueing it.
 
 Evidence: [client](../src/client.rs), [integration tests](../tests/collaboration.rs),
 [managed transport tests](../tests/managed.rs).

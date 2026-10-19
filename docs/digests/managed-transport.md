@@ -1,6 +1,6 @@
 # Managed transport and membership control
 
-Verification: `db271dabb0266cfa5e491ac056d6c064282d4a78` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `62636d072453eff4f2f3aeff493d73e51137d623` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] Server configuration takes exactly one of `listen` and `listen_unix`, and
 for artifacts exactly one of `listen` and `listen_unix`. Unix IRC refuses TLS,
@@ -30,12 +30,20 @@ passes the operation to the state actor. Replies are capped at 1 MiB.
 [FACT] Status reports protocol 1, the feature list, a per-process random
 incarnation, applied generation, applied digest, listener kinds, the configured
 account count and connected accounts with connection counts. Reload compares
-the baseline (all fields except accounts, channels and generation, plus the
-channel name set) and returns `RESTART_REQUIRED` on difference, then
-`GENERATION_STALE` for a lower generation and `GENERATION_CONFLICT` for the same
-generation with a different digest; the same digest is idempotent. Applying swaps
-accounts, channels and generation into the actor configuration and the shared
-handle read by artifact HTTP. [5](#source-5)
+the baseline (all fields except accounts, channels and generation) and returns
+`RESTART_REQUIRED` on difference or when any currently applied channel name is
+absent with its exact spelling, so removal or rename fails after earlier
+additions. Then `GENERATION_STALE` covers a lower generation and
+`GENERATION_CONFLICT` the same generation with a different digest; the same
+digest is idempotent. New channels are inserted transactionally and loaded with
+validated topics and bans before publication; failure returns `STORAGE_ERROR`
+and leaves the configuration, ACLs, digest and actor channels unchanged.
+Storage insertion may already have committed: inert rows survive a later load
+failure. `INSERT OR IGNORE` preserves their stored topic/moderated values on
+a later attempt; it does not overwrite them from configuration.
+Applying then swaps accounts, channels and generation into the actor
+configuration and the shared handle read by artifact HTTP. [5](#source-5)
+[10](#source-10)
 
 [FACT] After applying, sessions whose account is absent or whose token hash
 changed lose authority. The actor queues QUIT to peers and `ERROR :Membership
@@ -53,15 +61,21 @@ fallback; artifact HTTP uses reqwest's Unix socket support with origin
 `http://airc.local`. `FEATURES` lists implemented features; both binaries print
 it through `features`. `client-presence` covers JSONL WHO/away/back and
 away-notify negotiation; `server-presence` covers explicit AWAY, WHO and
-away-notify. Live control status uses the same build's list. [6](#source-6) [7](#source-7) [8](#source-8)
+away-notify; `channel-add-reload`, `client-topic` and `named-channels` cover
+reload additions, JSONL version 2 `topic` and named channel controls. Live
+control status uses the same build's list. [6](#source-6) [7](#source-7) [8](#source-8)
 
 [FACT] Tests run a Unix-only server with no TCP address, check 0600 sockets,
 artifact upload/download/announcement over Unix and socket removal on shutdown;
 stale/live/file/symlink handling; configuration exclusivity and control placement;
 the feature probe from both binaries; and control status, idempotent/conflicting/
 stale/restart-required reloads, KICK, account revocation within one second, old
-token refusal over IRC and HTTP, and token rotation. Unit tests cover lock refusal, ERROR delivery after the kill
-sender drops, and exact kick counts with 1024 details for 1100 kicks.
+token refusal over IRC and HTTP, and token rotation; a channel addition, a
+one-channel ACL removal that KICKs without revoking the account (a rejoin gets
+403) and a refused later replacement. Unit tests cover lock refusal, ERROR
+delivery after the kill sender drops, exact kick counts with 1024 details for
+1100 kicks, and sequential addition/removal/rename plus an injected staging
+failure.
 [9](#source-9) [2](#source-2) [5](#source-5)
 
 ## Sources
@@ -70,8 +84,9 @@ sender drops, and exact kick counts with 1024 details for 1100 kicks.
 2. <a id="source-2"></a> [src/server/mod.rs](../../src/server/mod.rs#L61-L217) — `ControlOp`, `Listener`, `OwnedSocket`, locked no-replace `bind_unix`; `start_file`/`start_inner` at L225-L369; `session` explicit-kill and writer sentinel at L389-L451; lock and graceful-close tests at L454-L511.
 3. <a id="source-3"></a> [src/server/http.rs](../../src/server/http.rs#L23-L55) — generic `serve` over an Axum listener and per-request shared configuration.
 4. <a id="source-4"></a> [src/server/control.rs](../../src/server/control.rs#L1-L95) — bounded control listener, request handling and reply cap.
-5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L84-L383) — `SharedConfig`, `reloadable_baseline`, `control`, `status`, `reload`, bounded `reloaded`, `close`; kick-count test at L2535-L2596.
+5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L83-L422) — `Channel::load`, `SharedConfig`, `reloadable_baseline`, `control`, `status`, `reload`, bounded `reloaded`, `close`; kick-count and addition/staging tests at L2574-L2721.
 6. <a id="source-6"></a> [src/client.rs](../../src/client.rs#L23-L132) — Unix endpoint fields, absolute-base loading and `validate`; `artifact_origin`/`http_client` at L1016-L1042.
 7. <a id="source-7"></a> [src/transport.rs](../../src/transport.rs#L42-L59) — `connect_unix`.
-8. <a id="source-8"></a> [src/lib.rs](../../src/lib.rs#L11-L37) — `FEATURES` and `feature_probe`; `features` commands in `src/bin/aircd.rs` and `src/bin/airc.rs`.
-9. <a id="source-9"></a> [tests/managed.rs](../../tests/managed.rs#L86-L707) — Unix transport, stale/live sockets, configuration, probe, control/revocation and relative-path tests.
+8. <a id="source-8"></a> [src/lib.rs](../../src/lib.rs#L11-L40) — `FEATURES` and `feature_probe`; `features` commands in `src/bin/aircd.rs` and `src/bin/airc.rs`.
+9. <a id="source-9"></a> [tests/managed.rs](../../tests/managed.rs#L86-L805) — Unix transport, stale/live sockets, configuration, probe, control/revocation, relative-path and channel-addition/ACL-removal tests.
+10. <a id="source-10"></a> [src/store.rs](../../src/store.rs#L83-L98) — transactional `add_channels`.

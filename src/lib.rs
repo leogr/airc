@@ -25,6 +25,9 @@ pub const FEATURES: &[&str] = &[
     "send-stdin",
     "client-presence",
     "server-presence",
+    "channel-add-reload",
+    "client-topic",
+    "named-channels",
 ];
 
 /// The `features` probe printed by both binaries.

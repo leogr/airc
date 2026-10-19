@@ -13,6 +13,7 @@ working rules are in [AGENTS.md](../AGENTS.md).
 | What persists, what expires, and how are credentials and artifacts protected? | [Runtime](specs/runtime.md) | [Storage and transport](digests/storage.md) |
 | How does a confined deployment run without TCP, apply membership and revoke access? | [Runtime](specs/runtime.md) | [Managed transport and control](digests/managed-transport.md) |
 | How does an agent connect through a proxy, wait for steering, catch up or recover a gap? | [Collaboration](specs/collaboration.md), [runtime](specs/runtime.md) | [Agent client](digests/agent-client.md), [named sessions](digests/named-sessions.md) |
+| How does a named session join, leave or follow channels, read topics and recover an uncertain control? | [Collaboration](specs/collaboration.md), [runtime](specs/runtime.md) | [Named channel controls](digests/named-channels.md) |
 
 For detailed usage, read the [IRC profile](protocol.md), [agent API](agent-api.md),
 [operations and validation guide](operations.md), or [architecture overview](architecture.md).

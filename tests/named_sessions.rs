@@ -559,6 +559,10 @@ enum Fault {
     EchoTimeout,
     AwayAfterCommit,
     AwayTimeout,
+    /// Never deliver this session's own PART confirmation.
+    PartTimeout,
+    /// Hold #extra's automatic JOIN topic/NAMES replies until a TOPIC passes.
+    DelaySetup,
 }
 
 struct FaultProxy(tokio::task::JoinHandle<()>);
@@ -596,8 +600,20 @@ async fn fault_proxy(server: &RunningServer, fault: Fault) -> (u16, FaultProxy) 
                             }
                         };
                         let from_server = async {
+                            let mut held = Vec::new();
+                            let mut released = false;
                             while let Ok(Some(line)) = read_line(&mut remote, 4608).await {
                                 let message = Message::parse(&line).unwrap();
+                                if inject && matches!(fault, Fault::PartTimeout) && message.command == "PART"
+                                    && message.prefix.as_deref().is_some_and(|p| p.starts_with("alice!")) {
+                                    std::future::pending::<()>().await;
+                                }
+                                let setup = ["331", "332", "353", "366"].contains(&message.command.as_str())
+                                    && message.params.get(1).is_some_and(|c| c == "#extra");
+                                if inject && matches!(fault, Fault::DelaySetup) && setup && !released {
+                                    held.push(line);
+                                    continue;
+                                }
                                 if inject && message.command == "PRIVMSG" && message.tags.contains_key("+airc-send") {
                                     if matches!(fault, Fault::EchoTimeout) { std::future::pending::<()>().await; }
                                     if matches!(fault, Fault::AfterCommit) { break; }
@@ -607,6 +623,13 @@ async fn fault_proxy(server: &RunningServer, fault: Fault) -> (u16, FaultProxy) 
                                     if matches!(fault, Fault::AwayAfterCommit) { break; }
                                 }
                                 if write.write_all(line.as_bytes()).await.is_err() { break; }
+                                if !released && message.command == "TOPIC" && message.params.first().is_some_and(|c| c == "#extra") {
+                                    // Only the first JOIN's setup is delayed; later replies pass.
+                                    released = true;
+                                    for line in held.drain(..) {
+                                        if write.write_all(line.as_bytes()).await.is_err() { return; }
+                                    }
+                                }
                             }
                         };
                         tokio::select! { _ = to_server => {}, _ = from_server => {} }
@@ -1057,4 +1080,489 @@ async fn lost_away_ack_is_unconfirmed_and_reconnect_never_replays_the_claim() {
         f.ok(&["disconnect", "trial"]).await;
         server.shutdown().await.unwrap();
     }
+}
+
+/// #extra: alice and human, both operators. #private: human only.
+fn channel_fixture() -> Fixture {
+    let mut f = Fixture::new();
+    f.config.channels.push(Channel {
+        name: "#extra".into(),
+        members: vec!["alice".into(), "human".into()],
+        operators: vec!["alice".into(), "human".into()],
+        moderated: false,
+    });
+    f.config.channels.push(Channel {
+        name: "#private".into(),
+        members: vec!["human".into()],
+        operators: vec![],
+        moderated: false,
+    });
+    f
+}
+
+async fn human_in_both(f: &Fixture, server: &RunningServer) -> client::Connection {
+    let mut config = f.client(server, "human");
+    config.channels = vec!["#work".into(), "#extra".into()];
+    client::connect(&config).await.unwrap()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Alice's `command` on `channel`, skipping other queued events.
+async fn from_alice(
+    connection: &mut client::Connection,
+    command: &str,
+    channel: &str,
+    wait: Duration,
+) -> Result<Message, tokio::time::error::Elapsed> {
+    timeout(wait, async {
+        loop {
+            let m = connection.inbound.recv().await.unwrap();
+            if m.command == command
+                && m.prefix.as_deref().is_some_and(|p| p.starts_with("alice!"))
+                && m.params.first().is_some_and(|c| c == channel)
+            {
+                break m;
+            }
+        }
+    })
+    .await
+}
+
+/// No `command` from alice on `channel` arrives within a short window.
+async fn quiet(connection: &mut client::Connection, command: &str, channel: &str) {
+    let observed = from_alice(connection, command, channel, Duration::from_millis(300)).await;
+    assert!(observed.is_err(), "unexpected {command}: {observed:?}");
+}
+
+/// A topic query is refused, never sent, until the JOIN setup barrier ends.
+async fn query_after_setup(f: &Fixture, channel: &str) -> Output {
+    for _ in 0..100 {
+        let output = f.cli(&["topic", "trial", channel]).await;
+        if !stdout(&output).contains("still pending") {
+            return output;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("JOIN setup never completed");
+}
+
+async fn raw_ipc(f: &Fixture, operation: serde_json::Value) -> serde_json::Value {
+    let stream = UnixStream::connect(f.root.join("trial/client.sock"))
+        .await
+        .unwrap();
+    let mut stream = BufReader::new(stream);
+    stream
+        .get_mut()
+        .write_all(format!("{}\n", json!({"version": 2, "operation": operation})).as_bytes())
+        .await
+        .unwrap();
+    let line = timeout(Duration::from_secs(15), read_line(&mut stream, 1 << 20))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[tokio::test]
+async fn named_channel_controls_confirm_once_and_are_idempotent_from_live_membership() {
+    let f = channel_fixture();
+    let server = f.start().await;
+    let mut human = human_in_both(&f, &server).await;
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let joined = f.ok(&["join", "trial", "#extra"]).await;
+    assert!(
+        joined.starts_with("joined #extra; operation_id="),
+        "{joined}"
+    );
+    from_alice(&mut human, "JOIN", "#extra", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let again = f.ok(&["join", "trial", "#EXTRA"]).await;
+    assert!(again.starts_with("already joined #EXTRA"), "{again}");
+    quiet(&mut human, "JOIN", "#extra").await;
+    let set = f
+        .ok(&["topic", "trial", "#extra", "--set", "Plan: ship"])
+        .await;
+    assert!(set.starts_with("topic set for #extra"), "{set}");
+    let read = query_after_setup(&f, "#extra").await;
+    assert!(
+        read.status.success() && stdout(&read).contains("topic for #extra: Plan: ship"),
+        "{}",
+        stdout(&read)
+    );
+    assert!(
+        f.ok(&["topic", "trial", "#extra", "--clear"])
+            .await
+            .starts_with("topic cleared for #extra")
+    );
+    // One fresh JOIN fetched one quiet initial page; the repeat fetched nothing.
+    let events = f.ok(&["read", "trial"]).await;
+    assert_eq!(
+        events
+            .matches("#extra: joined; initial bounded history window")
+            .count(),
+        1,
+        "{events}"
+    );
+    // Server refusals are never success, and restore the previous preference.
+    let denied = f.cli(&["join", "trial", "#private"]).await;
+    assert!(
+        !denied.status.success() && stdout(&denied).contains("refused by server 403"),
+        "{}",
+        stdout(&denied)
+    );
+    let not_operator = f.cli(&["topic", "trial", "#work", "--set", "nope"]).await;
+    assert!(
+        !not_operator.status.success() && stdout(&not_operator).contains("482"),
+        "{}",
+        stdout(&not_operator)
+    );
+    assert!(
+        !f.cli(&["topic", "trial", "#work", "--set", ""])
+            .await
+            .status
+            .success()
+    );
+    assert!(
+        f.ok(&["part", "trial", "#extra"])
+            .await
+            .starts_with("left #extra")
+    );
+    assert!(
+        f.ok(&["part", "trial", "#extra"])
+            .await
+            .starts_with("already absent from #extra")
+    );
+    assert!(stdout(&f.cli(&["topic", "trial", "#extra"]).await).contains("not joined to #extra"));
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.contains("channel #work: followed; joined; setup complete")
+            && status.contains("channel #private: not followed; absent; refused 403")
+            && !status.contains("channel #extra"),
+        "{status}"
+    );
+    assert!(status.matches("operation_id=").count() >= 9, "{status}");
+    // Reconnect follows the saved preference, not the configured channels.
+    f.ok(&["disconnect", "trial"]).await;
+    f.connect(&server).await;
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.contains("channel #work: followed; joined"),
+        "{status}"
+    );
+    quiet(&mut human, "JOIN", "#extra").await;
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn lost_control_reply_is_inspectable_by_its_id_and_never_replayed() {
+    let f = channel_fixture();
+    let server = f.start().await;
+    let mut human = human_in_both(&f, &server).await;
+    f.connect(&server).await;
+    let id = "0123456789abcdef0123456789abcdef";
+    {
+        // The caller disappears after the request, losing the final reply.
+        let mut stream = UnixStream::connect(f.root.join("trial/client.sock"))
+            .await
+            .unwrap();
+        let request = json!({"version": 2, "operation": {"op": "join", "channel": "#extra", "operation_id": id}});
+        stream
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    }
+    let receipt = format!("operation_id={id} join #extra (epoch=");
+    let mut status = String::new();
+    for _ in 0..100 {
+        status = f.ok(&["status", "trial"]).await;
+        if status.contains(&receipt) && status.contains("confirmed: joined #extra") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        status.contains(&receipt) && status.contains("confirmed: joined #extra"),
+        "{status}"
+    );
+    from_alice(&mut human, "JOIN", "#extra", Duration::from_secs(5))
+        .await
+        .unwrap();
+    // An identical second invocation has its own ID; it cannot claim the first.
+    let second = f.ok(&["join", "trial", "#extra"]).await;
+    assert!(
+        second.starts_with("already joined #extra") && !second.contains(id),
+        "{second}"
+    );
+    // The first ID returns its saved outcome without wire output.
+    let saved = raw_ipc(
+        &f,
+        json!({"op": "join", "channel": "#EXTRA", "operation_id": id}),
+    )
+    .await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert!(
+        saved["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("joined #extra; operation_id={id}"))
+    );
+    let conflict = raw_ipc(
+        &f,
+        json!({"op": "part", "channel": "#extra", "operation_id": id}),
+    )
+    .await;
+    assert_eq!(conflict["ok"], false, "{conflict}");
+    assert!(
+        conflict["text"]
+            .as_str()
+            .unwrap()
+            .contains("different request")
+    );
+    let null = raw_ipc(
+        &f,
+        json!({"op": "topic", "channel": "#extra", "operation_id": "1".repeat(32), "text": null}),
+    )
+    .await;
+    assert_eq!(null["ok"], false, "{null}");
+    quiet(&mut human, "JOIN", "#extra").await;
+    quiet(&mut human, "PART", "#extra").await;
+    assert!(
+        f.ok(&["status", "trial"])
+            .await
+            .contains("channel #extra: followed; joined")
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn named_startup_keeps_accessible_channels_when_followed_channels_are_refused() {
+    let f = channel_fixture();
+    let server = f.start().await;
+    let mut config = f.client(&server, "alice");
+    config.channels = vec!["#private".into(), "#work".into()];
+    write_private(
+        &f.dir.path().join("alice.toml"),
+        toml::to_string(&config).unwrap().as_bytes(),
+    )
+    .unwrap();
+    f.connect(&server).await;
+    let events = f.ok(&["read", "trial"]).await;
+    assert!(
+        events.contains("#private: JOIN refused by server 403"),
+        "{events}"
+    );
+    assert!(
+        f.ok(&["send", "trial", "#work", "still usable"])
+            .await
+            .contains("confirmed #work")
+    );
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.contains("channel #private: followed; absent; refused 403")
+            && status.contains("channel #work: followed; joined"),
+        "{status}"
+    );
+    // With every followed channel refused, the session stays authenticated.
+    f.ok(&["part", "trial", "#work"]).await;
+    f.ok(&["disconnect", "trial"]).await;
+    f.connect(&server).await;
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.starts_with("connected")
+            && status.contains("channel #private: followed; absent; refused 403")
+            && !status.contains("channel #work"),
+        "{status}"
+    );
+    // Parting the known-absent target repairs the preference; an explicitly
+    // empty followed set then starts with no JOIN at all.
+    assert!(
+        f.ok(&["part", "trial", "#private"])
+            .await
+            .starts_with("already absent from #private")
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    f.connect(&server).await;
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.starts_with("connected") && !status.contains("channel #"),
+        "{status}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn kick_quarantines_the_channel_until_an_explicit_join() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    human
+        .outbound
+        .send(vec![Message::new("KICK", ["#work", "alice", "stop"])])
+        .await
+        .unwrap();
+    let mut events = String::new();
+    for _ in 0..20 {
+        events.push_str(&f.ok(&["read", "trial", "--wait", "1"]).await);
+        if events.contains("removed by KICK") {
+            break;
+        }
+    }
+    assert!(
+        events.contains("#work: removed by KICK; follow preference kept"),
+        "{events}"
+    );
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.contains("channel #work: followed; absent; refused KICK")
+            && status.contains(
+                "quarantined: removed by KICK from human!human@airc: Removed by channel operator"
+            ),
+        "{status}"
+    );
+    // Reconnect does not rejoin a quarantined channel.
+    f.ok(&["disconnect", "trial"]).await;
+    f.connect(&server).await;
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.contains("channel #work: followed; absent") && status.contains("quarantined"),
+        "{status}"
+    );
+    assert!(
+        f.ok(&["join", "trial", "#work"])
+            .await
+            .starts_with("joined #work")
+    );
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.contains("channel #work: followed; joined") && !status.contains("quarantined"),
+        "{status}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unconfirmed_part_is_uncertain_quarantined_and_never_replayed() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    let (port, _proxy) = fault_proxy(&server, Fault::PartTimeout).await;
+    let mut config = f.client(&server, "alice");
+    config.port = port;
+    write_private(
+        &f.dir.path().join("alice.toml"),
+        toml::to_string(&config).unwrap().as_bytes(),
+    )
+    .unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let parting = f.cli(&["part", "trial", "#work"]);
+    let concurrent = async {
+        next(&mut human, "PART").await;
+        // Reads stay responsive; another control is refused, never queued.
+        assert!(f.cli(&["read", "trial"]).await.status.success());
+        let busy = f.cli(&["join", "trial", "#work"]).await;
+        assert!(
+            !busy.status.success() && stdout(&busy).contains("awaits confirmation"),
+            "{}",
+            stdout(&busy)
+        );
+    };
+    let (output, ()) = tokio::join!(parting, concurrent);
+    assert!(!output.status.success());
+    assert!(
+        stdout(&output).contains("operation_id=") && stdout(&output).contains("uncertain"),
+        "{}",
+        stdout(&output)
+    );
+    for _ in 0..50 {
+        if f.ok(&["status", "trial"]).await.starts_with("stopped") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The proxy injects only on its first connection.
+    f.connect(&server).await;
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.contains("channel #work: not followed; absent")
+            && status.contains("quarantined: interrupted part control")
+            && status.contains("uncertain"),
+        "{status}"
+    );
+    quiet(&mut human, "JOIN", "#work").await;
+    assert!(
+        f.ok(&["part", "trial", "#work"])
+            .await
+            .starts_with("already absent from #work")
+    );
+    assert!(!f.ok(&["status", "trial"]).await.contains("quarantined"));
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn delayed_join_setup_refuses_topic_queries_and_keeps_the_newer_topic() {
+    let f = channel_fixture();
+    let server = f.start().await;
+    let mut human = human_in_both(&f, &server).await;
+    human
+        .outbound
+        .send(vec![Message::new("TOPIC", ["#extra", "T0 stale"])])
+        .await
+        .unwrap();
+    next(&mut human, "TOPIC").await;
+    let (port, _proxy) = fault_proxy(&server, Fault::DelaySetup).await;
+    let mut config = f.client(&server, "alice");
+    config.port = port;
+    write_private(
+        &f.dir.path().join("alice.toml"),
+        toml::to_string(&config).unwrap().as_bytes(),
+    )
+    .unwrap();
+    f.connect(&server).await;
+    assert!(
+        f.ok(&["join", "trial", "#extra"])
+            .await
+            .starts_with("joined #extra")
+    );
+    // Review schedule 1: the immediate query is not sent while setup is held.
+    let query = f.cli(&["topic", "trial", "#extra"]).await;
+    assert!(
+        !query.status.success() && stdout(&query).contains("still pending"),
+        "{}",
+        stdout(&query)
+    );
+    // A newer operator topic passes before the stale initial numerics.
+    human
+        .outbound
+        .send(vec![Message::new("TOPIC", ["#extra", "T1 newer"])])
+        .await
+        .unwrap();
+    let current = query_after_setup(&f, "#extra").await;
+    assert!(
+        current.status.success() && stdout(&current).contains("topic for #extra: T1 newer"),
+        "{}",
+        stdout(&current)
+    );
+    let status = f.ok(&["status", "trial"]).await;
+    assert!(
+        status.contains("channel #extra: followed; joined; setup complete")
+            && status.contains("topic: T1 newer"),
+        "{status}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
 }

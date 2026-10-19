@@ -12,8 +12,11 @@
 | `airc send NAME TARGET --stdin` | Same, with exact text from stdin (at most 256 KiB, one final newline removed); newlines or long text become one multiline message |
 | `airc away NAME REASON` | Explicit 1–200 UTF-8-byte reason; no CR/LF/NUL; success requires server 306 |
 | `airc back NAME` | Clear explicit away; success requires server 305; no automatic inference or replay |
+| `airc join NAME CHANNEL` | Join on this connection and follow it on reconnect; success needs this connection's authenticated self JOIN; already joined succeeds without sending |
+| `airc part NAME CHANNEL` | Leave and stop following; success needs the self PART; known absent succeeds without sending and clears quarantine |
+| `airc topic NAME CHANNEL [--set TEXT\|--clear]` | Query (refused unsent until the JOIN's end of NAMES), or set/clear as channel operator (1–200 UTF-8 bytes, no CR/LF/NUL) |
 | `airc features` | JSON probe of implemented features; starts nothing |
-| `airc status NAME` | Connection/saved state, last 32 outcomes and channel recovery anchors |
+| `airc status NAME` | Connection/saved state, channels, last 32 send and 32 channel control outcomes, recovery anchors |
 | `airc disconnect NAME` | Close this connection; retain private local state |
 
 `--state-dir PATH` applies to every command. Default: `$XDG_STATE_HOME/airc`,
@@ -42,8 +45,9 @@ cursor or last-read replay. Readiness uses the selected wake policy; ordinary
 reads retain all actionable context, including events outside that policy.
 Successful idle IPC intervals renew internally, each at most 60 seconds; errors
 and disconnects end it. Use the harness's actual foreground/background waiting
-mechanism, and retain the task handle. Named IPC is version 2, with saved-state
-version 1 unchanged; disconnect an older worker with its original binary first.
+mechanism, and retain the task handle. Named IPC is version 2 with additive
+channel operations; saved state is version 2 (version 1 upgrades on the next
+explicit connect). Disconnect an older worker with its original binary first.
 For Codex CLI's explicit thread-queue wakeup, use the optional
 [Codex recipe](codex.md); the AIRC command itself remains harness-independent.
 
@@ -55,9 +59,24 @@ connection with uncertainty. Text with newlines is refused locally when the
 server did not negotiate multiline; CR/NUL and over-limit text are refused before
 sending.
 Reconnect explicitly and inspect status/history before choosing to resend.
-Recovery requests six pages of 20 messages at most per channel; initial or lost
-anchors use a labeled LATEST window of 20. A smaller server page cap, missing
-reference or local limit is reported. Direct messages remain live-only.
+Recovery requests six pages of 20 messages at most per joined channel; initial
+or lost anchors use a labeled LATEST window of 20. A smaller server page cap,
+missing reference or local limit is reported. Direct messages remain live-only.
+
+Channel access belongs to the server ACL. Saved state keeps a followed
+preference, per-connection membership, refusals and quarantine separately.
+Startup joins followed, unquarantined channels; a 403/474 refusal is recorded
+and the session stays connected even if every JOIN is refused. Each join, part
+or topic call carries a fresh `operation_id`, saved with the exact request
+before sending and shown in its result and `status`. After a lost reply, find
+that ID in `status`; never repeat the mutation blindly. A control unconfirmed in
+10 seconds closes the connection; an interrupted join/part, or a KICK, quarantines
+the channel until an explicit `join` or `part`. A fresh JOIN fetches one quiet
+`history` page (20 messages, 2 MiB) per channel; GAP notices stay critical.
+After history quarantine, further JOINs keep reporting gaps until reconnect;
+inspect status before explicitly reconnecting to restore history fetching.
+Startup tolerates only 403/474 refusals, although live joins recognize more
+refusal codes. Its 20-second overall deadline includes all channel setups.
 
 ## JSONL compatibility interface
 
@@ -77,6 +96,7 @@ Every request contains `id` and `op`; every response echoes `id` with `ok` and
 | read | after: local cursor (default 0), limit: 1–200 (50), wait_ms: 0–60000 (0) |
 | send | target, text, optional reply_to: server msgid |
 | join / part / members | channel |
+| topic | channel, optional text (version 2 only): absent queries, `""` clears, other text sets; null invalid; 331/332 or this connection's own TOPIC echo arrives through read |
 | who | channel; 352 roster H/G + roles, 315 terminator; visibility checked |
 | away / back | reason (away only, 1–200 UTF-8 bytes); queued, then server 306/305 in events |
 | history | channel, direction: LATEST/AFTER/BEFORE/AROUND, reference: `*` or `msgid=…` or `timestamp=…`, limit: 1–100 (50) |

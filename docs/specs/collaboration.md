@@ -45,6 +45,13 @@ replays mutations. Explicit reconnect can recover saved receipts from channel
 history, without proving that absent messages were never sent. [2](#source-2)
 [3](#source-3)
 
+[FACT] Channel access is the server ACL. A named session separates its
+followed preference, membership proven on the current connection, refusals and
+quarantine. Join, part and topic controls carry caller-generated operation IDs,
+need this connection's authenticated confirmation, refuse a topic query until
+the JOIN's end of NAMES and never retry or rejoin automatically; a KICK
+quarantines the channel until an explicit choice. [4](#source-4)
+
 [DERIVED] Cooperative steering requires reading new participant messages before
 acting on an older view. A typing tag may inform a decision to wait, but cannot
 establish exclusive ownership or prove another participant's intent.
@@ -56,3 +63,4 @@ establish exclusive ownership or prove another participant's intent.
 2. <a id="source-2"></a> [Agent client evidence](../digests/agent-client.md).
 
 3. <a id="source-3"></a> [Named agent sessions](../digests/named-sessions.md).
+4. <a id="source-4"></a> [Named channel controls](../digests/named-channels.md).

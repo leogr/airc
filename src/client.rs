@@ -1,7 +1,7 @@
 //! Persistent IRC connection with a bounded, cursor-addressed JSONL frontend.
 use crate::{
     multiline::{self, Assembler, Limits},
-    protocol::{MAX_LINE, Message, read_line, valid_channel, valid_nick},
+    protocol::{MAX_LINE, Message, fold, read_line, valid_channel, valid_nick},
     transport,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -171,17 +171,75 @@ pub async fn connect_with(config: &ClientConfig, multiline: bool) -> Result<Conn
     let token = config.token()?;
     tokio::time::timeout(
         Duration::from_secs(20),
-        open_connection(config, &token, multiline),
+        open_connection(config, &token, multiline, &config.channels, false),
     )
     .await
     .context("connection/authentication timed out")?
+    .map(|startup| startup.connection)
+}
+
+pub(crate) struct JoinRefusal {
+    pub channel: String,
+    pub code: String,
+    pub reason: String,
+}
+
+pub(crate) struct NamedStartup {
+    pub connection: Connection,
+    pub server_name: String,
+    pub joined: Vec<String>,
+    pub refusals: Vec<JoinRefusal>,
+}
+
+/// Named sessions may retain an authenticated connection when individual
+/// followed channels refuse JOIN. Generic JSONL startup remains strict.
+#[cfg(unix)]
+pub(crate) async fn connect_named(
+    config: &ClientConfig,
+    channels: &[String],
+) -> Result<NamedStartup> {
+    config.validate()?;
+    ensure!(
+        channels.len() <= 128 && channels.iter().all(|c| valid_channel(c)),
+        "invalid followed channels"
+    );
+    let unique = channels.iter().map(|c| fold(c)).collect::<BTreeSet<_>>();
+    ensure!(unique.len() == channels.len(), "duplicate followed channel");
+    let token = config.token()?;
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        open_connection(config, &token, true, channels, true),
+    )
+    .await
+    .context("connection/authentication timed out")?
+}
+
+/// AIRC's authoritative connection prefix, not a display nick or client tag.
+pub(crate) fn own_prefix(message: &Message, nick: &str, account: &str) -> bool {
+    message
+        .prefix
+        .as_deref()
+        .and_then(|prefix| prefix.split_once('!'))
+        .is_some_and(|(sender, userhost)| {
+            fold(sender) == fold(nick) && userhost == format!("{account}@airc")
+        })
+}
+
+pub(crate) fn server_numeric(message: &Message, server: &str, nick: &str) -> bool {
+    message.prefix.as_deref() == Some(server)
+        && message
+            .params
+            .first()
+            .is_some_and(|recipient| fold(recipient) == fold(nick))
 }
 
 async fn open_connection(
     config: &ClientConfig,
     token: &str,
     want_multiline: bool,
-) -> Result<Connection> {
+    channels: &[String],
+    partial: bool,
+) -> Result<NamedStartup> {
     let stream = match &config.unix {
         Some(path) => transport::connect_unix(path).await?,
         None => {
@@ -206,7 +264,7 @@ async fn open_connection(
         Message::new("USER", [&config.account, "0", "*", "AIRC agent"]),
     )
     .await?;
-    loop {
+    let server_name = loop {
         let line = read_line(&mut reader, MAX_LINE)
             .await?
             .context("connection closed during authentication")?;
@@ -274,45 +332,96 @@ async fn open_connection(
                 }
             }
             "903" => write_message(&mut writer, Message::new("CAP", ["END"])).await?,
-            "001" => break,
+            "001" => {
+                // Named sessions correlate later numerics with this server name.
+                let server = m.prefix.clone().unwrap_or_default();
+                ensure!(
+                    !partial
+                        || (!server.is_empty()
+                            && !server.contains(['!', '@'])
+                            && server_numeric(&m, &server, &config.nick)),
+                    "invalid registration identity"
+                );
+                break server;
+            }
             "PING" => write_message(&mut writer, Message::new("PONG", m.params)).await?,
             "ERROR" | "432" | "433" | "464" | "904" | "905" | "906" => {
                 bail!("IRC registration failed ({})", m.command)
             }
             _ => {}
         }
-    }
+    };
     let negotiated = offered_multiline
         .filter(|_| capabilities.contains(multiline::CAP) && capabilities.contains("batch"));
     let mut assembler = negotiated.map(Assembler::new);
     let mut startup = Vec::new();
-    for channel in &config.channels {
+    let mut joined_channels = Vec::new();
+    let mut refusals = Vec::new();
+    for channel in channels {
+        // Named startup bounds each automatic JOIN setup; generic startup keeps
+        // only the aggregate connection timeout.
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut self_joined = false;
         write_message(&mut writer, Message::new("JOIN", [channel])).await?;
         loop {
-            let line = read_line(&mut reader, MAX_LINE)
-                .await?
-                .context("connection closed while joining")?;
+            let read = read_line(&mut reader, MAX_LINE);
+            let line = if partial {
+                tokio::time::timeout_at(until, read)
+                    .await
+                    .context("channel JOIN setup timed out")??
+            } else {
+                read.await?
+            }
+            .context("connection closed while joining")?;
             let message = Message::parse(&line)?;
             if message.command == "PING" {
                 write_message(&mut writer, Message::new("PONG", message.params)).await?;
                 continue;
             }
+            let target = message
+                .params
+                .get(1)
+                .is_some_and(|name| fold(name) == fold(channel));
+            // Named setup also proves the numeric's server origin and recipient.
+            let numeric =
+                target && (!partial || server_numeric(&message, &server_name, &config.nick));
+            let refused = partial && numeric && matches!(message.command.as_str(), "403" | "474");
             ensure!(
-                (message.command == "422" || !message.command.starts_with(['4', '5']))
+                (refused || message.command == "422" || !message.command.starts_with(['4', '5']))
                     && message.command != "ERROR",
                 "channel join failed ({})",
                 message.command
             );
-            let joined = message.command == "366"
-                && message.params.get(1).is_some_and(|name| {
-                    crate::protocol::fold(name) == crate::protocol::fold(channel)
+            if refused {
+                // The session records the refusal; the raw numeric is not replayed.
+                refusals.push(JoinRefusal {
+                    channel: channel.clone(),
+                    code: message.command.clone(),
+                    reason: message.params.get(2).cloned().unwrap_or_default(),
                 });
+                break;
+            }
+            self_joined |= partial
+                && message.command == "JOIN"
+                && own_prefix(&message, &config.nick, &config.account)
+                && message
+                    .params
+                    .first()
+                    .is_some_and(|name| fold(name) == fold(channel));
+            let joined = message.command == "366" && numeric;
+            ensure!(
+                !partial || !joined || self_joined,
+                "JOIN setup ended without an authentic self JOIN"
+            );
             match &mut assembler {
                 Some(assembler) => startup.extend(assembler.push(message)),
                 None => startup.push(message),
             }
             ensure!(startup.len() <= 512, "startup event buffer exceeded");
             if joined {
+                if partial {
+                    joined_channels.push(channel.clone());
+                }
                 break;
             }
         }
@@ -369,12 +478,17 @@ async fn open_connection(
         };
         tokio::select! { _ = input => {}, _ = output => {} }
     });
-    Ok(Connection {
-        outbound,
-        inbound,
-        capabilities,
-        multiline: negotiated,
-        task,
+    Ok(NamedStartup {
+        connection: Connection {
+            outbound,
+            inbound,
+            capabilities,
+            multiline: negotiated,
+            task,
+        },
+        server_name,
+        joined: joined_channels,
+        refusals,
     })
 }
 
@@ -410,6 +524,11 @@ enum Operation {
     },
     Part {
         channel: String,
+    },
+    Topic {
+        channel: String,
+        #[serde(default, deserialize_with = "optional_text")]
+        text: Option<String>,
     },
     Members {
         channel: String,
@@ -888,6 +1007,8 @@ async fn run_frontend(
             }
             Operation::Upload { channel, path } => upload(config, &channel, &path).await,
             Operation::Download { artifact, path } => download(config, &artifact, &path).await,
+            // Version 1 stays unchanged; the topic operation is version 2 only.
+            Operation::Topic { .. } => Err(anyhow::anyhow!("topic requires JSONL version 2")),
             operation => match to_message(operation) {
                 Ok(message) => {
                     connection
@@ -940,6 +1061,29 @@ pub fn away_message(reason: Option<&str>) -> Result<Message> {
     Ok(message)
 }
 
+/// Missing text queries, empty text clears; JSON null is never either action.
+pub(crate) fn optional_text<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+pub fn topic_message(channel: &str, text: Option<&str>) -> Result<Message> {
+    ensure!(valid_channel(channel), "invalid channel");
+    if let Some(text) = text {
+        ensure!(
+            text.len() <= 200 && !text.contains(['\r', '\n', '\0']),
+            "topic must be at most 200 UTF-8 bytes without CR/LF/NUL"
+        );
+    }
+    let message = Message::new("TOPIC", std::iter::once(channel).chain(text));
+    message.encode()?;
+    Ok(message)
+}
+
 fn to_message(operation: Operation) -> Result<Message> {
     let m = match operation {
         Operation::Send {
@@ -963,6 +1107,7 @@ fn to_message(operation: Operation) -> Result<Message> {
         }
         Operation::Join { channel } => Message::new("JOIN", [channel]),
         Operation::Part { channel } => Message::new("PART", [channel]),
+        Operation::Topic { channel, text } => topic_message(&channel, text.as_deref())?,
         Operation::Members { channel } => Message::new("NAMES", [channel]),
         Operation::Who { channel } => {
             ensure!(valid_channel(&channel), "invalid channel");
@@ -1231,6 +1376,70 @@ mod tests {
 #[cfg(test)]
 mod presence_tests {
     use super::*;
+
+    #[test]
+    fn topic_operation_distinguishes_query_clear_and_set_and_rejects_null() {
+        let operation = |json: &str| serde_json::from_str::<Request>(json).map(|r| r.op);
+        for (json, params) in [
+            (r##"{"id":1,"op":"topic","channel":"#a"}"##, vec!["#a"]),
+            (
+                r##"{"id":2,"op":"topic","channel":"#a","text":""}"##,
+                vec!["#a", ""],
+            ),
+            (
+                r##"{"id":3,"op":"topic","channel":"#a","text":"Plan: ship"}"##,
+                vec!["#a", "Plan: ship"],
+            ),
+        ] {
+            let message = to_message(operation(json).unwrap()).unwrap();
+            assert_eq!(message.command, "TOPIC");
+            assert_eq!(message.params, params);
+        }
+        assert!(operation(r##"{"id":4,"op":"topic","channel":"#a","text":null}"##).is_err());
+        assert!(operation(r##"{"id":5,"op":"topic","channel":"#a","extra":1}"##).is_err());
+        for text in ["é".repeat(101), "a\rb".into(), "a\nb".into(), "a\0b".into()] {
+            assert!(topic_message("#a", Some(&text)).is_err());
+        }
+        assert!(topic_message("not-a-channel", None).is_err());
+        assert!(topic_message("#a", Some(&"é".repeat(100))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn jsonl_version_one_rejects_topic_without_queueing() {
+        let config: ClientConfig = toml::from_str(
+            "host = \"127.0.0.1\"\nport = 6667\naccount = \"alice\"\nnick = \"alice\"\ntoken_file = \"t\"\n",
+        )
+        .unwrap();
+        let (_to_client, inbound) = mpsc::channel(1);
+        let (outbound, mut written) = mpsc::channel(1);
+        let mut connection = Connection {
+            outbound,
+            inbound,
+            capabilities: BTreeSet::new(),
+            multiline: None,
+            task: tokio::spawn(std::future::pending()),
+        };
+        let (request, mut input) = mpsc::channel(2);
+        let (mut output, response) = tokio::io::duplex(65536);
+        let frontend = tokio::spawn(async move {
+            run_frontend(&config, "epoch", &mut connection, &mut input, &mut output).await
+        });
+        request
+            .send(Ok(r##"{"id":1,"op":"topic","channel":"#a"}"##.into()))
+            .await
+            .unwrap();
+        request
+            .send(Ok(r#"{"id":2,"op":"quit"}"#.into()))
+            .await
+            .unwrap();
+        let mut response = BufReader::new(response);
+        let reply: Value =
+            serde_json::from_str(&read_line(&mut response, 65536).await.unwrap().unwrap()).unwrap();
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("version 2"));
+        frontend.await.unwrap().unwrap();
+        assert!(written.try_recv().is_err(), "nothing was queued");
+    }
 
     #[test]
     fn explicit_presence_and_roster_operations_validate_before_queueing() {

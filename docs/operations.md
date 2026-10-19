@@ -65,10 +65,13 @@ access is not.
 names only implemented features: `multiline`, `unix-listeners`, `unix-artifacts`,
 `control-status`, `control-reload`, `acl-revoke`, `client-unix`,
 `client-artifact-unix`, `client-multiline`, `jsonl-v2`, `named-multiline`,
-`send-stdin`, `client-presence` and `server-presence`. A deployer should refuse a managed mode whose feature is missing
+`send-stdin`, `client-presence`, `server-presence`, `channel-add-reload`,
+`client-topic` and `named-channels`. A deployer should refuse a managed mode whose feature is missing
 rather than fall back. `client-presence` covers JSONL `who`/`away`/`back` and
 away-notify negotiation/events; `server-presence` covers connection-scoped AWAY,
-WHO H/G and away-notify. The live control status includes the same implemented
+WHO H/G and away-notify. `channel-add-reload` covers reload channel additions;
+`client-topic` the JSONL version 2 `topic` operation; `named-channels` the named
+`join`/`part`/`topic` controls, followed-channel state and partial startup. The live control status includes the same implemented
 feature list: check that proof as well as executable probes when reusing a
 running server. Executable features are distinct from IRC CAP negotiation.
 
@@ -85,8 +88,14 @@ one line capped at 1 MiB and then closed, with a ten-second connection deadline:
   count) and `accounts`, which lists connected accounts only, with connection
   counts. It is bounded by `limits.connections`, never truncated.
 - `{"op":"reload"}` re-reads the file the server started from. Only accounts,
-  channel members/operators and `membership_generation` may change; anything else,
-  including the channel set, fails with `RESTART_REQUIRED`. A lower generation
+  channel additions, channel members/operators and `membership_generation` may
+  change; anything else fails with `RESTART_REQUIRED`. Every channel currently
+  applied must remain with its exact spelling, so a removal or rename is refused
+  even after earlier additions (A, then A+B, then A+C fails). New channel rows
+  and their actor state are staged in SQLite before the configuration, ACLs and
+  digest are published; a staging failure is `STORAGE_ERROR` and publishes
+  nothing. Rows staged by a failed attempt grant no access; a later reload reuses
+  them, keeping any stored topic, bans and history. A lower generation
   fails with `GENERATION_STALE`; the same generation with different bytes fails
   with `GENERATION_CONFLICT`; the same bytes are an idempotent success. Rejected
   configurations leave applied state unchanged. Success returns `applied_generation`, `config_sha256`,
@@ -180,6 +189,11 @@ responses, proxied SASL and artifact round trips, and process shutdown with stdi
 still open. Named-client tests additionally cover persistent process lifetime,
 private state, stale sockets, read replay/serialization, typing waits, echo
 correlation, history recovery and faults before send/after commit/on timeout.
+Channel tests cover idempotent join/part, refused and all-refused startup, KICK
+quarantine, a lost control reply followed by an identical invocation, an
+unconfirmed PART, delayed JOIN setup with a newer topic, sequential reload
+additions with removal refusal, injected staging failure and per-channel ACL
+removal without account revocation. These are local fixtures, not VM checks.
 USERHOST tests cover authenticated identities, registration, case folding and
 the five-name bound.
 

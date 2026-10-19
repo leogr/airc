@@ -17,7 +17,9 @@ a missing msgid produces an explicit history gap. [1](#source-1) [2](#source-2)
 no TCP listener, and a separate control socket outside every listener
 directory. Control status and reload bind applied membership to a generation,
 the exact configuration digest and a per-process incarnation; reload revokes
-removed or rotated identities in the same actor step. [5](#source-5)
+removed or rotated identities in the same actor step. Reload may add channels,
+never remove or rename an applied one, and stages their storage before
+publishing any access. [5](#source-5)
 
 [FACT] Configuration declares accounts and channel access. Random tokens are
 hashed at the server and read from private client files. Remote IRC plaintext
@@ -44,6 +46,11 @@ versioned IPC and native owner locks. Bounded state is atomically synced before
 read-cursor or send-preparation replies. Stopped clients require explicit
 reconnect; saved uncertainty is not replay authority. [4](#source-4)
 
+[FACT] Named saved state version 2 keeps channel follows, refusals, quarantine
+and bounded control receipts; it binds each control's operation ID and intent
+before network output and its outcome before the reply. Partial startup stays
+connected when channels are refused. [6](#source-6)
+
 [FACT] Named readiness waits do not consume events or replace read replay.
 They renew bounded idle requests and stop on errors/disconnects. Agent turn
 scheduling remains the harness's responsibility. [4](#source-4)
@@ -56,3 +63,4 @@ scheduling remains the harness's responsibility. [4](#source-4)
 
 4. <a id="source-4"></a> [Named session persistence](../digests/named-sessions.md).
 5. <a id="source-5"></a> [Managed transport evidence](../digests/managed-transport.md).
+6. <a id="source-6"></a> [Named channel controls](../digests/named-channels.md).

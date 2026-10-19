@@ -80,6 +80,34 @@ struct Channel {
     members: BTreeMap<u64, Role>,
 }
 
+impl Channel {
+    fn load(config: &crate::config::Channel, store: &Store) -> Result<Self> {
+        let key = fold(&config.name);
+        let (moderated, topic) = store.channel(&key)?;
+        ensure!(
+            topic.len() <= 200 && !topic.contains(['\r', '\n', '\0']),
+            "invalid stored topic"
+        );
+        let bans = store.bans(&key, ban::MAX_BANS)?;
+        for entry in &bans {
+            ensure!(
+                ban::normalize(&entry.mask).as_deref() == Some(entry.mask.as_str()),
+                "invalid stored ban mask"
+            );
+        }
+        Ok(Self {
+            name: config.name.clone(),
+            moderated,
+            topic,
+            bans: bans
+                .into_iter()
+                .map(|entry| (entry.mask.clone(), entry))
+                .collect(),
+            members: BTreeMap::new(),
+        })
+    }
+}
+
 /// The live configuration; membership reload replaces it for every reader.
 pub(super) type SharedConfig = Arc<std::sync::RwLock<Arc<Config>>>;
 
@@ -106,40 +134,14 @@ pub(super) fn reloadable_baseline(config: &Config) -> Result<serde_json::Value> 
             fields.remove(reloadable);
         }
     }
-    let names = config
-        .channels
-        .iter()
-        .map(|c| fold(&c.name))
-        .collect::<BTreeSet<_>>();
-    Ok(serde_json::json!({"fixed": value, "channels": names}))
+    Ok(value)
 }
 
 impl State {
     pub fn new(config: Arc<Config>, store: Store) -> Result<Self> {
         let mut channels = BTreeMap::new();
         for c in &config.channels {
-            let key = fold(&c.name);
-            let (moderated, topic) = store.channel(&key)?;
-            let bans = store.bans(&key, ban::MAX_BANS)?;
-            for entry in &bans {
-                ensure!(
-                    ban::normalize(&entry.mask).as_deref() == Some(entry.mask.as_str()),
-                    "invalid stored ban mask"
-                );
-            }
-            channels.insert(
-                key,
-                Channel {
-                    name: c.name.clone(),
-                    moderated,
-                    topic,
-                    bans: bans
-                        .into_iter()
-                        .map(|entry| (entry.mask.clone(), entry))
-                        .collect(),
-                    members: BTreeMap::new(),
-                },
-            );
+            channels.insert(fold(&c.name), Channel::load(c, &store)?);
         }
         Ok(Self {
             shared: Arc::new(std::sync::RwLock::new(config.clone())),
@@ -215,7 +217,20 @@ impl State {
         if reloadable_baseline(&new).ok().as_ref() != Some(baseline) {
             return control_failure(
                 "RESTART_REQUIRED",
-                "only accounts, channel members/operators and membership_generation reload",
+                "only accounts, channel additions/members/operators and membership_generation reload",
+            );
+        }
+        // Compare with the currently applied catalog, not the startup baseline:
+        // A -> A+B -> A+C must refuse removing B. Exact spelling is stable even
+        // when the generic config uses mixed-case names.
+        if self.config.channels.iter().any(|old| {
+            !new.channels
+                .iter()
+                .any(|candidate| candidate.name == old.name)
+        }) {
+            return control_failure(
+                "RESTART_REQUIRED",
+                "reload cannot remove or rename an applied channel",
             );
         }
         let applied = self.config.membership_generation.unwrap_or(0);
@@ -235,12 +250,37 @@ impl State {
             }
             return self.reloaded(Vec::new(), Vec::new(), 0);
         }
+        let additions = new
+            .channels
+            .iter()
+            .filter(|channel| !self.channels.contains_key(&fold(&channel.name)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let prepared = (|| -> Result<BTreeMap<String, Channel>> {
+            self.store.add_channels(&additions)?;
+            additions
+                .iter()
+                .map(|channel| Ok((fold(&channel.name), Channel::load(channel, &self.store)?)))
+                .collect()
+        })();
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return control_failure(
+                    "STORAGE_ERROR",
+                    &format!("channel additions were not applied: {error:#}"),
+                );
+            }
+        };
         let old = self.config.clone();
         let mut next = (*old).clone();
         next.accounts = new.accounts;
         next.channels = new.channels;
         next.membership_generation = new.membership_generation;
         let next = Arc::new(next);
+        // All fallible store work is finished. Actor state and shared ACL/proof
+        // become visible together before the next queued event is processed.
+        self.channels.extend(prepared);
         self.config = next.clone();
         *self
             .shared
@@ -2593,5 +2633,90 @@ mod tests {
         assert_eq!(result["kicked"].as_array().unwrap().len(), MAX_KICK_DETAILS);
         assert!(state.channels["#space"].members.is_empty());
         assert!(serde_json::to_vec(&reply).unwrap().len() < 1024 * 1024);
+    }
+
+    #[test]
+    fn reload_adds_channels_only_against_the_applied_catalog_after_staging_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let channel = |name: &str| ChannelConfig {
+            name: name.into(),
+            members: vec!["alice".into()],
+            operators: vec![],
+            moderated: false,
+        };
+        let mut config = Config {
+            server_name: "test.airc".into(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            control_unix: None,
+            membership_generation: Some(1),
+            database: directory.path().join("state.db"),
+            allow_insecure: false,
+            allow_private_messages: false,
+            tls: None,
+            limits: Limits::default(),
+            accounts: vec![Account {
+                name: "alice".into(),
+                token_sha256: token_hash("test"),
+            }],
+            channels: vec![channel("#Mixed")],
+            artifacts: None,
+        };
+        let store = Store::open(&config).unwrap();
+        store.set_channel("#mixed", false, "kept topic").unwrap();
+        let mut state = State::new(Arc::new(config.clone()), store).unwrap();
+        state.set_source("one".into(), reloadable_baseline(&config).unwrap());
+        // A -> A+B applies the addition with the exact applied spelling kept.
+        config.channels.push(channel("#b"));
+        config.membership_generation = Some(2);
+        let reply = state.reload(config.clone(), "two".into());
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert!(state.channels.contains_key("#b") && state.config.may_read("alice", "#b"));
+        assert_eq!(state.channels["#mixed"].topic, "kept topic");
+        // A+B -> A+C removes B, and a case rename of A, are both refused
+        // against the currently applied catalog rather than the startup one.
+        let mut replaced = config.clone();
+        replaced.channels[1] = channel("#c");
+        let mut renamed = config.clone();
+        renamed.channels[0].name = "#mixed".into();
+        for candidate in [replaced, renamed] {
+            let mut candidate = candidate;
+            candidate.membership_generation = Some(3);
+            let reply = state.reload(candidate, "three".into());
+            assert_eq!(reply["code"], "RESTART_REQUIRED", "{reply}");
+        }
+        assert!(!state.channels.contains_key("#c"));
+        assert_eq!(state.config.membership_generation, Some(2));
+        // A staging failure publishes nothing: no ACL, proof or actor state.
+        state
+            .store
+            .execute_for_test(
+                "INSERT INTO channels(name, moderated, topic) VALUES ('#d', 0, 'bad' || char(10) || 'topic')",
+            )
+            .unwrap();
+        let mut added = config.clone();
+        added.channels.push(channel("#d"));
+        added.membership_generation = Some(3);
+        let reply = state.reload(added.clone(), "three".into());
+        assert_eq!(reply["code"], "STORAGE_ERROR", "{reply}");
+        assert!(!state.channels.contains_key("#d") && !state.config.may_read("alice", "#d"));
+        assert_eq!(state.config.membership_generation, Some(2));
+        assert_eq!(state.digest.as_deref(), Some("two"));
+        assert!(
+            !state
+                .shared_config()
+                .read()
+                .unwrap()
+                .may_read("alice", "#d")
+        );
+        // Once storage is repaired, the same desired state applies once.
+        state
+            .store
+            .execute_for_test("UPDATE channels SET topic='' WHERE name='#d'")
+            .unwrap();
+        assert_eq!(state.reload(added.clone(), "three".into())["ok"], true);
+        assert!(state.channels.contains_key("#d"));
+        let same = state.reload(added, "three".into());
+        assert_eq!(same["result"]["applied_generation"], 3, "{same}");
     }
 }

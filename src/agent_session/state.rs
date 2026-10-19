@@ -1,8 +1,12 @@
-use super::attention::{
-    self, Classification, Identity, Readiness, Snapshot, SnapshotError, Stamp, WakeMode,
+use super::{
+    attention::{
+        self, Classification, Identity, Readiness, Snapshot, SnapshotError, Stamp, WakeMode,
+    },
+    channels::{Begin, Change, Channels, Request},
+    history::{Disposition, Notice},
 };
 use crate::{
-    client::ClientConfig,
+    client::{ClientConfig, JoinRefusal},
     multiline::{self, Limits},
     protocol::{Message, fold, valid_channel, valid_nick},
 };
@@ -24,6 +28,8 @@ const READ_BYTES: usize = 1024 * 1024;
 /// Receipts keep this much text for inspection; longer text is matched by digest.
 const RECEIPT_PREVIEW: usize = 512;
 pub(super) const SEND_TAG: &str = "+airc-send";
+/// Saved-state version written by this release; version 1 is read-compatible.
+const VERSION: u8 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +51,10 @@ pub(super) struct State {
     /// Msgids of this session's confirmed messages, proving replies to it.
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     own: VecDeque<String>,
+    /// Required in version 2 and absent in version 1, so an explicitly empty
+    /// followed set is never mistaken for legacy configured channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channels: Option<Channels>,
     /// Start of this worker's monotonic clock; restored events have no time.
     #[serde(skip)]
     clock: Option<Instant>,
@@ -97,6 +107,16 @@ impl Receipt {
     }
 }
 
+/// How a history message is recorded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replay {
+    /// Explicit-connect recovery: replayed messages keep their attention.
+    Recovery,
+    /// A fresh live JOIN's page: navigation context that never wakes for
+    /// ordinary messages. `anchor` permits moving the recovery checkpoint.
+    Join { anchor: bool },
+}
+
 /// Render one chat line. Text after a newline continues on lines that start
 /// with `| `; header lines never do, so a record cannot be forged by content.
 fn framed(header: String, text: &str) -> String {
@@ -113,7 +133,7 @@ fn framed(header: String, text: &str) -> String {
 impl State {
     pub fn new(config: &ClientConfig) -> Result<Self> {
         Ok(Self {
-            version: 1,
+            version: VERSION,
             identity: identity(config)?,
             epoch: uuid::Uuid::new_v4().to_string(),
             account: config.account.clone(),
@@ -129,11 +149,16 @@ impl State {
             own: VecDeque::new(),
             clock: None,
             status: "not connected".into(),
+            channels: Some(Channels::seeded(&config.channels)?),
         })
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.version == 1, "unsupported session state version");
+        match (self.version, &self.channels) {
+            (1, None) => {}
+            (VERSION, Some(channels)) => channels.validate()?,
+            _ => anyhow::bail!("unsupported or malformed session state version"),
+        }
         ensure!(
             self.events.len() <= RETAIN
                 && self.references.len() <= RETAIN
@@ -232,6 +257,12 @@ impl State {
     // The +airc-send tag alone is never authority: account, nick, target and
     // text must all agree with the locally recorded operation.
     pub fn ingest(&mut self, message: &Message, history: bool) -> Option<String> {
+        self.ingest_with(message, history.then_some(Replay::Recovery))
+    }
+
+    fn ingest_with(&mut self, message: &Message, replay: Option<Replay>) -> Option<String> {
+        let history = replay.is_some();
+        let joined_page = matches!(replay, Some(Replay::Join { .. }));
         let duplicate = message
             .tags
             .get("msgid")
@@ -276,6 +307,7 @@ impl State {
             let id = message.tags.get("msgid");
             if !duplicate
                 && valid_channel(target)
+                && replay != Some(Replay::Join { anchor: false })
                 && let Some(id) = id
             {
                 self.checkpoints.insert(fold(target), id.clone());
@@ -335,23 +367,28 @@ impl State {
                     .tags
                     .get("+reply")
                     .is_some_and(|id| self.own.contains(id));
-                let class = attention::classify(
-                    message,
-                    Identity {
-                        nick: &self.nick,
-                        account: &self.account,
-                    },
-                    reply_to_own,
-                );
+                let class = if joined_page {
+                    Classification::Context
+                } else {
+                    attention::classify(
+                        message,
+                        Identity {
+                            nick: &self.nick,
+                            account: &self.account,
+                        },
+                        reply_to_own,
+                    )
+                };
                 let text = framed(header, &message.params[1]);
                 if text.len() > EVENT_MAX {
+                    // An omission in a quiet JOIN page still makes context incomplete.
                     self.notify(format!(
                         "{reference} {} {}({}): message of {} bytes omitted; its rendering exceeds the {EVENT_MAX}-byte event bound. Context is incomplete.",
                         safe(target),
                         safe(nick),
                         safe(account),
                         message.params[1].len()
-                    ), class);
+                    ), if joined_page { Classification::Critical } else { class });
                 } else {
                     self.record(text, class);
                 }
@@ -533,6 +570,155 @@ impl State {
         }
     }
 
+    /// Version-2 channel state; workers upgrade before connecting.
+    fn channels_mut(&mut self) -> &mut Channels {
+        self.channels
+            .as_mut()
+            .expect("named workers upgrade saved state before connecting")
+    }
+
+    /// Upgrade only on an explicit connect. Version-1 state follows the
+    /// channels of the original configuration whose identity it already proved.
+    /// A control left pending by an earlier worker becomes uncertain.
+    pub fn upgrade(&mut self, config: &ClientConfig) -> Result<()> {
+        if self.version == 1 {
+            self.channels = Some(Channels::seeded(&config.channels)?);
+            self.version = VERSION;
+        }
+        if let Some(notice) = self
+            .channels_mut()
+            .interrupt("the previous worker ended before confirmation")
+        {
+            self.notice(notice);
+        }
+        Ok(())
+    }
+
+    /// Followed channels that startup joins; quarantined targets are skipped.
+    pub fn startup_channels(&self) -> Vec<String> {
+        self.channels
+            .as_ref()
+            .map(Channels::startup)
+            .unwrap_or_default()
+    }
+
+    /// Begin this connection's channel evidence and record startup JOIN outcomes.
+    pub fn start_channels(&mut self, server: &str, joined: &[String], refusals: &[JoinRefusal]) {
+        let (epoch, nick, account) = (self.epoch.clone(), self.nick.clone(), self.account.clone());
+        let channels = self.channels_mut();
+        channels.reset(&epoch, &nick, &account, server);
+        for notice in channels.started(joined, refusals) {
+            self.notice(notice);
+        }
+    }
+
+    pub fn joined(&self, channel: &str) -> bool {
+        self.channels.as_ref().is_some_and(|c| c.joined(channel))
+    }
+
+    fn record_notices(&mut self, notices: impl IntoIterator<Item = Notice>) {
+        for notice in notices {
+            if notice.critical {
+                self.notice(notice.text);
+            } else {
+                self.context(notice.text);
+            }
+        }
+    }
+
+    /// Track channel evidence from one live event; history replay is not evidence.
+    pub fn track(&mut self, message: &Message) {
+        let Some(channels) = self.channels.as_mut() else {
+            return;
+        };
+        let (change, mut notices) = channels.track(message);
+        match change {
+            Change::Joined(channel) => {
+                notices.extend(channels.live.history.enqueue(&channel, Instant::now()));
+            }
+            Change::Kicked(channel) => notices.push(Notice {
+                critical: true,
+                text: format!("{channel}: removed by KICK; follow preference kept; quarantined until an explicit airc join or part"),
+            }),
+            Change::None => {}
+        }
+        self.record_notices(notices);
+    }
+
+    /// Handle one live inbound event: correlate a fresh JOIN's history page,
+    /// track channel evidence, settle a pending channel control, then record
+    /// it. Returns a confirmed send token and the settled control, if any.
+    pub fn ingest_live(&mut self, message: &Message) -> (Option<String>, Option<(bool, String)>) {
+        if self.channels.is_none() {
+            return (self.ingest(message, false), None);
+        }
+        let (disposition, notice) = self.channels_mut().live.history.observe(message);
+        self.record_notices(notice);
+        match disposition {
+            Disposition::Live => {
+                self.track(message);
+                let control = self.channels_mut().resolve(message);
+                (self.ingest(message, false), control)
+            }
+            Disposition::Replay { anchor } => (
+                self.ingest_with(message, Some(Replay::Join { anchor })),
+                None,
+            ),
+            Disposition::Consumed => (None, None),
+        }
+    }
+
+    pub fn begin_control(&mut self, request: Request, busy: Option<&str>) -> Result<Begin> {
+        let (begin, notices) = self.channels_mut().begin(request, busy)?;
+        for notice in notices {
+            self.notice(notice);
+        }
+        Ok(begin)
+    }
+
+    /// The pending control was not queued; nothing reached the network.
+    pub fn unsent_control(&mut self, why: &str) -> Option<(bool, String)> {
+        self.channels_mut().unsent(why)
+    }
+
+    /// The connection ends with a control unconfirmed: never replayed.
+    pub fn interrupt_control(&mut self, why: &str) -> Option<String> {
+        let notice = self.channels_mut().interrupt(why)?;
+        self.notice(notice.clone());
+        Some(notice)
+    }
+
+    /// Expire JOIN setup barriers and history requests; returns the next
+    /// history request to write, if one may start.
+    pub fn channel_tick(&mut self, now: Instant) -> Option<Message> {
+        let channels = self.channels.as_mut()?;
+        let mut notices = channels
+            .expire(now)
+            .into_iter()
+            .map(|text| Notice {
+                critical: true,
+                text,
+            })
+            .collect::<Vec<_>>();
+        notices.extend(channels.live.history.expire(now));
+        let (request, dispatched) = channels.live.history.dispatch(now);
+        notices.extend(dispatched);
+        self.record_notices(notices);
+        request
+    }
+
+    pub fn history_unsent(&mut self) {
+        let notice = self.channels_mut().live.history.unsent();
+        self.record_notices(notice);
+    }
+
+    /// Quiet channel changes that the event sequence does not reflect.
+    pub fn take_dirty(&mut self) -> bool {
+        self.channels
+            .as_mut()
+            .is_some_and(|c| std::mem::take(&mut c.live.dirty))
+    }
+
     pub fn describe(&self, running: bool) -> String {
         let mut text = format!(
             "{}; {}({}); epoch={}; unread={}\n{}\n",
@@ -562,6 +748,9 @@ impl State {
                     text.push_str(&format!("  full text: {bytes} bytes, sha256={digest}\n"));
                 }
             }
+        }
+        if let Some(channels) = &self.channels {
+            channels.describe(running, &mut text, safe);
         }
         for (channel, id) in &self.checkpoints {
             text.push_str(&format!(
@@ -595,7 +784,11 @@ mod tests {
     use super::*;
 
     fn state() -> State {
-        State::new(&ClientConfig {
+        State::new(&config()).unwrap()
+    }
+
+    fn config() -> ClientConfig {
+        ClientConfig {
             host: "localhost".into(),
             port: 6697,
             tls: true,
@@ -609,8 +802,7 @@ mod tests {
             artifact_url: None,
             unix: None,
             artifact_unix: None,
-        })
-        .unwrap()
+        }
     }
 
     fn chat(text: &str, id: &str) -> Message {
@@ -732,6 +924,64 @@ mod tests {
         assert_eq!(
             recovered.checkpoints["#work"], "real-id",
             "replay must not move recovery cursor backwards"
+        );
+    }
+
+    #[test]
+    fn version_one_state_stays_readable_and_upgrades_only_on_explicit_connect() {
+        let mut v1 = serde_json::to_value(state()).unwrap();
+        v1["version"] = 1.into();
+        v1.as_object_mut().unwrap().remove("channels");
+        let legacy: State = serde_json::from_value(v1.clone()).unwrap();
+        legacy.validate().unwrap();
+        assert!(!legacy.describe(false).contains("channel "));
+        let channels = serde_json::to_value(Channels::seeded(&[]).unwrap()).unwrap();
+        for (version, field) in [(1, Some(channels)), (2, None), (3, None)] {
+            let mut malformed = v1.clone();
+            malformed["version"] = version.into();
+            if let Some(field) = field {
+                malformed["channels"] = field;
+            }
+            let malformed: State = serde_json::from_value(malformed).unwrap();
+            assert!(malformed.validate().is_err(), "version {version}");
+        }
+        // Upgrade seeds absent legacy follows from the original configuration.
+        let mut upgraded: State = serde_json::from_value(v1).unwrap();
+        upgraded.upgrade(&config()).unwrap();
+        assert_eq!(upgraded.version, VERSION);
+        assert_eq!(upgraded.startup_channels(), ["#work"]);
+        // An explicitly empty version-2 set is never replaced by legacy follows.
+        let mut empty = state();
+        empty.channels_mut().followed.clear();
+        let mut restored: State =
+            serde_json::from_slice(&serde_json::to_vec(&empty).unwrap()).unwrap();
+        restored.validate().unwrap();
+        restored.upgrade(&config()).unwrap();
+        assert!(restored.startup_channels().is_empty());
+    }
+
+    #[test]
+    fn fresh_join_page_is_quiet_context_and_never_regresses_a_newer_live_anchor() {
+        let mut state = state();
+        state.ingest_with(
+            &chat("@Alice please look at this", "page-1"),
+            Some(Replay::Join { anchor: true }),
+        );
+        let event = state.events.back().unwrap();
+        assert_eq!(event.class, Some(Classification::Context));
+        assert!(event.text.starts_with("history @"));
+        assert_eq!(state.checkpoints["#work"], "page-1");
+        state.ingest(&chat("live and newer", "live-1"), false);
+        state.ingest_with(
+            &chat("older page message", "page-2"),
+            Some(Replay::Join { anchor: false }),
+        );
+        assert_eq!(state.checkpoints["#work"], "live-1");
+        // Explicit-connect recovery keeps its attention classification.
+        state.ingest(&chat("@Alice recovered request", "recovered"), true);
+        assert_ne!(
+            state.events.back().unwrap().class,
+            Some(Classification::Context)
         );
     }
 

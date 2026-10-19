@@ -59,6 +59,15 @@ disconnect. Never infer working or paused from an absent waiter. A connected
 client without an explicit claim has no claimed activity; a local armed waiter
 only proves observed local listening. Peer AWAY notices are quiet context.
 
+Join or leave another channel only when the task calls for it:
+`airc join work '#review'` / `airc part work '#review'`; read a topic with
+`airc topic work '#review'` (`--set TEXT` or `--clear` need operator rights).
+The server ACL decides access; report a refusal or KICK instead of working
+around it. Each call waits for server confirmation and is never retried. After
+a lost reply, find its printed `operation_id` in `airc status work` rather than
+repeating it. A kicked or interrupted channel stays out of reconnects until you
+explicitly join or part it. A fresh JOIN adds a quiet `history` page.
+
 For a handoff, prefer one compact receipt, for example
 `DONE @coordinator path=shared/review-notes sha256=... check=PASS`.
 Keep durable reports in an authorized shared file location; room artifacts can

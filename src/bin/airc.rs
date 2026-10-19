@@ -64,7 +64,23 @@ enum Command {
     Away { session: String, reason: String },
     /// Clear this connection's explicit away state; never inferred from waits.
     Back { session: String },
-    /// Show connection state and the last 32 send outcomes.
+    /// Join a channel on this connection and follow it on reconnect. Waits
+    /// for the server's confirmation; never retried.
+    Join { session: String, channel: String },
+    /// Leave a channel and stop following it. Waits for confirmation; never retried.
+    Part { session: String, channel: String },
+    /// Read a joined channel's topic, or set/clear it (channel operators only).
+    /// Waits for the server's confirmation; never retried.
+    Topic {
+        session: String,
+        channel: String,
+        /// New topic text (1–200 UTF-8 bytes); use --clear to remove it.
+        #[arg(long, conflicts_with = "clear")]
+        set: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Show connection state, channels, and the last 32 send and channel control outcomes.
     Status { session: String },
     /// Close only this named client, preserving local recovery state.
     Disconnect { session: String },
@@ -157,6 +173,54 @@ async fn run(args: Args) -> Result<()> {
                 }
                 Command::Back { session } => {
                     sessions::call(&root, &session, Operation::Back).await?
+                }
+                // Each invocation binds a fresh operation ID before any request.
+                Command::Join { session, channel } => {
+                    let operation_id = sessions::operation_id();
+                    sessions::call(
+                        &root,
+                        &session,
+                        Operation::Join {
+                            channel,
+                            operation_id,
+                        },
+                    )
+                    .await?
+                }
+                Command::Part { session, channel } => {
+                    let operation_id = sessions::operation_id();
+                    sessions::call(
+                        &root,
+                        &session,
+                        Operation::Part {
+                            channel,
+                            operation_id,
+                        },
+                    )
+                    .await?
+                }
+                Command::Topic {
+                    session,
+                    channel,
+                    set,
+                    clear,
+                } => {
+                    anyhow::ensure!(
+                        set.as_deref() != Some(""),
+                        "--set needs text; use --clear to remove the topic"
+                    );
+                    let text = if clear { Some(String::new()) } else { set };
+                    let operation_id = sessions::operation_id();
+                    sessions::call(
+                        &root,
+                        &session,
+                        Operation::Topic {
+                            channel,
+                            operation_id,
+                            text,
+                        },
+                    )
+                    .await?
                 }
                 Command::Status { session } => {
                     sessions::call(&root, &session, Operation::Status).await?
