@@ -26,7 +26,7 @@ impl Drop for Proxy {
 async fn proxy(server: &RunningServer) -> (String, Proxy) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let irc = server.address;
+    let irc = server.address.unwrap();
     let http = server.artifact_address.unwrap();
     let task = tokio::spawn(async move {
         let mut tunnels = tokio::task::JoinSet::new();
@@ -78,7 +78,10 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             server_name: "test.airc".into(),
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            control_unix: None,
+            membership_generation: None,
             database: dir.path().join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
@@ -100,7 +103,8 @@ impl Fixture {
                 moderated: false,
             }],
             artifacts: Some(Artifacts {
-                listen: "127.0.0.1:0".parse().unwrap(),
+                listen: Some("127.0.0.1:0".parse().unwrap()),
+                listen_unix: None,
                 public_url: "http://127.0.0.1:0".into(),
                 max_bytes: 32,
                 per_channel: 2,
@@ -118,7 +122,7 @@ impl Fixture {
         }
         ClientConfig {
             host: "127.0.0.1".into(),
-            port: server.address.port(),
+            port: server.address.unwrap().port(),
             tls: false,
             allow_insecure: false,
             ca_certificate: None,
@@ -128,6 +132,8 @@ impl Fixture {
             nick: name.into(),
             channels: vec!["#work".into()],
             artifact_url: Some(format!("http://{}", server.artifact_address.unwrap())),
+            unix: None,
+            artifact_unix: None,
         }
     }
 }
@@ -138,7 +144,7 @@ struct Peer {
 }
 impl Peer {
     async fn open(server: &RunningServer) -> Self {
-        let (read, writer) = TcpStream::connect(server.address)
+        let (read, writer) = TcpStream::connect(server.address.unwrap())
             .await
             .unwrap()
             .into_split();
@@ -456,7 +462,7 @@ async fn frontend_scenario(proxied: bool) {
     }
     connection
         .outbound
-        .send(Message::new("PRIVMSG", ["#work", "from agent"]))
+        .send(vec![Message::new("PRIVMSG", ["#work", "from agent"])])
         .await
         .unwrap();
     loop {
@@ -580,7 +586,7 @@ async fn auth_failures_cap_atomicity_and_malformed_frames() {
 #[test]
 fn configuration_rejects_unsafe_or_ambiguous_settings() {
     let mut f = Fixture::new();
-    f.config.listen = "0.0.0.0:6667".parse().unwrap();
+    f.config.listen = Some("0.0.0.0:6667".parse().unwrap());
     assert!(f.config.validate().is_err());
     f.config.allow_insecure = true;
     f.config.validate().unwrap();
@@ -1399,5 +1405,205 @@ async fn history_pages_are_byte_bounded_and_page_on_without_loss() {
             "{request}"
         );
     }
+    server.shutdown().await.unwrap();
+}
+
+impl Peer {
+    // An ordered protocol barrier, without timing-based absence assertions.
+    async fn through_pong(&mut self, label: &str) -> Vec<Message> {
+        self.send(&format!("PING :{label}")).await;
+        let mut messages = Vec::new();
+        loop {
+            let message = self.next().await;
+            if message.command == "PONG" && message.params.last().is_some_and(|text| text == label)
+            {
+                return messages;
+            }
+            messages.push(message);
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_away_notifies_shared_capable_peers_and_supplies_roster_facts() {
+    let mut f = Fixture::new();
+    f.config.allow_private_messages = true;
+    f.config.channels.push(Channel {
+        name: "#second".into(),
+        members: vec!["human".into(), "alice".into()],
+        operators: vec!["human".into()],
+        moderated: false,
+    });
+    let server = f.start().await;
+    let mut human = Peer::login_caps(&server, "human", Some("away-notify")).await;
+    let mut alice = Peer::login_caps(&server, "alice", Some("away-notify")).await;
+    let mut bob = Peer::login(&server, "bob", false).await;
+    let mut outsider = Peer::login_caps(&server, "outsider", Some("away-notify")).await;
+    human.join().await;
+    bob.join().await;
+    alice.send("AWAY :explicit before joining").await;
+    alice.until("306").await;
+    assert!(
+        !human
+            .through_pong("before-join")
+            .await
+            .iter()
+            .any(|m| m.command == "AWAY")
+    );
+    alice.join().await;
+    let joined = human.through_pong("joined").await;
+    let away = joined.iter().find(|m| m.command == "AWAY").unwrap();
+    assert_eq!(away.params, ["explicit before joining"]);
+    assert_eq!(away.prefix.as_deref(), Some("alice!alice@airc"));
+    assert!(
+        !alice
+            .through_pong("not-self")
+            .await
+            .iter()
+            .any(|m| m.command == "AWAY")
+    );
+    assert!(
+        !bob.through_pong("legacy")
+            .await
+            .iter()
+            .any(|m| m.command == "AWAY")
+    );
+    assert!(
+        !outsider
+            .through_pong("outsider")
+            .await
+            .iter()
+            .any(|m| m.command == "AWAY")
+    );
+    human.send("JOIN #second").await;
+    human.until("366").await;
+    alice.send("JOIN #second").await;
+    alice.until("366").await;
+    human.through_pong("drain-second").await;
+
+    // Bound/truncate a UTF-8 reason without splitting a scalar; shared-channel
+    // overlap delivers one change, not one per common channel.
+    alice.send(&format!("AWAY :a{}", "é".repeat(100))).await;
+    alice.until("306").await;
+    let updates = human.through_pong("changed").await;
+    let updates: Vec<_> = updates.iter().filter(|m| m.command == "AWAY").collect();
+    assert_eq!(updates.len(), 1);
+    let reason = format!("a{}", "é".repeat(99));
+    assert_eq!(updates[0].params.as_slice(), std::slice::from_ref(&reason));
+    alice.send(&format!("AWAY :{reason}")).await;
+    alice.until("306").await;
+    assert!(
+        !human
+            .through_pong("unchanged")
+            .await
+            .iter()
+            .any(|m| m.command == "AWAY")
+    );
+    human.send("MODE #work +v alice").await;
+    human.until("MODE").await;
+    human.send("WHO #work").await;
+    let roster = human.through_pong("who").await;
+    assert!(
+        roster
+            .iter()
+            .any(|m| m.command == "352" && m.params[5] == "alice" && m.params[6] == "G+")
+    );
+    assert!(
+        roster
+            .iter()
+            .any(|m| m.command == "352" && m.params[5] == "human" && m.params[6] == "H@")
+    );
+    outsider.send("WHO #work").await;
+    assert!(
+        !outsider
+            .through_pong("hidden")
+            .await
+            .iter()
+            .any(|m| m.command == "352")
+    );
+    human.send("WHOIS ALICE").await;
+    assert_eq!(human.until("301").await.params, ["human", "alice", &reason]);
+    human.until("318").await;
+    human.send("USERHOST ALICE").await;
+    assert_eq!(human.until("302").await.params[1], "alice=-alice@airc");
+    human.send("PRIVMSG alice :still delivers while away").await;
+    human.until("301").await;
+    assert_eq!(
+        alice.until("PRIVMSG").await.params[1],
+        "still delivers while away"
+    );
+    human.send("NOTICE alice :quiet notice").await;
+    assert_eq!(alice.until("NOTICE").await.params[1], "quiet notice");
+    assert!(
+        !human
+            .through_pong("notice-silent")
+            .await
+            .iter()
+            .any(|m| m.command == "301")
+    );
+
+    alice.send("AWAY").await;
+    alice.until("305").await;
+    assert!(human.until("AWAY").await.params.is_empty());
+    human.send("WHO #work").await;
+    assert!(
+        human
+            .through_pong("back-who")
+            .await
+            .iter()
+            .any(|m| m.command == "352" && m.params[5] == "alice" && m.params[6] == "H+")
+    );
+    human.send("USERHOST alice").await;
+    assert_eq!(human.until("302").await.params[1], "alice=+alice@airc");
+    alice.send("AWAY :").await;
+    alice.until("305").await;
+    assert!(
+        !human
+            .through_pong("already-back")
+            .await
+            .iter()
+            .any(|m| m.command == "AWAY")
+    );
+    // Reconnects are new sessions, never restoration of an account's claim.
+    alice.send("AWAY :before disconnect").await;
+    alice.until("306").await;
+    alice.send("QUIT :done").await;
+    human.until("QUIT").await;
+    let mut alice = Peer::login(&server, "alice", false).await;
+    alice.join().await;
+    human.send("WHOIS alice").await;
+    assert!(
+        !human
+            .through_pong("new-session")
+            .await
+            .iter()
+            .any(|m| m.command == "301")
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn away_keeps_registration_private_message_policy_and_notice_silence() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut unauthenticated = Peer::open(&server).await;
+    unauthenticated.send("AWAY :not registered").await;
+    unauthenticated.until("451").await;
+    let mut alice = Peer::login(&server, "alice", false).await;
+    alice.send("AWAY :explicit claim").await;
+    alice.until("306").await;
+    let mut human = Peer::login(&server, "human", false).await;
+    human.send("PRIVMSG alice :denied").await;
+    let denied = human.through_pong("private-denied").await;
+    assert!(denied.iter().any(|m| m.command == "404"));
+    assert!(!denied.iter().any(|m| m.command == "301"));
+    human.send("NOTICE alice :also denied").await;
+    assert!(
+        !human
+            .through_pong("denied")
+            .await
+            .iter()
+            .any(|m| m.command == "301" || m.command == "404")
+    );
     server.shutdown().await.unwrap();
 }

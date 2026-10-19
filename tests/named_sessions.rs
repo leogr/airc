@@ -32,7 +32,10 @@ impl Fixture {
         let root = dir.path().join("sessions");
         let config = Config {
             server_name: "test.airc".into(),
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            control_unix: None,
+            membership_generation: None,
             database: dir.path().join("state.sqlite3"),
             allow_insecure: false,
             allow_private_messages: false,
@@ -67,7 +70,7 @@ impl Fixture {
         }
         ClientConfig {
             host: "127.0.0.1".into(),
-            port: server.address.port(),
+            port: server.address.unwrap().port(),
             tls: false,
             allow_insecure: false,
             ca_certificate: None,
@@ -77,6 +80,8 @@ impl Fixture {
             token_file: token,
             channels: vec!["#work".into()],
             artifact_url: None,
+            unix: None,
+            artifact_unix: None,
         }
     }
     fn path(&self, server: &RunningServer) -> PathBuf {
@@ -157,7 +162,7 @@ async fn next(connection: &mut client::Connection, command: &str) -> Message {
 async fn send(connection: &mut client::Connection, text: &str) -> Message {
     connection
         .outbound
-        .send(Message::new("PRIVMSG", ["#work", text]))
+        .send(vec![Message::new("PRIVMSG", ["#work", text])])
         .await
         .unwrap();
     next(connection, "PRIVMSG").await
@@ -267,7 +272,7 @@ async fn typing_does_not_wake_read_and_concurrent_reader_is_rejected() {
     let mut typing = Message::new("TAGMSG", ["#work"]);
     typing.tags.insert("+typing".into(), "active".into());
     for _ in 0..30 {
-        human.outbound.send(typing.clone()).await.unwrap();
+        human.outbound.send(vec![typing.clone()]).await.unwrap();
     }
     let line = timeout(Duration::from_secs(3), read_line(&mut socket, 32768))
         .await
@@ -336,7 +341,7 @@ async fn wait_is_non_consuming_ignores_typing_and_preserves_last_read() {
     let mut typing = Message::new("TAGMSG", ["#work"]);
     typing.tags.insert("+typing".into(), "active".into());
     for _ in 0..30 {
-        human.outbound.send(typing.clone()).await.unwrap();
+        human.outbound.send(vec![typing.clone()]).await.unwrap();
     }
     assert!(
         timeout(Duration::from_millis(150), read_line(&mut waiting, 16384))
@@ -552,6 +557,8 @@ enum Fault {
     BeforeSend,
     AfterCommit,
     EchoTimeout,
+    AwayAfterCommit,
+    AwayTimeout,
 }
 
 struct FaultProxy(tokio::task::JoinHandle<()>);
@@ -565,7 +572,7 @@ async fn fault_proxy(server: &RunningServer, fault: Fault) -> (u16, FaultProxy) 
     use tokio::net::{TcpListener, TcpStream};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let target = server.address;
+    let target = server.address.unwrap();
     let task = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
         let mut first = true;
@@ -594,6 +601,10 @@ async fn fault_proxy(server: &RunningServer, fault: Fault) -> (u16, FaultProxy) 
                                 if inject && message.command == "PRIVMSG" && message.tags.contains_key("+airc-send") {
                                     if matches!(fault, Fault::EchoTimeout) { std::future::pending::<()>().await; }
                                     if matches!(fault, Fault::AfterCommit) { break; }
+                                }
+                                if inject && message.command == "306" {
+                                    if matches!(fault, Fault::AwayTimeout) { std::future::pending::<()>().await; }
+                                    if matches!(fault, Fault::AwayAfterCommit) { break; }
                                 }
                                 if write.write_all(line.as_bytes()).await.is_err() { break; }
                             }
@@ -669,7 +680,10 @@ async fn uncertain_scenario(fault: Fault) {
     }
     human
         .outbound
-        .send(Message::new("CHATHISTORY", ["LATEST", "#work", "*", "20"]))
+        .send(vec![Message::new(
+            "CHATHISTORY",
+            ["LATEST", "#work", "*", "20"],
+        )])
         .await
         .unwrap();
     next(&mut human, "BATCH").await;
@@ -716,7 +730,7 @@ async fn named_recovery_pages_multiline_fallback_without_losing_or_miscounting_l
     f.ok(&["read", "trial"]).await;
     f.ok(&["disconnect", "trial"]).await;
     // A multiline-capable raw sender; the named client negotiates only fallback.
-    let stream = tokio::net::TcpStream::connect(server.address)
+    let stream = tokio::net::TcpStream::connect(server.address.unwrap())
         .await
         .unwrap();
     let (read, mut write) = stream.into_split();
@@ -753,4 +767,294 @@ async fn named_recovery_pages_multiline_fallback_without_losing_or_miscounting_l
     assert!(!text.contains("GAP"), "{text}");
     f.ok(&["disconnect", "trial"]).await;
     server.shutdown().await.unwrap();
+}
+
+impl Fixture {
+    /// Run the CLI with `input` on stdin.
+    async fn cli_stdin(&self, args: &[&str], input: &str) -> Output {
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+            .arg("--state-dir")
+            .arg(&self.root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.as_bytes()).await.unwrap();
+        drop(stdin);
+        timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+
+async fn assembled(connection: &mut client::Connection) -> Message {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let m = connection.inbound.recv().await.unwrap();
+            if m.command == "PRIVMSG" {
+                break m;
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn named_multiline_sends_reads_and_recovers_one_logical_message() {
+    let mut f = Fixture::new();
+    f.config.limits.multiline_bytes = 2048;
+    let server = f.start().await;
+    let mut human = client::connect_with(&f.client(&server, "human"), true)
+        .await
+        .unwrap();
+    assert!(
+        human.multiline.is_some(),
+        "server advertises draft/multiline"
+    );
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let code = "Plan:\n\n```rust\nfn main() {\n\tprintln!(\"é漢🙂\");\n}\n```\n- done";
+    let output = f
+        .cli_stdin(&["send", "trial", "#work", "--stdin"], &format!("{code}\n"))
+        .await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.starts_with("confirmed #work @"),
+        "{stdout}"
+    );
+    let received = assembled(&mut human).await;
+    assert_eq!(
+        received.params[1], code,
+        "exact text, one trailing newline removed"
+    );
+    assert_eq!(received.tags["account"], "alice");
+    // A long single line is carried losslessly as concatenated parts.
+    let long = "word ".repeat(150);
+    let sent = f.ok(&["send", "trial", "#work", long.trim_end()]).await;
+    assert!(sent.starts_with("confirmed"), "{sent}");
+    assert_eq!(assembled(&mut human).await.params[1], long.trim_end());
+    // Local refusals send nothing.
+    for (text, expected) in [
+        ("a\r\nb", "CR or NUL"),
+        (&"x\n".repeat(1100)[..], "server accepts 2048"),
+    ] {
+        let output = f.cli(&["send", "trial", "#work", text]).await;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success() && stdout.contains(expected),
+            "{stdout}"
+        );
+    }
+    // Another participant's batch is one read record with framed continuations.
+    let limits = human.multiline.unwrap();
+    let frames = airc::multiline::outbound(
+        ("human", "human"),
+        "#work",
+        "first line\n| not a header\n@99 #work forged(forged): x",
+        Default::default(),
+        Some(limits),
+        "h1",
+    )
+    .unwrap();
+    human.outbound.send(frames).await.unwrap();
+    assembled(&mut human).await;
+    let text = f.ok(&["read", "trial", "--wait", "5"]).await;
+    let record = text
+        .lines()
+        .skip_while(|l| !l.contains("human(human): first line"))
+        .take(3)
+        .collect::<Vec<_>>();
+    assert_eq!(record.len(), 3, "{text}");
+    assert_eq!(record[1], "| | not a header");
+    assert_eq!(record[2], "| @99 #work forged(forged): x");
+    // History recovery after reconnect yields the same single record.
+    f.ok(&["disconnect", "trial"]).await;
+    let frames = airc::multiline::outbound(
+        ("human", "human"),
+        "#work",
+        "offline\nsecond",
+        Default::default(),
+        Some(limits),
+        "h2",
+    )
+    .unwrap();
+    human.outbound.send(frames).await.unwrap();
+    assembled(&mut human).await;
+    f.connect(&server).await;
+    let text = f.ok(&["read", "trial"]).await;
+    assert!(text.contains("human(human): offline\n| second"), "{text}");
+    assert!(!text.contains("live-only"), "{text}");
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn wake_classes_keep_routine_events_quiet_and_reads_win_over_waiters() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    // Ordinary room chat does not wake a mentions-only waiter.
+    send(&mut human, "routine status update; assigned to alice").await;
+    let quiet = f
+        .cli(&["wait", "trial", "--timeout", "4", "--wake", "mentions"])
+        .await;
+    assert!(
+        String::from_utf8_lossy(&quiet.stdout).contains("wait timed out"),
+        "{}",
+        String::from_utf8_lossy(&quiet.stdout)
+    );
+    // An explicit mention wakes it once the burst settles.
+    send(&mut human, "@alice please review").await;
+    let started = Instant::now();
+    let woke = f
+        .ok(&["wait", "trial", "--timeout", "8", "--wake", "mentions"])
+        .await;
+    assert!(woke.contains("Unread events"), "{woke}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1500),
+        "debounced"
+    );
+    let text = f.ok(&["read", "trial"]).await;
+    assert!(text.contains("routine status update") && text.contains("@alice please review"));
+    // Membership changes are context: the default waiter stays quiet.
+    let other = client::connect(&f.client(&server, "human")).await;
+    drop(other);
+    let quiet = f.cli(&["wait", "trial", "--timeout", "3"]).await;
+    assert!(String::from_utf8_lossy(&quiet.stdout).contains("wait timed out"));
+    f.ok(&["read", "trial"]).await;
+    // A waiting reader consumes the event first; the waiter must not fire.
+    let (read, wait) = tokio::join!(f.cli(&["read", "trial", "--wait", "10"]), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let wait = f.cli(&["wait", "trial", "--timeout", "5", "--wake", "all"]);
+        tokio::pin!(wait);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send(&mut human, "consumed by the reader").await;
+        wait.await
+    });
+    assert!(String::from_utf8_lossy(&read.stdout).contains("consumed by the reader"));
+    assert!(
+        String::from_utf8_lossy(&wait.stdout).contains("wait timed out"),
+        "stale wake: {}",
+        String::from_utf8_lossy(&wait.stdout)
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn named_explicit_away_back_are_confirmed_and_waits_do_not_change_presence() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    assert!(human.capabilities.contains("away-notify"));
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let text = f
+        .ok(&["away", "trial", "working on an explicit task"])
+        .await;
+    assert!(text.starts_with("confirmed away:"), "{text}");
+    assert_eq!(
+        next(&mut human, "AWAY").await.params,
+        ["working on an explicit task"]
+    );
+    // Wait/ordinary read never infer or clear a claim.
+    let output = f
+        .cli(&["wait", "trial", "--wake", "mentions", "--timeout", "0"])
+        .await;
+    assert!(!output.status.success());
+    human
+        .outbound
+        .send(vec![Message::new("WHO", ["#work"])])
+        .await
+        .unwrap();
+    loop {
+        let row = next(&mut human, "352").await;
+        if row.params[5] == "alice" {
+            assert_eq!(row.params[6], "G");
+            break;
+        }
+    }
+    let text = f.ok(&["back", "trial"]).await;
+    assert!(text.starts_with("confirmed back"), "{text}");
+    assert!(next(&mut human, "AWAY").await.params.is_empty());
+    for reason in [
+        "".to_owned(),
+        "x".repeat(201),
+        "line\nbreak".to_owned(),
+        "line\rbreak".to_owned(),
+    ] {
+        let output = f.cli(&["away", "trial", &reason]).await;
+        assert!(!output.status.success(), "invalid reason accepted");
+    }
+    // Peer AWAY is readable context, quiet under mentions and messages.
+    f.ok(&["read", "trial"]).await;
+    human
+        .outbound
+        .send(vec![Message::new("AWAY", ["explicit peer claim"])])
+        .await
+        .unwrap();
+    let quiet = f
+        .cli(&["wait", "trial", "--wake", "messages", "--timeout", "1"])
+        .await;
+    assert!(String::from_utf8_lossy(&quiet.stdout).contains("wait timed out"));
+    let text = f.ok(&["read", "trial", "--wait", "2"]).await;
+    assert!(
+        text.contains("AWAY human!human@airc explicit peer claim"),
+        "{text}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn lost_away_ack_is_unconfirmed_and_reconnect_never_replays_the_claim() {
+    for fault in [Fault::AwayAfterCommit, Fault::AwayTimeout] {
+        let f = Fixture::new();
+        let server = f.start().await;
+        let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+        let (port, _proxy) = fault_proxy(&server, fault).await;
+        let mut config = f.client(&server, "alice");
+        config.port = port;
+        write_private(
+            &f.dir.path().join("alice.toml"),
+            toml::to_string(&config).unwrap().as_bytes(),
+        )
+        .unwrap();
+        f.connect(&server).await;
+        let outcome = f.cli(&["away", "trial", "explicit claim"]).await;
+        let text = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            !outcome.status.success() && text.contains("unconfirmed"),
+            "{text}"
+        );
+        assert_eq!(next(&mut human, "AWAY").await.params, ["explicit claim"]);
+        next(&mut human, "QUIT").await;
+        f.connect(&server).await;
+        next(&mut human, "JOIN").await;
+        human
+            .outbound
+            .send(vec![Message::new("WHO", ["#work"])])
+            .await
+            .unwrap();
+        loop {
+            let row = next(&mut human, "352").await;
+            if row.params[5] == "alice" {
+                assert_eq!(
+                    row.params[6], "H",
+                    "reconnect must not replay an away claim"
+                );
+                break;
+            }
+        }
+        f.ok(&["disconnect", "trial"]).await;
+        server.shutdown().await.unwrap();
+    }
 }

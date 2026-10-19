@@ -38,6 +38,26 @@ pub async fn connect(
     .context("transport connection timed out")?
 }
 
+/// Connect to a local Unix endpoint. There is deliberately no TCP fallback.
+pub async fn connect_unix(path: &std::path::Path) -> Result<Stream> {
+    #[cfg(unix)]
+    {
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::UnixStream::connect(path),
+        )
+        .await
+        .context("Unix connection timed out")?
+        .with_context(|| format!("connect {}", path.display()))?;
+        Ok(Box::new(stream))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        anyhow::bail!("Unix endpoints require a Unix host")
+    }
+}
+
 async fn connect_inner(
     host: &str,
     port: u16,

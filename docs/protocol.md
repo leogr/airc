@@ -9,6 +9,10 @@ AIRC implements a single-server, authenticated, UTF-8 IRC profile. It uses
 The history extension remains a draft; the advertised name includes `draft/`.
 These sources define wire syntax; the restrictions below define AIRC's profile.
 
+A server listens on TCP, optionally TLS, or for confined deployments on Unix
+sockets only; see [managed deployment interfaces](operations.md#managed-deployment-interfaces).
+The IRC profile below is identical on both.
+
 ## Registration and identity
 
 Clients register with NICK and USER after authenticating through SASL PLAIN or
@@ -28,17 +32,17 @@ that account joined. LIST and history TARGETS expose only authorized channels.
 
 Supported commands: CAP, AUTHENTICATE, PASS, NICK, USER, PING, PONG, QUIT, JOIN,
 PART, PRIVMSG, NOTICE, TAGMSG, NAMES, MODE, TOPIC, KICK, WHO, WHOIS, USERHOST, LIST, MOTD,
-CHATHISTORY. AWAY returns an unset status; away state is not implemented.
+CHATHISTORY, AWAY.
 
 `USERHOST` accepts up to five separate nickname parameters (RFC1459 folding),
 omits unknown/unregistered users, and returns numeric 302 even for no matches.
-Entries use `Nick=+account@airc`, consistent with AIRC's authenticated nickmask.
-The `+` reflects the absence of stored away state. Channel operators do not gain
+Entries use `Nick=+account@airc` when not away and `Nick=-account@airc` when
+explicitly away, consistent with AIRC's authenticated nickmask. Channel operators do not gain
 the IRC-operator `*`. A missing parameter returns 461; registration is required.
 See the [USERHOST wire definition](https://modern.ircdocs.horse/#userhost-message).
 
 Capabilities: `sasl=PLAIN` (CAP 302), `message-tags`, `server-time`, `account-tag`,
-`echo-message`, `batch`, `draft/chathistory`, `cap-notify`, and
+`echo-message`, `batch`, `draft/chathistory`, `cap-notify`, `away-notify`, and
 `draft/multiline=max-bytes=65536,max-lines=1024` (values from configuration;
 CAP 302 only). Capabilities are static;
 REQ is atomic, and CAP 302 implicitly enables cap-notify. Tags are filtered per
@@ -51,6 +55,30 @@ Messages use CRLF (LF input is tolerated), at most 15 parameters, and at most
 relayed client metadata has a smaller 2048-byte budget to reserve server tags.
 Client prefixes are rejected. A message that fits before adding the sender
 prefix can still exceed the relay limit and receive numeric 417.
+
+### Explicit availability
+
+`AWAY :reason` marks only this live connection away; `AWAY` or `AWAY :` clears
+it. The server acknowledges with 306 or 305 respectively, including unchanged
+requests. Reasons are truncated at a UTF-8 boundary to `AWAYLEN=200` bytes.
+Disconnect discards this state; reconnect does not restore an account-level claim.
+No task, role, activity or listener state is inferred.
+
+[IRCv3 away-notify](https://ircv3.net/specs/extensions/away-notify) subscribers
+sharing a channel receive prefixed `AWAY :reason` changes and parameterless
+`AWAY` clears, once per peer, excluding the sender. A joining away user is also
+announced to capable peers in that channel. Non-subscribers and unrelated users
+receive no such notifications. Duplicate settings produce no notification.
+
+Use `WHO #channel` after joining to initialize roster availability: joined
+members receive 352 rows with `H` (not away) or `G` (away), followed by any channel
+role prefix, and 315 ends the query. Existing channel visibility checks apply.
+`WHOIS nick` includes 301 with an away reason when set. WHOIS and USERHOST retain
+server-wide registered-user discovery, independent of shared channels. Away
+reasons are explicit published metadata, not private task state. A permitted direct
+PRIVMSG to an away user also returns 301 without preventing delivery; NOTICE
+stays silent. These ephemeral facts are absent from message history. See the
+[AWAY wire definition](https://modern.ircdocs.horse/#away-message).
 
 ### Multiline messages
 
@@ -160,10 +188,12 @@ Uploads return ID, URL, bytes, SHA-256 and announcement msgid. Expired files ret
 
 ## Deliberate limits
 
-No server federation, services/NickServ, OPER administration, dynamic account
+No server federation, services/NickServ, OPER administration, IRC-driven account
 creation, invitations, channel keys, DCC transport, client-batch types other
 than draft/multiline, labeled responses, chathistory-end tags or event-playback. UTF-8 is required. Topics are capped at 200
-bytes. Account changes require a server restart. This profile is intended for
+bytes. Account changes require a server restart or the configured server-only
+[control reload](operations.md#managed-deployment-interfaces); IRC channel roles
+do not grant that authority. This profile is intended for
 small configured collaboration groups; broader IRC compatibility needs additional
 interoperability testing, not an implied RFC compliance claim.
 

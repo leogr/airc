@@ -1,6 +1,6 @@
 # Storage, transport and server lifecycle
 
-Verification: `c1aaff4f72a8cea262c129b0c14f243c0758fd38` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `db271dabb0266cfa5e491ac056d6c064282d4a78` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] Strict TOML configuration validates identifiers, account/channel references,
 resource limits and remote plaintext opt-ins before listeners start. Relative
@@ -45,17 +45,17 @@ continues receiving. [8](#source-8) [9](#source-9) [10](#source-10)
 
 ## Sources
 
-1. <a id="source-1"></a> [src/config.rs](../../src/config.rs#L12-L262) — strict config types, `Config::load`, `validate`, authentication and private writes.
-2. <a id="source-2"></a> [src/server/mod.rs](../../src/server/mod.rs#L43-L206) — `RunningServer`, `start`, `session`.
-3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L47-L273) — session roles, batch state, actor handling, timeouts, pruning and byte-counted output queues.
+1. <a id="source-1"></a> [src/config.rs](../../src/config.rs#L133-L332) — `load_with_digest` and `validate`; authentication/access at L334-L349, token generation and private writes at L365-L394.
+2. <a id="source-2"></a> [src/server/mod.rs](../../src/server/mod.rs#L219-L369) — `start`/`start_inner`; `RunningServer` at L66-L95 and `session` at L389-L451.
+3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L47-L534) — session roles, batch state, actor handling, timeouts, pruning and byte-counted output queues.
 4. <a id="source-4"></a> [src/store.rs](../../src/store.rs#L36-L203) — schema ownership, append transactions, selection and pruning.
-5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L1750-L1813) — `artifact` checks, persistence and broadcast.
+5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L2076-L2139) — `artifact` checks, persistence and broadcast.
 6. <a id="source-6"></a> [src/transport.rs](../../src/transport.rs#L11-L85) — TLS acceptor and verified connection.
 7. <a id="source-7"></a> [src/server/http.rs](../../src/server/http.rs#L25-L175) — routes, authentication, transfer limits and response headers.
 8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L326-L392) — artifact ACL, moderation and size tests.
 9. <a id="source-9"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L593-L681) — persistent topic/moderation and TLS rejection tests.
-10. <a id="source-10"></a> [src/server/core.rs](../../src/server/core.rs#L2036-L2090) — `slow_output_disconnects_only_that_client`.
+10. <a id="source-10"></a> [src/server/core.rs](../../src/server/core.rs#L2369-L2426) — `slow_output_disconnects_only_that_client`.
 11. <a id="source-11"></a> [src/bin/aircd.rs](../../src/bin/aircd.rs#L59-L129) — `init` private directory, credentials and configuration creation.
 12. <a id="source-12"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L914-L988) — schema-1 migration retains history, topic/moderation and artifacts; newer schema refusal preserves data.
-13. <a id="source-13"></a> [src/server/core.rs](../../src/server/core.rs#L88-L121) — persisted list validation.
-14. <a id="source-14"></a> [src/server/core.rs](../../src/server/core.rs#L1270-L1420) — ban queries and persist-before-broadcast mutation.
+13. <a id="source-13"></a> [src/server/core.rs](../../src/server/core.rs#L114-L151) — persisted list validation.
+14. <a id="source-14"></a> [src/server/core.rs](../../src/server/core.rs#L1531-L1681) — ban queries and persist-before-broadcast mutation.

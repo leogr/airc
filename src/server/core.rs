@@ -1,4 +1,4 @@
-use super::{Event, ban};
+use super::{ControlOp, Event, ban};
 use crate::{
     config::Config,
     protocol::{Message, fold, valid_channel, valid_nick},
@@ -25,8 +25,10 @@ const CAPS: &[&str] = &[
     "echo-message",
     "draft/chathistory",
     "cap-notify",
+    "away-notify",
     MULTILINE,
 ];
+const AWAY_LEN: usize = 200;
 const MULTILINE: &str = "draft/multiline";
 const CONCAT: &str = "draft/multiline-concat";
 const BATCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -49,6 +51,8 @@ struct Client {
     user: bool,
     account: Option<String>,
     registered: bool,
+    /// Explicit session availability; never inferred from activity or waiters.
+    away: Option<String>,
     negotiating: bool,
     cap302: bool,
     caps: BTreeSet<String>,
@@ -76,12 +80,38 @@ struct Channel {
     members: BTreeMap<u64, Role>,
 }
 
+/// The live configuration; membership reload replaces it for every reader.
+pub(super) type SharedConfig = Arc<std::sync::RwLock<Arc<Config>>>;
+
 pub(super) struct State {
     config: Arc<Config>,
+    shared: SharedConfig,
     store: Store,
     clients: BTreeMap<u64, Client>,
     channels: BTreeMap<String, Channel>,
     batch: u64,
+    /// Random per process, so a status from a replaced server never matches.
+    incarnation: String,
+    /// SHA-256 of the configuration bytes last applied from the source file.
+    digest: Option<String>,
+    /// Non-reloadable configuration; reload refuses any difference from it.
+    baseline: Option<serde_json::Value>,
+}
+
+/// Configuration fields that a reload must leave unchanged.
+pub(super) fn reloadable_baseline(config: &Config) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(config)?;
+    if let Some(fields) = value.as_object_mut() {
+        for reloadable in ["accounts", "channels", "membership_generation"] {
+            fields.remove(reloadable);
+        }
+    }
+    let names = config
+        .channels
+        .iter()
+        .map(|c| fold(&c.name))
+        .collect::<BTreeSet<_>>();
+    Ok(serde_json::json!({"fixed": value, "channels": names}))
 }
 
 impl State {
@@ -112,12 +142,243 @@ impl State {
             );
         }
         Ok(Self {
+            shared: Arc::new(std::sync::RwLock::new(config.clone())),
             config,
             store,
             clients: BTreeMap::new(),
             channels,
             batch: 0,
+            incarnation: uuid::Uuid::new_v4().to_string(),
+            digest: None,
+            baseline: None,
         })
+    }
+
+    pub fn shared_config(&self) -> SharedConfig {
+        self.shared.clone()
+    }
+
+    /// Mark this server as started from a file whose bytes had `digest`.
+    pub fn set_source(&mut self, digest: String, baseline: serde_json::Value) {
+        self.digest = Some(digest);
+        self.baseline = Some(baseline);
+    }
+
+    fn control(&mut self, op: ControlOp) -> serde_json::Value {
+        match op {
+            ControlOp::Status => serde_json::json!({"ok": true, "result": self.status()}),
+            ControlOp::Reload(Err(error)) => control_failure("INVALID_CONFIG", &error),
+            ControlOp::Reload(Ok(loaded)) => {
+                let (config, digest) = *loaded;
+                self.reload(config, digest)
+            }
+        }
+    }
+
+    fn status(&self) -> serde_json::Value {
+        // Connected accounts only: bounded by the connection limit, never truncated.
+        let mut accounts = BTreeMap::<&str, usize>::new();
+        for account in self.clients.values().filter_map(|c| c.account.as_deref()) {
+            *accounts.entry(account).or_default() += 1;
+        }
+        let accounts = accounts
+            .into_iter()
+            .map(|(name, connections)| {
+                (
+                    name.to_owned(),
+                    serde_json::json!({"connections": connections}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let kind = |unix: bool| if unix { "unix" } else { "tcp" };
+        serde_json::json!({
+            "protocol": 1,
+            "features": crate::FEATURES,
+            "incarnation": self.incarnation,
+            "applied_generation": self.config.membership_generation,
+            "config_sha256": self.digest,
+            "listeners": {
+                "irc": kind(self.config.listen_unix.is_some()),
+                "artifacts": self.config.artifacts.as_ref().map(|a| kind(a.listen_unix.is_some())),
+            },
+            "configured_accounts": self.config.accounts.len(),
+            "accounts": accounts,
+        })
+    }
+
+    /// Apply accounts and channel membership atomically, then revoke live
+    /// authority that the new membership no longer grants.
+    fn reload(&mut self, new: Config, digest: String) -> serde_json::Value {
+        let Some(baseline) = &self.baseline else {
+            return control_failure("RESTART_REQUIRED", "server was not started from a file");
+        };
+        if reloadable_baseline(&new).ok().as_ref() != Some(baseline) {
+            return control_failure(
+                "RESTART_REQUIRED",
+                "only accounts, channel members/operators and membership_generation reload",
+            );
+        }
+        let applied = self.config.membership_generation.unwrap_or(0);
+        let generation = new.membership_generation.unwrap_or(0);
+        if generation < applied {
+            return control_failure(
+                "GENERATION_STALE",
+                &format!("generation {generation} is older than applied {applied}"),
+            );
+        }
+        if generation == applied {
+            if self.digest.as_deref() != Some(digest.as_str()) {
+                return control_failure(
+                    "GENERATION_CONFLICT",
+                    &format!("generation {generation} is applied with different content"),
+                );
+            }
+            return self.reloaded(Vec::new(), Vec::new(), 0);
+        }
+        let old = self.config.clone();
+        let mut next = (*old).clone();
+        next.accounts = new.accounts;
+        next.channels = new.channels;
+        next.membership_generation = new.membership_generation;
+        let next = Arc::new(next);
+        self.config = next.clone();
+        *self
+            .shared
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
+        self.digest = Some(digest);
+        // A removed account or a changed token hash ends every session of it.
+        let token = |config: &Config, name: &str| {
+            config
+                .accounts
+                .iter()
+                .find(|a| a.name == name)
+                .map(|a| a.token_sha256.clone())
+        };
+        let revoked = self
+            .clients
+            .iter()
+            .filter_map(|(id, c)| {
+                let account = c.account.as_deref()?;
+                let kept =
+                    token(&old, account).is_some() && token(&old, account) == token(&next, account);
+                (!kept).then(|| (*id, account.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        let mut disconnected = BTreeSet::new();
+        for (id, account) in revoked {
+            self.close(id, "Membership revoked");
+            disconnected.insert(account);
+        }
+        // Channel membership and configured operator roles follow the new ACL.
+        let mut kicked = Vec::new();
+        let mut kicks = 0usize;
+        for channel in next.channels.clone() {
+            let key = fold(&channel.name);
+            let was_operator = |account: &str| {
+                old.channels
+                    .iter()
+                    .find(|c| fold(&c.name) == key)
+                    .is_some_and(|c| c.operators.iter().any(|a| a == account))
+            };
+            let members = self.channels[&key]
+                .members
+                .iter()
+                .map(|(id, role)| {
+                    (
+                        *id,
+                        *role,
+                        self.clients[id].account.clone().unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (id, role, account) in members {
+                let name = self.channels[&key].name.clone();
+                let nick = self.clients[&id].nick.clone();
+                let peers = self.channels[&key]
+                    .members
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>();
+                if !channel.members.contains(&account) {
+                    let mut kick = Message::new("KICK", [&name, &nick, "Membership revoked"]);
+                    kick.prefix = Some(self.config.server_name.clone());
+                    self.broadcast(peers, kick);
+                    self.channels.get_mut(&key).unwrap().members.remove(&id);
+                    if kicked.len() < MAX_KICK_DETAILS {
+                        kicked.push(serde_json::json!({"channel": name, "account": account}));
+                    }
+                    kicks += 1;
+                    continue;
+                }
+                let operator = channel.operators.contains(&account);
+                let change = if operator && !was_operator(&account) && !role.op {
+                    Some("+o")
+                } else if !operator && was_operator(&account) && role.op {
+                    Some("-o")
+                } else {
+                    None
+                };
+                if let Some(change) = change {
+                    self.channels
+                        .get_mut(&key)
+                        .unwrap()
+                        .members
+                        .get_mut(&id)
+                        .unwrap()
+                        .op = change == "+o";
+                    let mut mode = Message::new("MODE", [&name, change, &nick]);
+                    mode.prefix = Some(self.config.server_name.clone());
+                    self.broadcast(peers, mode);
+                }
+            }
+        }
+        self.reloaded(disconnected.into_iter().collect(), kicked, kicks)
+    }
+
+    /// Applied state is always exact. `disconnected` is bounded by the
+    /// connection limit; `kicked` details stop at `MAX_KICK_DETAILS`, with the
+    /// exact `kicked_count` and `kicked_truncated` reporting the rest.
+    fn reloaded(
+        &self,
+        disconnected: Vec<String>,
+        kicked: Vec<serde_json::Value>,
+        kicks: usize,
+    ) -> serde_json::Value {
+        serde_json::json!({"ok": true, "result": {
+            "applied_generation": self.config.membership_generation,
+            "config_sha256": self.digest,
+            "incarnation": self.incarnation,
+            "disconnected": disconnected,
+            "kicked_truncated": kicks > kicked.len(),
+            "kicked": kicked,
+            "kicked_count": kicks,
+        }})
+    }
+
+    /// Remove a session immediately, delivering `ERROR :reason` before the
+    /// connection closes. Later input from that connection is ignored.
+    fn close(&mut self, id: u64, reason: &str) {
+        if !self.clients.contains_key(&id) {
+            return;
+        }
+        let mut quit = Message::new("QUIT", [reason]);
+        quit.prefix = Some(self.prefix(id));
+        let peers = self
+            .peers(id)
+            .into_iter()
+            .filter(|peer| *peer != id)
+            .collect::<Vec<_>>();
+        self.broadcast(peers, quit);
+        for c in self.channels.values_mut() {
+            c.members.remove(&id);
+        }
+        self.send(id, Message::new("ERROR", [reason]));
+        if let Some(c) = self.clients.remove(&id)
+            && c.out.try_send(String::new()).is_err()
+        {
+            let _ = c.kill.send(true);
+        }
     }
 
     pub fn shutdown(&mut self) {
@@ -141,6 +402,7 @@ impl State {
                         user: false,
                         account: None,
                         registered: false,
+                        away: None,
                         negotiating: false,
                         cap302: false,
                         caps: BTreeSet::new(),
@@ -217,6 +479,10 @@ impl State {
                     .store
                     .artifact(&id)
                     .map(|a| a.filter(|a| self.config.may_read(&account, &a.channel)));
+                let _ = reply.send(result);
+            }
+            Event::Control { op, reply } => {
+                let result = self.control(op);
                 let _ = reply.send(result);
             }
             _ => {}
@@ -454,7 +720,7 @@ impl State {
                 self.numeric(id, "323", &["End of LIST"]);
             }
             "MOTD" => self.numeric(id, "422", &["No MOTD"]),
-            "AWAY" => self.numeric(id, "305", &["Away state is not stored"]),
+            "AWAY" => self.away(id, p.first().map(String::as_str)),
             _ => self.numeric(id, "421", &[&m.command, "Unknown command"]),
         }
         self.register(id);
@@ -504,6 +770,7 @@ impl State {
                 "CHANMODES=b,,,mnt",
                 &format!("MAXLIST=b:{}", ban::MAX_BANS),
                 "NICKLEN=24",
+                &format!("AWAYLEN={AWAY_LEN}"),
                 "CHANNELLEN=48",
                 "UTF8ONLY",
                 &format!("CHATHISTORY={}", self.config.limits.history_page),
@@ -692,6 +959,9 @@ impl State {
         let mut m = Message::new("JOIN", [&name]);
         m.prefix = Some(self.prefix(id));
         self.broadcast(peers.clone(), m);
+        if self.clients[&id].away.is_some() {
+            self.notify_away(id, peers.iter().copied());
+        }
         if op {
             let mut m = Message::new("MODE", [&name, "+o", &self.clients[&id].nick]);
             m.prefix = Some(self.config.server_name.clone());
@@ -895,6 +1165,15 @@ impl State {
                 self.deny(id, batch, notice, "401", &[&target, "No such nick"]);
                 return Ok(());
             };
+            if m.command == "PRIVMSG"
+                && let Some(reason) = self.clients[&target_id].away.clone()
+            {
+                self.numeric(
+                    id,
+                    "301",
+                    &[&self.clients[&target_id].nick.clone(), &reason],
+                );
+            }
             peers = BTreeSet::from([target_id]);
         }
         if self.clients[&id].caps.contains("echo-message") {
@@ -1498,6 +1777,38 @@ impl State {
         }
     }
 
+    fn away(&mut self, id: u64, reason: Option<&str>) {
+        // Standard AWAY is connection state, not durable account/task state.
+        // Truncate at a UTF-8 boundary to the advertised byte limit.
+        let away = reason.filter(|text| !text.is_empty()).map(|text| {
+            let mut end = text.len().min(AWAY_LEN);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_owned()
+        });
+        let changed = self.clients[&id].away != away;
+        self.clients.get_mut(&id).unwrap().away = away;
+        if self.clients[&id].away.is_some() {
+            self.numeric(id, "306", &["You have been marked as being away"]);
+        } else {
+            self.numeric(id, "305", &["You are no longer marked as being away"]);
+        }
+        if changed {
+            self.notify_away(id, self.peers(id));
+        }
+    }
+
+    fn notify_away(&mut self, id: u64, peers: impl IntoIterator<Item = u64>) {
+        let mut message = Message::new("AWAY", self.clients[&id].away.iter().cloned());
+        message.prefix = Some(self.prefix(id));
+        let recipients = peers
+            .into_iter()
+            .filter(|peer| *peer != id && self.clients[peer].caps.contains("away-notify"))
+            .collect::<BTreeSet<_>>();
+        self.broadcast(recipients, message);
+    }
+
     fn who(&mut self, id: u64, name: &str) {
         if self
             .channels
@@ -1513,13 +1824,17 @@ impl State {
                     (
                         c.account.clone().unwrap(),
                         c.nick.clone(),
-                        if r.op {
-                            "H@"
-                        } else if r.voice {
-                            "H+"
-                        } else {
-                            "H"
-                        },
+                        format!(
+                            "{}{}",
+                            if c.away.is_some() { "G" } else { "H" },
+                            if r.op {
+                                "@"
+                            } else if r.voice {
+                                "+"
+                            } else {
+                                ""
+                            }
+                        ),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1533,7 +1848,7 @@ impl State {
                         "airc",
                         &self.config.server_name.clone(),
                         &nick,
-                        flags,
+                        &flags,
                         "0 AIRC participant",
                     ],
                 );
@@ -1544,7 +1859,7 @@ impl State {
 
     fn userhost(&mut self, id: u64, nicks: &[String]) {
         // RFC 2812: at most five names, unknown/unregistered users omitted.
-        // Channel operators are not IRC operators; AWAY is not stored by AIRC.
+        // Channel operators are not IRC operators; +/- is explicit away state.
         let users = nicks
             .iter()
             .take(5)
@@ -1553,7 +1868,14 @@ impl State {
                     .values()
                     .find(|c| c.registered && fold(&c.nick) == fold(nick))
             })
-            .map(|c| format!("{}=+{}@airc", c.nick, c.account.as_deref().unwrap()))
+            .map(|c| {
+                format!(
+                    "{}={}{}@airc",
+                    c.nick,
+                    if c.away.is_some() { "-" } else { "+" },
+                    c.account.as_deref().unwrap()
+                )
+            })
             .collect::<Vec<_>>()
             .join(" ");
         self.numeric(id, "302", &[&users]);
@@ -1567,12 +1889,16 @@ impl State {
         {
             let account = c.account.clone().unwrap();
             let nick = c.nick.clone();
+            let away = c.away.clone();
             self.numeric(
                 id,
                 "311",
                 &[&nick, &account, "airc", "*", "AIRC participant"],
             );
             self.numeric(id, "330", &[&nick, &account, "is logged in as"]);
+            if let Some(reason) = away {
+                self.numeric(id, "301", &[&nick, &reason]);
+            }
         } else {
             self.numeric(id, "401", &[nick, "No such nick"]);
         }
@@ -1813,6 +2139,13 @@ impl State {
     }
 }
 
+/// Kick details in a reload reply; 1024 entries keep it far below 1 MiB.
+const MAX_KICK_DETAILS: usize = 1024;
+
+fn control_failure(code: &str, error: &str) -> serde_json::Value {
+    serde_json::json!({"ok": false, "code": code, "error": error})
+}
+
 fn valid_middle(param: &str) -> bool {
     !param.is_empty()
         && param.len() <= 128
@@ -2037,7 +2370,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = Arc::new(Config {
             server_name: "test.airc".into(),
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            control_unix: None,
+            membership_generation: None,
             database: directory.path().join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
@@ -2093,7 +2429,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = Arc::new(Config {
             server_name: "test.airc".into(),
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            control_unix: None,
+            membership_generation: None,
             database: directory.path().join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
@@ -2190,5 +2529,69 @@ mod tests {
         }
         assert!(!sent.contains("FAIL"), "{sent}");
         assert!(sent.contains("PRIVMSG #work :three"), "{sent}");
+    }
+
+    #[test]
+    fn reload_reports_exact_kick_counts_with_bounded_details() {
+        let directory = tempfile::tempdir().unwrap();
+        let account = |name: &str| Account {
+            name: name.into(),
+            token_sha256: token_hash("test"),
+        };
+        let mut config = Config {
+            server_name: "test.airc".into(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            control_unix: None,
+            membership_generation: Some(1),
+            database: directory.path().join("state.db"),
+            allow_insecure: false,
+            allow_private_messages: false,
+            tls: None,
+            limits: Limits::default(),
+            accounts: vec![account("alice"), account("bob")],
+            channels: vec![ChannelConfig {
+                name: "#space".into(),
+                members: vec!["alice".into(), "bob".into()],
+                operators: vec![],
+                moderated: false,
+            }],
+            artifacts: None,
+        };
+        let store = Store::open(&config).unwrap();
+        let mut state = State::new(Arc::new(config.clone()), store).unwrap();
+        state.set_source("one".into(), reloadable_baseline(&config).unwrap());
+        // 1100 sessions of one account in the channel; outputs are discarded.
+        for id in 1..=1100u64 {
+            let (out, _) = mpsc::channel(1);
+            let (kill, _) = watch::channel(false);
+            state.handle(Event::Connect {
+                id,
+                out,
+                queued: Arc::default(),
+                kill,
+            });
+            let c = state.clients.get_mut(&id).unwrap();
+            c.nick = format!("bob{id}");
+            c.account = Some("bob".into());
+            c.registered = true;
+            state
+                .channels
+                .get_mut("#space")
+                .unwrap()
+                .members
+                .insert(id, Role::default());
+        }
+        config.channels[0].members.retain(|m| m != "bob");
+        config.membership_generation = Some(2);
+        let reply = state.reload(config, "two".into());
+        let result = &reply["result"];
+        assert_eq!(result["applied_generation"], 2, "{reply}");
+        assert_eq!(result["config_sha256"], "two");
+        assert_eq!(result["kicked_count"], 1100);
+        assert_eq!(result["kicked_truncated"], true);
+        assert_eq!(result["kicked"].as_array().unwrap().len(), MAX_KICK_DETAILS);
+        assert!(state.channels["#space"].members.is_empty());
+        assert!(serde_json::to_vec(&reply).unwrap().len() < 1024 * 1024);
     }
 }

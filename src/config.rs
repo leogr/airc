@@ -13,7 +13,18 @@ use subtle::ConstantTimeEq;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server_name: String,
-    pub listen: SocketAddr,
+    /// TCP IRC listener; exactly one of `listen` and `listen_unix` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<SocketAddr>,
+    /// Unix IRC listener. Unix mode never opens a TCP listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_unix: Option<PathBuf>,
+    /// Server-only control socket, outside every listener directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_unix: Option<PathBuf>,
+    /// Desired membership generation reported and enforced by control reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership_generation: Option<u64>,
     pub database: PathBuf,
     #[serde(default)]
     pub allow_insecure: bool,
@@ -95,7 +106,11 @@ pub struct Channel {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifacts {
-    pub listen: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<SocketAddr>,
+    /// Unix artifact listener; `public_url` then only names links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_unix: Option<PathBuf>,
     pub public_url: String,
     #[serde(default = "artifact_bytes")]
     pub max_bytes: usize,
@@ -111,17 +126,39 @@ fn artifact_count() -> usize {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let mut config: Self =
-            toml::from_str(&std::fs::read_to_string(path).context("read server configuration")?)
-                .context("parse server configuration")?;
-        let parent = path.parent().unwrap_or(Path::new("."));
+        Ok(Self::load_with_digest(path)?.0)
+    }
+
+    /// Load and validate, returning the SHA-256 of exactly the bytes parsed.
+    pub fn load_with_digest(path: &Path) -> Result<(Self, String)> {
+        let bytes = std::fs::read(path).context("read server configuration")?;
+        let digest = token_hash_bytes(&bytes);
+        let mut config: Self = toml::from_str(
+            std::str::from_utf8(&bytes).context("server configuration is not UTF-8")?,
+        )
+        .context("parse server configuration")?;
+        let path = std::path::absolute(path)?;
+        let parent = path.parent().unwrap_or(Path::new("/"));
         config.database = parent.join(&config.database);
+        for socket in [
+            config.listen_unix.as_mut(),
+            config.control_unix.as_mut(),
+            config
+                .artifacts
+                .as_mut()
+                .and_then(|a| a.listen_unix.as_mut()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *socket = parent.join(&*socket);
+        }
         if let Some(tls) = &mut config.tls {
             tls.certificate = parent.join(&tls.certificate);
             tls.private_key = parent.join(&tls.private_key);
         }
         config.validate()?;
-        Ok(config)
+        Ok((config, digest))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -134,10 +171,49 @@ impl Config {
                     .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b)),
             "invalid server_name"
         );
-        ensure!(
-            self.listen.ip().is_loopback() || self.tls.is_some() || self.allow_insecure,
-            "non-loopback IRC requires TLS or explicit allow_insecure"
-        );
+        match (&self.listen, &self.listen_unix) {
+            (Some(listen), None) => ensure!(
+                listen.ip().is_loopback() || self.tls.is_some() || self.allow_insecure,
+                "non-loopback IRC requires TLS or explicit allow_insecure"
+            ),
+            (None, Some(path)) => {
+                unix_path(path)?;
+                ensure!(
+                    self.tls.is_none() && !self.allow_insecure,
+                    "listen_unix excludes tls and allow_insecure"
+                );
+                ensure!(
+                    self.artifacts
+                        .as_ref()
+                        .is_none_or(|a| a.listen_unix.is_some()),
+                    "listen_unix requires [artifacts] listen_unix; Unix mode opens no TCP listener"
+                );
+            }
+            _ => anyhow::bail!("configure exactly one of listen and listen_unix"),
+        }
+        if let Some(control) = &self.control_unix {
+            unix_path(control)?;
+            ensure!(
+                self.membership_generation.is_some(),
+                "control_unix requires membership_generation"
+            );
+            let directory = control.parent().unwrap_or(control);
+            for listener in [
+                self.listen_unix.as_deref(),
+                self.artifacts
+                    .as_ref()
+                    .and_then(|a| a.listen_unix.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let shared = listener.parent().unwrap_or(listener);
+                ensure!(
+                    !directory.starts_with(shared) && !shared.starts_with(directory),
+                    "control_unix must not share or nest with a listener directory"
+                );
+            }
+        }
         ensure!(
             (1..=4096).contains(&self.limits.connections),
             "invalid connection limit"
@@ -210,10 +286,20 @@ impl Config {
             "configure 1 to 128 channels"
         );
         if let Some(a) = &self.artifacts {
-            ensure!(
-                a.listen.ip().is_loopback() || self.allow_insecure,
-                "artifact HTTP requires loopback or explicit allow_insecure; use a TLS reverse proxy remotely"
-            );
+            match (&a.listen, &a.listen_unix) {
+                (Some(listen), None) => ensure!(
+                    self.listen.is_some() && (listen.ip().is_loopback() || self.allow_insecure),
+                    "artifact HTTP requires loopback or explicit allow_insecure; use a TLS reverse proxy remotely"
+                ),
+                (None, Some(path)) => {
+                    unix_path(path)?;
+                    ensure!(
+                        self.listen_unix.is_some(),
+                        "[artifacts] listen_unix requires listen_unix for IRC"
+                    );
+                }
+                _ => anyhow::bail!("configure exactly one artifact listen and listen_unix"),
+            }
             let url = reqwest::Url::parse(&a.public_url).context("invalid artifact public_url")?;
             ensure!(
                 ["http", "https"].contains(&url.scheme())
@@ -229,6 +315,7 @@ impl Config {
             );
             ensure!(
                 url.scheme() == "https"
+                    || a.listen_unix.is_some()
                     || self.allow_insecure
                     || url.host_str().is_some_and(|h| h == "localhost"
                         || h.parse::<std::net::IpAddr>()
@@ -259,6 +346,20 @@ impl Config {
             .iter()
             .any(|c| fold(&c.name) == fold(channel) && c.members.iter().any(|a| a == account))
     }
+}
+
+/// Socket paths are absolute after loading and fit `sockaddr_un`.
+fn unix_path(path: &Path) -> Result<()> {
+    ensure!(
+        path.is_absolute()
+            && path.file_name().is_some()
+            && path.as_os_str().len() < 100
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "Unix socket paths must be absolute, without '..', and shorter than 100 bytes"
+    );
+    Ok(())
 }
 
 pub fn token_hash(token: &str) -> String {

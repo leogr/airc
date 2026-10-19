@@ -12,8 +12,9 @@ initialization directories use 0700. Existing file permissions are not repaired.
 Accounts have a canonical name and SHA-256 hash of a randomly generated token.
 Channel members/operators refer to those account names. To add an account, create
 a fresh random token, keep it in that participant's token file, add its hash and
-membership to server config, and restart. Never substitute a memorable password
-for a random token. There is no public registration or live config reload.
+membership to server config, and restart, or use a
+[control reload](#managed-deployment-interfaces). Never substitute a memorable
+password for a random token. There is no public registration.
 
 Default limits: 128 IRC connections, 256 queued replies and 4 MiB of unwritten
 output per connection (`outbound_queue`, `outbound_bytes`), 10,000 messages per
@@ -39,6 +40,76 @@ newlines that older binaries cannot replay. Back up before upgrading if rollback
 is needed: older binaries reject the newer schema. Restoring an older database also discards
 changes made since that backup. Ban masks and setter/time metadata survive restart;
 voice/operator session roles do not.
+
+## Managed deployment interfaces
+
+These interfaces let a deployment tool run AIRC confined, without TCP. AIRC does
+not depend on any such tool.
+
+**Unix mode.** `listen_unix = "PATH"` replaces `listen`, and `[artifacts]`
+`listen_unix` replaces its `listen`; exactly one of each pair is set. Unix mode
+refuses `tls`, `allow_insecure` and any TCP artifact listener, so it never opens a
+TCP port. `public_url` then only names artifact links (for example
+`http://airc.local`); it is not checked as a network origin. Socket paths are
+absolute (after resolution against the configuration file), have no `..` and are
+under 100 bytes. A stable lock beside the socket serializes servers sharing its
+path. A temporary socket is set to mode 0600, then published with a no-replace
+hard link. A stale socket refusing connections is removed before binding; a live
+server or non-socket is refused. On shutdown a server unlinks a
+socket only while the path still names the inode it created, so a replacement
+server's socket survives. SASL accounts remain the identity boundary; socket
+access is not.
+
+**Feature probe.** `aircd features` and `airc features` print
+`{"protocol":1,"version":"…","features":[…]}` without starting anything. The list
+names only implemented features: `multiline`, `unix-listeners`, `unix-artifacts`,
+`control-status`, `control-reload`, `acl-revoke`, `client-unix`,
+`client-artifact-unix`, `client-multiline`, `jsonl-v2`, `named-multiline`,
+`send-stdin`, `client-presence` and `server-presence`. A deployer should refuse a managed mode whose feature is missing
+rather than fall back. `client-presence` covers JSONL `who`/`away`/`back` and
+away-notify negotiation/events; `server-presence` covers connection-scoped AWAY,
+WHO H/G and away-notify. The live control status includes the same implemented
+feature list: check that proof as well as executable probes when reusing a
+running server. Executable features are distinct from IRC CAP negotiation.
+
+**Control socket.** `control_unix = "PATH"` requires `membership_generation`
+(unsigned 64-bit) and must not be inside, contain or share a directory with any
+listener socket, so members given the endpoint directory cannot reach it. The
+protocol is one JSON request line per connection (16 KiB at most), answered by
+one line capped at 1 MiB and then closed, with a ten-second connection deadline:
+
+- `{"op":"status"}` returns `{"ok":true,"result":{...}}` with `protocol`,
+  `features`, `incarnation` (random per server process), `applied_generation`,
+  `config_sha256` (SHA-256 hex of the exact configuration file bytes applied),
+  `listeners` (`irc`/`artifacts`: `unix` or `tcp`), `configured_accounts` (a
+  count) and `accounts`, which lists connected accounts only, with connection
+  counts. It is bounded by `limits.connections`, never truncated.
+- `{"op":"reload"}` re-reads the file the server started from. Only accounts,
+  channel members/operators and `membership_generation` may change; anything else,
+  including the channel set, fails with `RESTART_REQUIRED`. A lower generation
+  fails with `GENERATION_STALE`; the same generation with different bytes fails
+  with `GENERATION_CONFLICT`; the same bytes are an idempotent success. Rejected
+  configurations leave applied state unchanged. Success returns `applied_generation`, `config_sha256`,
+  `incarnation`, `disconnected` (accounts) and `kicked` (`channel`, `account`).
+  Kick details stop at 1024 entries; `kicked_count` is the exact count and
+  `kicked_truncated` says whether details were omitted. Applied state proof and
+  the connection-bounded `disconnected` account list are not truncated.
+- Errors are `{"ok":false,"code":"…","error":"…"}`; invalid configuration is
+  `INVALID_CONFIG` and malformed requests `INVALID_REQUEST`.
+
+If the control connection closes without a reply, inspect status before deciding
+whether the reload applied; losing the reply does not roll back an applied change.
+
+Reload applies atomically in the server's state actor. Every session whose
+account was removed or whose token hash changed loses authority in that step;
+artifact HTTP stops accepting the old token immediately. The server queues
+`ERROR :Membership revoked` before graceful close, but queue saturation, socket
+failure or the write deadline can prevent delivery. A member removed from a
+channel is KICKed by the server and cannot rejoin. Configured operators added or removed by the
+reload gain or lose `+o`; dynamic roles granted by operators are kept. Reload
+requires a server started from a file (`aircd serve`); deleting a token file is
+not revocation. Prove an apply by matching generation, `config_sha256` and
+`incarnation`, and a later status that no longer lists revoked accounts.
 
 ## Remote access
 

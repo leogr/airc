@@ -1,11 +1,12 @@
 //! Named, explicitly started local IRC clients. IPC never carries credentials.
+mod attention;
 mod history;
 mod state;
 mod storage;
 
 use crate::{
     client::{self, ClientConfig},
-    protocol::{Message, fold, read_line},
+    protocol::read_line,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -28,13 +29,44 @@ use tokio::{
 
 const VERSION: u32 = 2;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
+/// A request carries at most one 256 KiB message, even fully JSON-escaped.
+const MAX_REQUEST: usize = 2 * 1024 * 1024;
+/// Echo deadline for one line; batches add time for the server's input pacing.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SEND_WAIT: Duration = Duration::from_secs(50);
+
+/// Which unread events wake `wait`. Every event stays readable regardless.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Wake {
+    /// Every recorded event, including membership changes.
+    All,
+    /// Others' messages and local problems; membership is quiet (default).
+    #[default]
+    Messages,
+    /// Explicit @nick/@account or leading/group addresses, direct messages, replies to this
+    /// session's messages, @all/@here, and local problems.
+    Mentions,
+}
+
+impl Wake {
+    fn mode(self) -> attention::WakeMode {
+        match self {
+            Self::All => attention::WakeMode::All,
+            Self::Messages => attention::WakeMode::Messages,
+            Self::Mentions => attention::WakeMode::Mentions,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Wait {
         wait: u64,
+        /// Older clients omit this and get the default.
+        #[serde(default)]
+        wake: Wake,
     },
     Read {
         wait: u64,
@@ -46,6 +78,10 @@ pub enum Operation {
         text: String,
         reply: Option<String>,
     },
+    Away {
+        reason: String,
+    },
+    Back,
     Status,
     Disconnect,
 }
@@ -102,12 +138,20 @@ struct WaitingRead {
 }
 struct WaitingNotice {
     until: Instant,
+    wake: Wake,
     reply: oneshot::Sender<Response>,
 }
 struct WaitingSend {
     until: Instant,
     token: String,
     target: String,
+    reply: oneshot::Sender<Response>,
+}
+
+struct WaitingAvailability {
+    until: Instant,
+    expected: &'static str,
+    reason: Option<String>,
     reply: oneshot::Sender<Response>,
 }
 
@@ -212,11 +256,13 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
         "session socket owner mismatch"
     );
     let wait = match &operation {
-        Operation::Read { wait, .. } | Operation::Wait { wait } => *wait + 5,
-        Operation::Send { .. } => 15,
+        Operation::Read { wait, .. } | Operation::Wait { wait, .. } => *wait + 5,
+        Operation::Send { .. } => 60,
+        Operation::Away { .. } | Operation::Back => 20,
         _ => 5,
     };
     let uncertain = matches!(operation, Operation::Send { .. });
+    let availability = matches!(operation, Operation::Away { .. } | Operation::Back);
     let disconnect = matches!(operation, Operation::Disconnect);
     let request = Request {
         version: VERSION,
@@ -259,6 +305,8 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
                 "{detail}; {}",
                 if uncertain {
                     "send outcome uncertain. Inspect airc status and history before resending; nothing was retried"
+                } else if availability {
+                    "availability outcome unconfirmed; inspect WHO/WHOIS. Nothing was retried"
                 } else {
                     "request was not retried; use read --again to recover a previous read"
                 }
@@ -269,7 +317,7 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
 
 /// Wait for unread events without advancing the cursor or replacing read replay.
 /// Each IPC wait is bounded; only successful idle responses renew the wait.
-pub async fn wait(root: &Path, name: &str, seconds: Option<u64>) -> Result<Response> {
+pub async fn wait(root: &Path, name: &str, seconds: Option<u64>, wake: Wake) -> Result<Response> {
     let deadline = seconds
         .map(|value| {
             Instant::now()
@@ -285,7 +333,15 @@ pub async fn wait(root: &Path, name: &str, seconds: Option<u64>) -> Result<Respo
                 .saturating_add(u64::from(left.subsec_nanos() != 0))
                 .min(60)
         });
-        let response = call(root, name, Operation::Wait { wait: interval }).await?;
+        let response = call(
+            root,
+            name,
+            Operation::Wait {
+                wait: interval,
+                wake,
+            },
+        )
+        .await?;
         if !response.ok {
             return Ok(response);
         }
@@ -305,7 +361,10 @@ pub async fn wait(root: &Path, name: &str, seconds: Option<u64>) -> Result<Respo
 }
 
 fn validate(operation: &Operation) -> Result<()> {
-    if let Operation::Wait { wait } = operation {
+    if let Operation::Away { reason } = operation {
+        client::away_message(Some(reason))?;
+    }
+    if let Operation::Wait { wait, .. } = operation {
         ensure!(*wait <= 60, "internal wait requires 0–60 seconds");
     }
     if let Operation::Read { wait, limit, again } = operation {
@@ -314,6 +373,13 @@ fn validate(operation: &Operation) -> Result<()> {
             "read requires --wait 0–60 and --limit 1–200"
         );
         ensure!(!again || *wait == 0, "--again cannot wait");
+    }
+    if let Operation::Send { text, .. } = operation {
+        ensure!(
+            text.len() <= crate::multiline::CLIENT_MAX_BYTES,
+            "message exceeds {} bytes; share larger content as an artifact",
+            crate::multiline::CLIENT_MAX_BYTES
+        );
     }
     Ok(())
 }
@@ -325,8 +391,9 @@ pub async fn worker(root: &Path, name: &str, config: &Path) -> Result<()> {
         let lock = store.lock()?;
         let config = ClientConfig::load(config)?;
         let mut state = store.load()?.unwrap_or(State::new(&config)?);
+        state.begin_epoch();
         ensure!(state.identity == identity(&config)?, "session config changed; use a new session name to preserve old recovery state");
-        let mut connection = client::connect(&config).await?;
+        let mut connection = client::connect_with(&config, true).await?;
         ensure!(["message-tags", "account-tag", "echo-message", "batch", "draft/chathistory"].iter()
             .all(|cap| connection.capabilities.contains(*cap)), "named sessions need message-tags, account-tag, echo-message, batch and draft/chathistory");
         if state.status.starts_with("connected") {
@@ -334,7 +401,7 @@ pub async fn worker(root: &Path, name: &str, config: &Path) -> Result<()> {
         }
         state.epoch = uuid::Uuid::new_v4().to_string();
         state.status = "connected; no automatic reconnect or resend".into();
-        state.notice(format!("connected as {}({}); epoch={}; history below is replay", config.nick, config.account, state.epoch));
+        state.context(format!("connected as {}({}); epoch={}; history below is replay", config.nick, config.account, state.epoch));
         history::recover(&mut connection, &mut state, &config.channels).await?;
         store.save(&state)?;
         match fs::remove_file(store.socket()) {
@@ -388,6 +455,7 @@ async fn serve(
     let mut reader: Option<WaitingRead> = None;
     let mut waiter: Option<WaitingNotice> = None;
     let mut sender: Option<WaitingSend> = None;
+    let mut availability: Option<WaitingAvailability> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -409,13 +477,32 @@ async fn serve(
                     state.notice(state.status.clone());
                     break;
                 };
+                if availability.as_ref().is_some_and(|pending|
+                    message.command == pending.expected
+                        && message.params.first().is_some_and(|nick| crate::protocol::fold(nick) == crate::protocol::fold(&state.nick))
+                ) {
+                    let pending = availability.take().unwrap();
+                    let text = match pending.reason {
+                        Some(reason) => format!("confirmed away: {}", safe(&reason)),
+                        None => "confirmed back (not marked away)".into(),
+                    };
+                    state.context(text.clone());
+                    store.save(state)?;
+                    let _ = pending.reply.send(Response::ok(format!("{text}\n")));
+                } else if availability.is_some()
+                    && matches!(message.command.as_str(), "421" | "461")
+                    && message.params.get(1).is_some_and(|command| command == "AWAY")
+                {
+                    let pending = availability.take().unwrap();
+                    let _ = pending.reply.send(Response::error(format!("availability rejected by server {}", message.command)));
+                }
                 let previous_sequence = state.sequence();
                 let confirmed = state.ingest(&message, false);
                 if sender.as_ref().is_some_and(|s| confirmed.as_deref() == Some(s.token.as_str())) {
                     let sent = sender.take().unwrap();
                     store.save(state)?;
                     let _ = sent.reply.send(Response::ok(format!("{}\n", safe(&state.outcome(&sent.token)))));
-                } else if let Some(pending) = &sender && rejects(&message, &pending.target) {
+                } else if let Some(pending) = &sender && client::rejects(&message, &pending.target) {
                     let sent = sender.take().unwrap();
                     state.set_outcome(&sent.token, format!("rejected by server {} {}", message.command, message.params.join(" ")));
                     store.save(state)?;
@@ -428,11 +515,11 @@ async fn serve(
             }
             Some(call) = request_rx.recv() => {
                 match call.operation {
-                    Operation::Wait { wait } => {
+                    Operation::Wait { wait, wake } => {
                         if waiter.as_ref().is_some_and(|w| !w.reply.is_closed()) {
                             let _ = call.reply.send(Response::error("another waiter is active; keep one waiter per session"));
                         } else {
-                            waiter = Some(WaitingNotice { until: Instant::now() + Duration::from_secs(wait), reply: call.reply });
+                            waiter = Some(WaitingNotice { until: Instant::now() + Duration::from_secs(wait), wake, reply: call.reply });
                         }
                     }
                     Operation::Status => { let _ = call.reply.send(Response::ok(state.describe(true))); }
@@ -449,22 +536,45 @@ async fn serve(
                             let _ = call.reply.send(Response::error("another read is waiting; reads are serialized, retry after it finishes"));
                         } else { reader = Some(WaitingRead { until: Instant::now() + Duration::from_secs(wait), limit, reply: call.reply }); }
                     }
+                    op @ (Operation::Away { .. } | Operation::Back) => {
+                        if availability.is_some() || sender.is_some() {
+                            let _ = call.reply.send(Response::error("not sent: another send or availability update awaits confirmation"));
+                            continue;
+                        }
+                        let reason = match op { Operation::Away { reason } => Some(reason), _ => None };
+                        let message = client::away_message(reason.as_deref())?;
+                        if connection.outbound.try_send(vec![message]).is_err() {
+                            let _ = call.reply.send(Response::error("not sent: connection queue unavailable"));
+                        } else {
+                            availability = Some(WaitingAvailability {
+                                until: Instant::now() + SEND_TIMEOUT,
+                                expected: if reason.is_some() { "306" } else { "305" },
+                                reason,
+                                reply: call.reply,
+                            });
+                        }
+                    }
                     Operation::Send { target, text, reply } => {
+                        if availability.is_some() {
+                            let _ = call.reply.send(Response::error("not sent: an availability update awaits confirmation"));
+                            continue;
+                        }
                         if sender.is_some() {
                             let _ = call.reply.send(Response::error("not sent: another send awaits confirmation; retry this call after it finishes"));
                             continue;
                         }
-                        match state.prepare_send(&target, &text, reply.as_deref()) {
+                        match state.prepare_send(&target, &text, reply.as_deref(), connection.multiline) {
                             Err(e) => { let _ = call.reply.send(Response::error(format!("not sent: {e:#}"))); }
-                            Ok(message) => {
-                                let token = message.tags[SEND_TAG].clone();
+                            Ok(frames) => {
+                                let token = frames[0].tags[SEND_TAG].clone();
+                                let wait = (SEND_TIMEOUT + Duration::from_millis(12 * frames.len() as u64)).min(MAX_SEND_WAIT);
                                 store.save(state)?; // Prepared uncertainty is durable BEFORE queuing.
-                                if connection.outbound.try_send(message).is_err() {
+                                if connection.outbound.try_send(frames).is_err() {
                                     state.set_outcome(&token, "not sent: connection queue unavailable".into());
                                     store.save(state)?;
                                     let _ = call.reply.send(Response::error(state.outcome(&token)));
                                 } else {
-                                    sender = Some(WaitingSend { until: Instant::now() + SEND_TIMEOUT, token, target, reply: call.reply });
+                                    sender = Some(WaitingSend { until: Instant::now() + wait, token, target, reply: call.reply });
                                 }
                             }
                         }
@@ -473,16 +583,8 @@ async fn serve(
             }
             _ = tick.tick() => {},
         }
-        if waiter.as_ref().is_some_and(|w| w.reply.is_closed()) {
-            waiter = None;
-        }
-        if waiter
-            .as_ref()
-            .is_some_and(|w| state.has_unread() || Instant::now() >= w.until)
-        {
-            let waiting = waiter.take().unwrap();
-            let _ = waiting.reply.send(Response::readiness(state.has_unread()));
-        }
+        // A pending reader is satisfied first, so events it consumes cannot also
+        // fire readiness and cause a stale wakeup.
         if reader.as_ref().is_some_and(|r| r.reply.is_closed()) {
             reader = None;
         }
@@ -495,6 +597,30 @@ async fn serve(
             store.save(state)?; // Cache/cursor publication precedes potentially lost stdout.
             let _ = read.reply.send(Response::ok(text));
         }
+        if waiter.as_ref().is_some_and(|w| w.reply.is_closed()) {
+            waiter = None;
+        }
+        if let Some(w) = &waiter {
+            // Debounced by event times: 2 s of quiet, at most 10 s after the
+            // first relevant event; critical events and gaps wake at once.
+            let decision = match state.readiness(w.wake.mode(), w.until.into_std()) {
+                Ok(attention::Readiness::Ready) => Some(Response::readiness(true)),
+                Ok(attention::Readiness::TimedOut) => Some(Response::readiness(false)),
+                Ok(attention::Readiness::Pending) => None,
+                Err(e) => Some(Response::error(format!("wait failed: {e}; inspect status"))),
+            };
+            if let Some(response) = decision {
+                let _ = waiter.take().unwrap().reply.send(response);
+            }
+        }
+        if availability
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.until)
+        {
+            state.status = "availability confirmation timed out; reconnect explicitly and inspect WHO/WHOIS; no update was retried".into();
+            state.notice(state.status.clone());
+            break; // A late numeric must never confirm a subsequent update.
+        }
         if sender.as_ref().is_some_and(|s| Instant::now() >= s.until) {
             state.status = "send confirmation timed out; reconnect explicitly and inspect history before resending".into();
             state.notice(state.status.clone());
@@ -502,6 +628,11 @@ async fn serve(
         }
     }
     store.save(state)?;
+    if let Some(pending) = availability {
+        let _ = pending.reply.send(Response::error(
+            "availability outcome unconfirmed; connection ended; nothing was retried",
+        ));
+    }
     if let Some(send) = sender {
         let _ = send.reply.send(Response::error(state.outcome(&send.token)));
     }
@@ -520,27 +651,9 @@ async fn serve(
     Ok(())
 }
 
-fn rejects(message: &Message, target: &str) -> bool {
-    match message.command.as_str() {
-        "401" | "403" | "404" => message
-            .params
-            .get(1)
-            .is_some_and(|v| fold(v) == fold(target)),
-        "417" => true,
-        "FAIL" => {
-            message.params.first().is_some_and(|v| v == "PRIVMSG")
-                && message
-                    .params
-                    .get(2)
-                    .is_some_and(|v| fold(v) == fold(target))
-        }
-        _ => false,
-    }
-}
-
 async fn handle(stream: UnixStream, tx: mpsc::Sender<Call>) -> Result<()> {
     let mut stream = BufReader::new(stream);
-    let line = timeout(Duration::from_secs(5), read_line(&mut stream, 16384))
+    let line = timeout(Duration::from_secs(5), read_line(&mut stream, MAX_REQUEST))
         .await??
         .context("empty request")?;
     let parsed = (|| {
@@ -605,16 +718,22 @@ mod tests {
                 let line = read_line(&mut socket, 16384).await.unwrap().unwrap();
                 let request: Request = serde_json::from_str(&line).unwrap();
                 assert_eq!(request.version, VERSION);
-                assert!(matches!(request.operation, Operation::Wait { wait: 60 }));
+                assert!(matches!(
+                    request.operation,
+                    Operation::Wait { wait: 60, .. }
+                ));
                 write_json(socket.get_mut(), &Response::readiness(ready))
                     .await
                     .unwrap();
             }
         });
-        let response = timeout(Duration::from_secs(5), wait(root.path(), "waiter", None))
-            .await
-            .unwrap()
-            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            wait(root.path(), "waiter", None, Wake::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(response.ok);
         assert!(response.text.contains("airc read waiter"));
         peer.await.unwrap();
@@ -638,7 +757,7 @@ mod tests {
                         .is_err()
                 );
             });
-            let response = wait(root.path(), "waiter", None).await;
+            let response = wait(root.path(), "waiter", None, Wake::default()).await;
             assert!(response.is_err() || !response.unwrap().ok);
             peer.await.unwrap();
         }

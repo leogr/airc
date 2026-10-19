@@ -8,7 +8,8 @@ use std::{
 };
 use tokio::net::UnixStream;
 
-const MAX_STATE: u64 = 4 * 1024 * 1024;
+/// Retained events, the last read and receipts, including JSON escaping.
+const MAX_STATE: u64 = 16 * 1024 * 1024;
 
 pub(super) struct Storage {
     pub dir: PathBuf,

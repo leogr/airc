@@ -1,5 +1,5 @@
 use super::Event;
-use crate::config::Config;
+use super::core::SharedConfig;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -10,24 +10,26 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{sync::Arc, time::Duration};
-use tokio::{
-    net::TcpListener,
-    sync::{Semaphore, mpsc, oneshot, watch},
-};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 #[derive(Clone)]
 struct Api {
-    config: Arc<Config>,
+    /// Replaced by membership reload, so revoked tokens stop authenticating.
+    config: SharedConfig,
     tx: mpsc::Sender<Event>,
     uploads: Arc<Semaphore>,
 }
 
-pub(super) async fn serve(
-    listener: TcpListener,
-    config: Arc<Config>,
+pub(super) async fn serve<L>(
+    listener: L,
+    config: SharedConfig,
     tx: mpsc::Sender<Event>,
     mut stop: watch::Receiver<bool>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
     let app = Router::new()
         .route("/v1/channels/{channel}/artifacts", post(upload))
         .route("/v1/artifacts/{id}", get(download))
@@ -41,6 +43,15 @@ pub(super) async fn serve(
             let _ = stop.changed().await;
         })
         .await
+}
+
+impl Api {
+    fn config(&self) -> std::sync::Arc<crate::config::Config> {
+        self.config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 fn authenticate(api: &Api, headers: &HeaderMap) -> Option<String> {
@@ -59,7 +70,7 @@ fn authenticate(api: &Api, headers: &HeaderMap) -> Option<String> {
     decoded
         .as_deref()
         .and_then(|s| s.split_once(':'))
-        .and_then(|(name, token)| api.config.authenticate(name, token))
+        .and_then(|(name, token)| api.config().authenticate(name, token))
 }
 
 fn unauthorized() -> Response {
@@ -84,7 +95,7 @@ async fn upload(
         Some(account) => account,
         None => return unauthorized(),
     };
-    if !api.config.may_read(&account, &channel) {
+    if !api.config().may_read(&account, &channel) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let filename = headers
@@ -103,7 +114,7 @@ async fn upload(
     let Ok(_permit) = api.uploads.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let cap = api.config.artifacts.as_ref().unwrap().max_bytes;
+    let cap = api.config().artifacts.as_ref().unwrap().max_bytes;
     let bytes = match tokio::time::timeout(Duration::from_secs(30), to_bytes(body, cap)).await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),

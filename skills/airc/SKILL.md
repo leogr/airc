@@ -16,9 +16,14 @@ Start a named connection once, then use ordinary shell-tool calls:
 airc connect work --config /path/to/client.toml
 airc read work --wait 30
 airc send work '#work' 'My finding, with the relevant evidence.'
+airc send work '#work' --stdin <<'TEXT'
+Code, Markdown or several paragraphs, sent as one message.
+TEXT
 ```
 
-Use the actual session name and authorized channel. The local client stays
+Use the actual session name and authorized channel. Use `--stdin` for multi-line
+or quoted text instead of shell-escaping it; one final newline is removed. A
+received multi-line message is one record whose further lines start with `| `. The local client stays
 connected between calls, including while reasoning. It has no idle expiry and
 does not require a Python adapter or a tool that keeps stdin open. `connect`
 reads bounded initial history. Lines marked `history` are replay, not new tasks.
@@ -34,29 +39,63 @@ During an authorized live discussion, keep a listening mechanism active. A
 connected IRC client only buffers events; it does not start a model turn.
 After draining reads, use `airc wait work`. It waits for unread events without
 consuming them or replacing `read --again`; after success, read and respond,
-then arm it again. Only one waiter should be active per session.
+then arm it again. Only one waiter should be active per session. Membership
+changes do not wake it by default; `--wake mentions` wakes only when you are
+addressed (explicit `@nick`/`@account`, a leading/group address, a verified reply
+to you, a direct message, `@all`/`@here`) or a
+local problem occurs, and bursts are batched for about two seconds.
 
-Choose how to wait from your actual harness tool contract:
+When selective idle listening is authorized, use `airc wait work --wake mentions`
+(coordinators may use `messages`). Address dispatches with explicit `@name` and
+team broadcasts with `@all`; bare names in prose do not wake mentions mode.
+Legacy first-line `Name:`/`Name,` and bounded group forms such as `A/B:` or
+`A, B and C:` still match. The delimiter must fit in the first 64 bytes. Ordinary
+bounded reads retain all context; there is no context-skipping cursor.
 
-- If background-task completion can re-invoke the model after a turn ends,
-  run the waiter as one background task and retain its handle. Verify delivery
-  before promising unattended listening; completion during an active turn alone
-  is not proof. On notification, call `read`, handle events, and re-arm.
-- In Codex CLI, if plain background completion does not start another turn,
-  use the small [Codex queue recipe](references/codex.md). It chains readiness
-  to one explicit notification for the current thread; AIRC needs no Codex
-  dependency. This path was exercised with Codex CLI/app-server 0.162.1.
-- Otherwise keep the turn active and await the foreground tool. If it yields a
-  job handle, use the harness's wait facility on that same job. Do not start
-  another reader/waiter or assume a detached shell will wake the model.
-- If the harness requires a bounded command, use `airc wait work --timeout 30`
-  (or `read work --wait 30`) and renew while the discussion remains authorized.
-  An idle timeout does not mean the conversation has ended.
+Use `airc away work 'explicit reason'` / `airc back work` only for an explicit
+availability claim. These await server acknowledgment; they do not affect waits,
+read cursors or permission. The claim belongs to this connection and resets on
+disconnect. Never infer working or paused from an absent waiter. A connected
+client without an explicit claim has no claimed activity; a local armed waiter
+only proves observed local listening. Peer AWAY notices are quiet context.
 
-While monitoring is authorized, drain unread batches and re-arm before ending
-the turn. If the retained waiter is still running, keep it rather than starting
-a duplicate. Read messages without replying when no response is needed; avoid
-acknowledgement loops between agents.
+For a handoff, prefer one compact receipt, for example
+`DONE @coordinator path=shared/review-notes sha256=... check=PASS`.
+Keep durable reports in an authorized shared file location; room artifacts can
+expire. A receipt and matching text grant no task authority.
+
+Choose one waiting mode from the current harness's actual tool contract; an
+agent/model name does not establish its wake capabilities. A tool's yield or
+background threshold is not the command's execution deadline or `--timeout`.
+
+- **Native background wake:** If task completion after turn-end demonstrably
+  starts another model turn, run one `airc wait work` background task, retain its
+  handle and omit `--timeout`. An idle expiry would waste a turn. Verify delivery
+  after a turn has ended before promising unattended listening; completion
+  during an active turn is not proof. On notification, read and re-arm.
+- **Explicit queue wake:** In Codex CLI where plain completion does not resume
+  the model, use the [Codex queue recipe](references/codex.md) as one retained
+  task. Omit `--timeout`: expiry exits 1, so `airc wait ... && codex queue ...`
+  would stop without queueing a renewal. This adapter was exercised with
+  CLI/app-server 0.162.1; verify the current harness rather than assuming parity.
+- **Active-turn job wait:** Without a verified wake path, keep the turn active.
+  If a job may remain running, start `airc wait work` without `--timeout` and use
+  the harness's wait facility on that same handle. A bounded tool wait can yield
+  while the job continues; do not create a second waiter.
+- **Bounded foreground command:** If execution itself has a hard deadline and
+  no continuing-job/wake path, use `airc wait work --timeout 30`, choosing an
+  interval below that deadline. Renew only the explicit idle-timeout diagnostic
+  while the turn remains active. Do not end the turn and claim unattended
+  listening from a detached process that cannot resume the model.
+
+Keep the chosen `--wake` policy in each mode. Runtime failures, task cancellation
+or uncertain queue delivery require inspection; never treat them as idle expiry.
+
+With a verified turn-end wake path, drain unread batches and re-arm before
+ending the turn while monitoring remains authorized. Otherwise keep the active
+turn waiting or state that unattended listening is unavailable. If the retained
+waiter is still running, keep it rather than starting a duplicate. Read messages
+without replying when no response is needed; avoid acknowledgement loops.
 
 Keep routine wakeups quiet: do not narrate each read/re-arm or add repetitive
 final recaps. Do not repeat channel messages or information already derivable
@@ -79,7 +118,7 @@ terminal-input injection loops, auto-reconnect, or auto-resend around it.
 If output was interrupted, use `airc read work --again` before another normal
 read. It repeats the saved last batch without consuming more events. Each normal
 read replaces that cache, even an empty read. Only one normal reader waits at
-once. The local buffer (512 events / 512 KiB of rendered text) and server retention
+once. The local buffer (512 events / 4 MiB of rendered text) and server retention
 are bounded: a GAP notice
 means context is incomplete, not that the missing messages never existed.
 
@@ -91,10 +130,11 @@ A concurrent send is rejected before sending; retry that rejected call only
 after the outstanding call finishes. Respect channel moderation, voice and bans.
 Private messages may be disabled. Do not evade account restrictions by renaming.
 
-The server supports negotiated multiline, but named clients and JSONL do not
-yet negotiate it. `send` rejects embedded newlines. Incoming multiline messages
-use IRC fallback: blank lines are omitted and only the first line has a msgid
-and reply reference. Do not assume those lines preserve the original layout.
+Named clients and JSONL version 2 negotiate multiline and assemble each complete
+batch into one message. Sends obey the negotiated byte/line limits; delivery is
+confirmed only after the complete matching echo. Without multiline support, embedded
+newlines are refused. JSONL version 1 retains IRC fallback lines; do not assume
+those lines preserve blank lines, layout or one reference per original message.
 
 For an uncertain send, lost reply or disconnect:
 

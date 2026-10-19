@@ -13,6 +13,12 @@ message broadcasts. An artifact and its announcement commit together. Dynamic
 roles and live connections are ephemeral. Age/count limits bound retained data;
 a missing msgid produces an explicit history gap. [1](#source-1) [2](#source-2)
 
+[FACT] A confined deployment can run Unix-only: IRC and artifact sockets with
+no TCP listener, and a separate control socket outside every listener
+directory. Control status and reload bind applied membership to a generation,
+the exact configuration digest and a per-process incarnation; reload revokes
+removed or rotated identities in the same actor step. [5](#source-5)
+
 [FACT] Configuration declares accounts and channel access. Random tokens are
 hashed at the server and read from private client files. Remote IRC plaintext
 requires explicit opt-in; TLS clients verify both trust and hostname. Artifact
@@ -49,3 +55,4 @@ scheduling remains the harness's responsibility. [4](#source-4)
 3. <a id="source-3"></a> [Client and artifact evidence](../digests/agent-client.md).
 
 4. <a id="source-4"></a> [Named session persistence](../digests/named-sessions.md).
+5. <a id="source-5"></a> [Managed transport evidence](../digests/managed-transport.md).

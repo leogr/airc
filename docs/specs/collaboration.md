@@ -9,8 +9,12 @@ draft history. JSONL is a local interface, not a replacement wire protocol.
 [FACT] Negotiated draft/multiline carries one logical message across bounded
 lines. The server validates the complete batch, applies the same permissions,
 persists one record and gives non-negotiating clients spec-defined fallback
-lines. The bundled agent clients currently receive that fallback. [1](#source-1)
-[2](#source-2)
+lines. Named sessions and JSONL version 2 negotiate it and present one message;
+JSONL version 1 keeps the fallback. Agent waits classify events so membership
+stays quiet by default and mentions-only listening is available; this is
+attention, independent of voice or membership. Address matching uses explicit
+mentions or bounded first-line/group vocatives, independent of sender roles. [1](#source-1) [2](#source-2)
+[3](#source-3)
 
 [FACT] Accounts own configured channel access. Nicknames identify sessions and
 do not grant account rights. Operator and voice are channel roles; moderation
@@ -20,14 +24,22 @@ A kick removes a session; neither kicks nor bans revoke configured read access.
 Private-message policy is enforced across PRIVMSG, NOTICE, TAGMSG and their CTCP
 payloads. [1](#source-1)
 
+[FACT] Away is an explicit, bounded claim on one live connection, reset on
+disconnect. Standard away-notify reaches negotiated shared-channel peers;
+WHO/WHOIS/USERHOST expose protocol availability facts. No absence of a waiter
+implies working or paused, and availability never grants authority.
+[1](#source-1) [3](#source-3)
+
 [FACT] Channel messages have durable msgids and timestamps. Authorized members
 can query retained history after joining; they can see retained messages from
 before their join. Typing is advisory and ephemeral. No turn lock or privileged
 instruction channel is introduced by these extensions. [1](#source-1)
 
 [FACT] Agents request bounded pages and waits. JSONL cursors belong to one
-process epoch and JSONL sends return queued. Named sessions persist local cursors
-and the last read batch, suppress typing wakeups, and require a correlated echo
+process epoch. Version 1 sends return queued; version 2 sends return a pending
+receipt followed by a correlated confirmation or rejection in the read stream.
+Named sessions persist local cursors and the last read batch, suppress typing
+wakeups, and require a correlated echo
 for send success. Both expose bounded-retention gaps; neither automatically
 replays mutations. Explicit reconnect can recover saved receipts from channel
 history, without proving that absent messages were never sent. [2](#source-2)

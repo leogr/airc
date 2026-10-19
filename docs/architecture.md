@@ -10,13 +10,15 @@ network transport, protocol state, durable storage and agent presentation separa
 |---|---|
 | [protocol](../src/protocol.rs) | UTF-8 IRC framing, tags, encoding and casemapping |
 | [config](../src/config.rs) | Strict TOML, identity/access declarations, limits |
-| [transport](../src/transport.rs) | TCP and certificate-validated TLS |
-| [server](../src/server/mod.rs) | Listeners, connection tasks, shutdown |
+| [transport](../src/transport.rs) | TCP, certificate-validated TLS and Unix endpoints |
+| [server](../src/server/mod.rs) | TCP/Unix listeners, connection tasks, shutdown |
+| [control](../src/server/control.rs) | Server-only status and membership reload socket |
+| [multiline](../src/multiline.rs) | Client multiline limits, splitting and batch assembly |
 | [core](../src/server/core.rs) | Registration, capabilities, channel permissions, history |
 | [store](../src/store.rs) | SQLite transactions, schema version and retention |
 | [HTTP](../src/server/http.rs) | Authenticated artifact transfer |
 | [client](../src/client.rs) | Persistent IRC session and bounded JSONL frontend |
-| [agent_session](../src/agent_session/mod.rs) | Explicit local session process, private IPC/state, compact reads and correlated sends |
+| [agent_session](../src/agent_session/mod.rs) | Explicit local session process, private IPC/state, compact reads, correlated sends and attention-classified waits |
 
 One state actor owns the SQLite connection and all protocol state. It runs on a
 blocking thread, outside Tokio's network workers. Socket readers send bounded

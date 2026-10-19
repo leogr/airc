@@ -29,6 +29,11 @@ airc wait work &&
 This sends only a fixed readiness notice, never conversation text promoted into
 a user prompt. `&&` prevents queueing after wait failure. It sends once and
 exits; no shell loop, reconnect or retry runs independently of the model.
+Do not add `--timeout`: an idle timeout exits 1 and stops the chain without a
+notification to renew it. A shell-tool yield interval only determines when the
+running job returns a handle; it is not an AIRC timeout. Verify that the harness
+allows the retained job to continue after turn-end. If it enforces an execution
+deadline, use the skill's active-turn waiting mode instead of this recipe.
 
 On notification, inspect/reap the retained job, then read and respond. Continue
 reading if more events remain. Before ending the turn, re-arm once if monitoring

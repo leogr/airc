@@ -1,14 +1,28 @@
+use super::attention::{
+    self, Classification, Identity, Readiness, Snapshot, SnapshotError, Stamp, WakeMode,
+};
 use crate::{
     client::ClientConfig,
+    multiline::{self, Limits},
     protocol::{Message, fold, valid_channel, valid_nick},
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
+    time::{Duration, Instant},
+};
 
 const RETAIN: usize = 512;
-const RETAIN_BYTES: usize = 512 * 1024;
+/// Retained rendered events; at least four maximal events fit.
+const RETAIN_BYTES: usize = 4 * 1024 * 1024;
+/// A rendered event above this is replaced by an explicit omission notice.
+const EVENT_MAX: usize = 1024 * 1024;
+/// A read stops before this many bytes, but always returns one event.
+const READ_BYTES: usize = 1024 * 1024;
+/// Receipts keep this much text for inspection; longer text is matched by digest.
+const RECEIPT_PREVIEW: usize = 512;
 pub(super) const SEND_TAG: &str = "+airc-send";
 
 #[derive(Serialize, Deserialize)]
@@ -28,6 +42,12 @@ pub(super) struct State {
     pub receipts: VecDeque<Receipt>,
     pub last_read: String,
     pub status: String,
+    /// Msgids of this session's confirmed messages, proving replies to it.
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    own: VecDeque<String>,
+    /// Start of this worker's monotonic clock; restored events have no time.
+    #[serde(skip)]
+    clock: Option<Instant>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -35,6 +55,11 @@ pub(super) struct State {
 struct Event {
     sequence: u64,
     text: String,
+    /// Attention class; absent in older state, then treated as critical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    class: Option<Classification>,
+    #[serde(skip)]
+    observed: Option<Duration>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -49,8 +74,40 @@ struct Reference {
 pub(super) struct Receipt {
     pub token: String,
     pub target: String,
+    /// The text, or a preview of it when `sha256` is set.
     pub text: String,
     pub outcome: String,
+    /// SHA-256 and byte length of the full text (receipts written by this
+    /// release); older receipts compare `text` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<usize>,
+}
+
+impl Receipt {
+    fn matches(&self, text: &str) -> bool {
+        match &self.sha256 {
+            Some(digest) => {
+                self.bytes == Some(text.len())
+                    && crate::config::token_hash_bytes(text.as_bytes()) == *digest
+            }
+            None => self.text == text,
+        }
+    }
+}
+
+/// Render one chat line. Text after a newline continues on lines that start
+/// with `| `; header lines never do, so a record cannot be forged by content.
+fn framed(header: String, text: &str) -> String {
+    let mut lines = text.split('\n');
+    let mut out = header;
+    out.push_str(&safe(lines.next().unwrap_or("")));
+    for line in lines {
+        out.push_str("\n| ");
+        out.push_str(&safe(line));
+    }
+    out
 }
 
 impl State {
@@ -69,6 +126,8 @@ impl State {
             checkpoints: BTreeMap::new(),
             receipts: VecDeque::new(),
             last_read: "No previous read.\n".into(),
+            own: VecDeque::new(),
+            clock: None,
             status: "not connected".into(),
         })
     }
@@ -87,15 +146,36 @@ impl State {
         Ok(())
     }
 
+    /// A local problem or recovery fact: it always wakes a waiter.
     pub fn notice(&mut self, text: impl Into<String>) {
-        self.record(format!("! {}", safe(&text.into())));
+        self.notify(text, Classification::Critical);
     }
 
-    fn record(&mut self, text: String) {
+    /// Routine local context (connection or history-window labels).
+    pub fn context(&mut self, text: impl Into<String>) {
+        self.notify(text, Classification::Context);
+    }
+
+    fn notify(&mut self, text: impl Into<String>, class: Classification) {
+        self.record(format!("! {}", safe(&text.into())), class);
+    }
+
+    /// Start this worker's attention clock; call before recording any event.
+    pub fn begin_epoch(&mut self) {
+        self.clock = Some(Instant::now());
+    }
+
+    fn elapsed(&self) -> Option<Duration> {
+        self.clock.map(|start| start.elapsed())
+    }
+
+    fn record(&mut self, text: String, class: Classification) {
         self.sequence += 1;
         self.events.push_back(Event {
             sequence: self.sequence,
             text,
+            class: Some(class),
+            observed: self.elapsed(),
         });
         let mut bytes: usize = self.events.iter().map(|e| e.text.len()).sum();
         while self.events.len() > RETAIN || bytes > RETAIN_BYTES {
@@ -169,7 +249,7 @@ impl State {
                 && let Some(index) = self.receipts.iter().position(|r| {
                     r.token == *token
                         && fold(&r.target) == fold(&message.params[0])
-                        && r.text == message.params[1]
+                        && r.matches(&message.params[1])
                 })
             {
                 let reference = message
@@ -177,6 +257,12 @@ impl State {
                     .get("msgid")
                     .map(|id| self.reference(id))
                     .unwrap_or("live-only".into());
+                if let Some(id) = message.tags.get("msgid") {
+                    self.own.push_back(id.clone());
+                    if self.own.len() > RETAIN {
+                        self.own.pop_front();
+                    }
+                }
                 let receipt = &mut self.receipts[index];
                 receipt.outcome = format!("confirmed {} {}", receipt.target, reference);
                 confirmed = Some(token.clone());
@@ -236,30 +322,65 @@ impl State {
                         format!(" reply={reference}")
                     })
                     .unwrap_or_default();
-                self.record(format!(
-                    "{}{} {} {}({}){}: {}",
+                let header = format!(
+                    "{}{} {} {}({}){}: ",
                     if history { "history " } else { "" },
                     reference,
                     safe(target),
                     safe(nick),
                     safe(account),
                     reply,
-                    safe(&message.params[1])
-                ));
+                );
+                let reply_to_own = message
+                    .tags
+                    .get("+reply")
+                    .is_some_and(|id| self.own.contains(id));
+                let class = attention::classify(
+                    message,
+                    Identity {
+                        nick: &self.nick,
+                        account: &self.account,
+                    },
+                    reply_to_own,
+                );
+                let text = framed(header, &message.params[1]);
+                if text.len() > EVENT_MAX {
+                    self.notify(format!(
+                        "{reference} {} {}({}): message of {} bytes omitted; its rendering exceeds the {EVENT_MAX}-byte event bound. Context is incomplete.",
+                        safe(target),
+                        safe(nick),
+                        safe(account),
+                        message.params[1].len()
+                    ), class);
+                } else {
+                    self.record(text, class);
+                }
             }
         } else if matches!(
             message.command.as_str(),
-            "JOIN" | "PART" | "QUIT" | "NICK" | "MODE" | "KICK" | "TOPIC"
+            "JOIN" | "PART" | "QUIT" | "NICK" | "MODE" | "KICK" | "TOPIC" | "AWAY"
         ) {
             let prefix = message.prefix.as_deref().unwrap_or("server");
             // Initial own JOIN is routine; peers joining/leaving still matter.
             if message.command != "JOIN" || !prefix.starts_with(&format!("{}!", self.nick)) {
-                self.notice(format!(
-                    "{} {} {}",
-                    message.command,
-                    prefix,
-                    message.params.join(" ")
-                ));
+                // Membership is context; only a KICK of this session is critical.
+                let class = attention::classify(
+                    message,
+                    Identity {
+                        nick: &self.nick,
+                        account: &self.account,
+                    },
+                    false,
+                );
+                self.notify(
+                    format!(
+                        "{} {} {}",
+                        message.command,
+                        prefix,
+                        message.params.join(" ")
+                    ),
+                    class,
+                );
             }
         } else if message.command == "FAIL"
             || message.command == "ERROR"
@@ -278,6 +399,30 @@ impl State {
         self.sequence > self.cursor
     }
 
+    /// Whether a waiter in `mode` should wake now, without consuming anything.
+    /// `deadline` is that waiter's own deadline on this worker's clock.
+    pub fn readiness(&self, mode: WakeMode, deadline: Instant) -> Result<Readiness, SnapshotError> {
+        let start = self.clock.unwrap_or_else(Instant::now);
+        let stamps = self.events.iter().map(|e| Stamp {
+            sequence: e.sequence,
+            bytes: e.text.len(),
+            observed_at: e.observed,
+            class: e.class.unwrap_or(Classification::Critical),
+        });
+        attention::readiness(
+            mode,
+            Snapshot {
+                cursor: self.cursor,
+                sequence: self.sequence,
+                events: stamps,
+                capacity: RETAIN,
+                byte_capacity: RETAIN_BYTES,
+            },
+            start.elapsed(),
+            deadline.saturating_duration_since(start),
+        )
+    }
+
     pub fn read(&mut self, limit: usize) -> String {
         let mut text = String::new();
         if let Some(front) = self.events.front()
@@ -287,23 +432,23 @@ impl State {
                 "! GAP: unread events exceeded the 512-event buffer; context is incomplete.\n",
             );
         }
+        let mut last = None;
         for event in self
             .events
             .iter()
             .filter(|e| e.sequence > self.cursor)
             .take(limit)
         {
+            // Byte-bounded, but always one event so a large one cannot stall reads.
+            if last.is_some() && text.len() + event.text.len() > READ_BYTES {
+                break;
+            }
             text.push_str(&event.text);
             text.push('\n');
+            last = Some(event.sequence);
         }
-        if let Some(last) = self
-            .events
-            .iter()
-            .filter(|e| e.sequence > self.cursor)
-            .take(limit)
-            .last()
-        {
-            self.cursor = last.sequence;
+        if let Some(last) = last {
+            self.cursor = last;
         }
         if self.has_unread() {
             text.push_str("! More unread events; read again.\n");
@@ -315,26 +460,33 @@ impl State {
         text
     }
 
+    /// Frames for one send: a single PRIVMSG, or one multiline batch when the
+    /// text has newlines or exceeds a line and draft/multiline is negotiated.
     pub fn prepare_send(
         &mut self,
         target: &str,
         text: &str,
         reply: Option<&str>,
-    ) -> Result<Message> {
+        multiline: Option<Limits>,
+    ) -> Result<Vec<Message>> {
         ensure!(
             valid_channel(target) || valid_nick(target),
             "invalid message target"
         );
-        ensure!(!text.is_empty(), "message text is empty");
         let token = uuid::Uuid::new_v4().to_string();
-        let mut message = Message::new("PRIVMSG", [target, text]);
-        message.tags.insert(SEND_TAG.into(), token.clone());
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert(SEND_TAG.to_owned(), token.clone());
         if let Some(reply) = reply {
-            message
-                .tags
-                .insert("+reply".into(), self.resolve_reference(reply)?);
+            tags.insert("+reply".into(), self.resolve_reference(reply)?);
         }
-        message.encode()?;
+        let frames = multiline::outbound(
+            (&self.nick, &self.account),
+            target,
+            text,
+            tags,
+            multiline,
+            &format!("s{}", token.replace('-', "").get(..12).unwrap_or("0")),
+        )?;
         if self.receipts.len() == 32 {
             if self
                 .receipts
@@ -345,13 +497,24 @@ impl State {
             }
             self.receipts.pop_front();
         }
+        let mut preview = text.to_owned();
+        if preview.len() > RECEIPT_PREVIEW {
+            let mut cut = RECEIPT_PREVIEW;
+            while !preview.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            preview.truncate(cut);
+            preview.push_str("…[preview]");
+        }
         self.receipts.push_back(Receipt {
             token,
             target: target.into(),
-            text: text.into(),
+            text: preview,
             outcome: "uncertain (prepared; delivery not observed)".into(),
+            sha256: Some(crate::config::token_hash_bytes(text.as_bytes())),
+            bytes: Some(text.len()),
         });
-        Ok(message)
+        Ok(frames)
     }
 
     pub fn outcome(&self, token: &str) -> String {
@@ -393,6 +556,11 @@ impl State {
             ));
             if receipt.outcome.starts_with("uncertain") {
                 text.push_str(&format!("  text: {}\n", safe(&receipt.text)));
+                if let (Some(digest), Some(bytes)) = (&receipt.sha256, receipt.bytes)
+                    && bytes > RECEIPT_PREVIEW
+                {
+                    text.push_str(&format!("  full text: {bytes} bytes, sha256={digest}\n"));
+                }
             }
         }
         for (channel, id) in &self.checkpoints {
@@ -439,6 +607,8 @@ mod tests {
             token_file: "unused".into(),
             channels: vec!["#work".into()],
             artifact_url: None,
+            unix: None,
+            artifact_unix: None,
         })
         .unwrap()
     }
@@ -475,9 +645,16 @@ mod tests {
         m.tags.insert("+reply".into(), "id\nforged".into());
         state.ingest(&m, false);
         let output = state.read(50);
-        assert_eq!(output.lines().count(), 1);
-        assert!(output.contains("Human(human)"));
-        assert!(output.contains("\\n! confirmed") && !output.contains('\x1b'));
+        // A newline (only possible in an assembled multiline message) starts a
+        // framed continuation; no content line can begin a new record.
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{output}");
+        assert!(lines[0].contains("Human(human)"));
+        assert!(
+            lines[1].starts_with("| ! confirmed\\r\\u{1b}[2J"),
+            "{output}"
+        );
+        assert!(!output.contains('\x1b') && !output.contains('\r'));
         let mut unverified = chat("no account tag", "other");
         unverified.tags.remove("account");
         state.ingest(&unverified, false);
@@ -500,7 +677,8 @@ mod tests {
         m.tags.insert("+reply".into(), "@1".into());
         state.ingest(&m, false);
         assert!(state.read(50).contains("reply=msgid:@1"));
-        for n in 0..512 {
+        // More unread events than the 512-event ring forces a visible gap.
+        for n in 0..520 {
             let mut m = chat(&"\u{7f}".repeat(400), &format!("id-{n}"));
             m.tags.insert("+reply".into(), "\u{7f}".repeat(1000));
             assert!(m.encode().is_ok(), "fixture must fit real wire bounds");
@@ -511,13 +689,20 @@ mod tests {
         assert!(state.validate().is_ok());
         assert!(serde_json::to_vec(&state).unwrap().len() < 4 * 1024 * 1024);
         state.ingest(&chat("still usable", "last"), false);
-        assert!(state.read(200).contains("still usable"));
+        let mut drained = String::new();
+        while state.has_unread() {
+            drained.push_str(&state.read(200));
+        }
+        assert!(drained.contains("still usable"));
     }
 
     #[test]
     fn forged_or_mismatched_echo_cannot_confirm_and_recovered_echo_can() {
         let mut state = state();
-        let sent = state.prepare_send("#work", "duplicate", None).unwrap();
+        let sent = state
+            .prepare_send("#work", "duplicate", None, None)
+            .unwrap()
+            .remove(0);
         let token = sent.tags[SEND_TAG].clone();
         let mut echo = sent.clone();
         echo.prefix = Some("Alice!alice@airc".into());

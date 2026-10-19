@@ -44,7 +44,7 @@ async fn recover_inner(
         let mut reference = anchors.get(&fold(channel)).map(|id| format!("msgid={id}"));
         let mut latest = reference.is_none();
         if latest {
-            state.notice(format!("{channel}: initial bounded history window (up to 20 messages); earlier context may exist"));
+            state.context(format!("{channel}: initial bounded history window (up to 20 messages); earlier context may exist"));
         }
         for page in 0..6 {
             let m = Message::new(
@@ -58,7 +58,7 @@ async fn recover_inner(
             );
             connection
                 .outbound
-                .send(m)
+                .send(vec![m])
                 .await
                 .context("disconnected during history request")?;
             let mut batch = None;

@@ -21,6 +21,8 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Print the machine-readable supported-feature probe as JSON.
+    Features,
     /// Run until SIGINT or SIGTERM.
     Serve {
         #[arg(long)]
@@ -32,15 +34,23 @@ enum Command {
 async fn main() -> Result<()> {
     match Args::parse().command {
         Command::Init { directory } => init(directory)?,
+        Command::Features => println!("{}", airc::feature_probe()),
         Command::Check { config } => {
             Config::load(&config)?;
             println!("Configuration valid");
         }
         Command::Serve { config } => {
-            let mut server = airc::server::start(Config::load(&config)?).await?;
-            eprintln!("aircd listening on {}", server.address);
+            let mut server = airc::server::start_file(&config).await?;
+            match (&server.address, &server.unix) {
+                (Some(address), _) => eprintln!("aircd listening on {address}"),
+                (_, Some(path)) => eprintln!("aircd listening on unix:{}", path.display()),
+                _ => {}
+            }
             if let Some(address) = server.artifact_address {
                 eprintln!("artifacts listening on {address}");
+            }
+            if let Some(path) = &server.artifact_unix {
+                eprintln!("artifacts listening on unix:{}", path.display());
             }
             #[cfg(unix)]
             {
@@ -88,6 +98,8 @@ fn init(directory: PathBuf) -> Result<()> {
             nick: name.into(),
             channels: vec!["#work".into()],
             artifact_url: Some("http://127.0.0.1:8080".into()),
+            unix: None,
+            artifact_unix: None,
         };
         config::write_private(
             &directory.join(format!("{name}.toml")),
@@ -96,7 +108,10 @@ fn init(directory: PathBuf) -> Result<()> {
     }
     let server = Config {
         server_name: "airc.local".into(),
-        listen: "127.0.0.1:6667".parse()?,
+        listen: Some("127.0.0.1:6667".parse()?),
+        listen_unix: None,
+        control_unix: None,
+        membership_generation: None,
         database: "airc.sqlite3".into(),
         allow_insecure: false,
         allow_private_messages: false,
@@ -110,7 +125,8 @@ fn init(directory: PathBuf) -> Result<()> {
             moderated: false,
         }],
         artifacts: Some(Artifacts {
-            listen: "127.0.0.1:8080".parse()?,
+            listen: Some("127.0.0.1:8080".parse()?),
+            listen_unix: None,
             public_url: "http://127.0.0.1:8080".into(),
             max_bytes: 4 * 1024 * 1024,
             per_channel: 32,

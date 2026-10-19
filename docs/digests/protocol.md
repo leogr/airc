@@ -1,6 +1,6 @@
 # Protocol and permissions
 
-Verification: `c1aaff4f72a8cea262c129b0c14f243c0758fd38` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `db271dabb0266cfa5e491ac056d6c064282d4a78` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] The parser accepts UTF-8, bounds the non-tag IRC message to 512 bytes,
 limits parameters to 15, decodes tag escapes, and rejects embedded CR/LF/NUL.
@@ -48,8 +48,8 @@ Tests define these oracles; their presence alone does not establish a live run.
 [FACT] Registered users can query up to five USERHOST nicknames using RFC1459
 folding. Numeric 302 returns `nick=+account@airc`, omitting unknown/unregistered
 users; no matches still yield an empty reply. Missing parameters return 461.
-The fixed `+` matches the unset AWAY profile; channel roles never imply IRC
-operator status. Tests cover these boundaries and case folding.
+The `+` means not away and `-` means explicitly away; channel roles never imply
+IRC operator status. Tests cover these boundaries and case folding.
 [11](#source-11) [12](#source-12) [13](#source-13)
 
 [FACT] CAP 302 advertises `draft/multiline` with configured max-bytes and
@@ -81,25 +81,40 @@ fallback, nested history, restart, malformed/overlapping/interrupted/unauthorize
 batches, permission at close, byte-bounded paging and Tick timeout.
 [16](#source-16) [17](#source-17) [18](#source-18) [19](#source-19)
 
+[FACT] AWAY stores a per-connection reason, truncated at a UTF-8 boundary to
+200 bytes, acknowledged by 306/305 and discarded on disconnect. Negotiated
+away-notify reaches shared-channel peers once, excluding self; away joiners
+are announced. WHO uses H/G plus roles, WHOIS adds 301, and permitted direct
+PRIVMSG adds 301 without blocking delivery; NOTICE remains silent. WHOIS/USERHOST
+retain server-wide registered-user discovery; away reasons are published metadata.
+These ephemeral facts imply no task/listener state or authority. Tests cover visibility,
+legacy peers, UTF-8 bounds, duplicate settings, clear and reconnect.
+[20](#source-20) [21](#source-21) [22](#source-22) [23](#source-23)
+
 ## Sources
 
 1. <a id="source-1"></a> [src/protocol.rs](../../src/protocol.rs#L7-L219) — `Message`, `fold`, name validation and `read_line`.
-2. <a id="source-2"></a> [src/server/core.rs](../../src/server/core.rs#L336-L662) — `command`, `register`, `cap`, `sasl`.
-3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L664-L791) — `join` and membership/operator checks; `mode`, `topic`, `kick` at L1270-L1499.
-4. <a id="source-4"></a> [src/server/core.rs](../../src/server/core.rs#L792-L914) — `chat` and shared `relay`.
-5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L241-L267) — `send_frames` capability filtering and queue failure.
-6. <a id="source-6"></a> [src/server/core.rs](../../src/server/core.rs#L1582-L2028) — history dispatch, target selection, references and pagination.
+2. <a id="source-2"></a> [src/server/core.rs](../../src/server/core.rs#L602-L929) — `command`, `register`, `cap`, `sasl`.
+3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L931-L1061) — `join` and membership/operator checks; `mode`, `topic`, `kick` at L1549-L1778.
+4. <a id="source-4"></a> [src/server/core.rs](../../src/server/core.rs#L1062-L1193) — `chat` and shared `relay`.
+5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L507-L533) — `send_frames` capability filtering and queue failure.
+6. <a id="source-6"></a> [src/server/core.rs](../../src/server/core.rs#L1908-L2361) — history dispatch, target selection, references and pagination.
 7. <a id="source-7"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L243-L355) — moderation/DM/ACL and restart/history integration oracles.
 8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L536-L568) — authentication failures, CAP atomicity and malformed-frame handling.
 9. <a id="source-9"></a> [src/server/ban.rs](../../src/server/ban.rs#L1-L96) — bounded mask normalization, wildcard matching and boundary tests.
 10. <a id="source-10"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L760-L942) — ban listing, authorization, enforcement, exemptions, artifact access and persistence.
 
-11. <a id="source-11"></a> [src/server/core.rs](../../src/server/core.rs#L1545-L1560) — `userhost`.
+11. <a id="source-11"></a> [src/server/core.rs](../../src/server/core.rs#L1860-L1882) — `userhost`.
 12. <a id="source-12"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L212-L240) — USERHOST identity, limits, unknown users and registration.
 13. <a id="source-13"></a> [Modern IRC client protocol](https://modern.ircdocs.horse/#userhost-message) — USERHOST and numeric 302 wire semantics; checked 2026-10-13.
-14. <a id="source-14"></a> [src/server/core.rs](../../src/server/core.rs#L336-L348) — `command` batch dispatch and interruption; `cap` value at L517-L590.
-15. <a id="source-15"></a> [src/server/core.rs](../../src/server/core.rs#L991-L1268) — `fail_batch`, `discard`, `abort_batch`, `timeout_batch`, `client_batch`, `batch_line`, `close_batch`.
-16. <a id="source-16"></a> [src/server/core.rs](../../src/server/core.rs#L809-L989) — `relay`, batch-context `deny` and `chat_frames`; `valid_middle`/`split_lines` at L1816-L1858.
-17. <a id="source-17"></a> [src/server/core.rs](../../src/server/core.rs#L1582-L1680) — `history` rendering; `Trim`/`page_window`/`select_history` from L1899 and the window test near L2165.
+14. <a id="source-14"></a> [src/server/core.rs](../../src/server/core.rs#L602-L614) — `command` batch dispatch and interruption; `cap` value at L784-L857.
+15. <a id="source-15"></a> [src/server/core.rs](../../src/server/core.rs#L1270-L1547) — `fail_batch`, `discard`, `abort_batch`, `timeout_batch`, `client_batch`, `batch_line`, `close_batch`.
+16. <a id="source-16"></a> [src/server/core.rs](../../src/server/core.rs#L1079-L1268) — `relay`, batch-context `deny` and `chat_frames`; `valid_middle`/`split_lines` at L2149-L2191.
+17. <a id="source-17"></a> [src/server/core.rs](../../src/server/core.rs#L1908-L2006) — `history` rendering; `Trim`/`page_window`/`select_history` from L2233 and the window test near L2504.
 18. <a id="source-18"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L1032-L1399) — multiline delivery, fallback, history, restart, rejection and paging tests.
 19. <a id="source-19"></a> [IRCv3 multiline draft](https://github.com/ircv3/ircv3-specifications/blob/0efc8474e5997a00d452e227c3db0423c9081b20/extensions/multiline.md) — batch, fallback and FAIL semantics; client-batch framing in `extensions/client-batch.md` at the same revision.
+
+20. <a id="source-20"></a> [src/server/core.rs](../../src/server/core.rs#L1780-L1907) — explicit state, notify and roster; JOIN calls `notify_away`, `relay` sends permitted-DM 301.
+21. <a id="source-21"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L1428-L1585) — away/roster/visibility/reset oracles; next test covers registration and denied DM/NOTICE.
+22. <a id="source-22"></a> [IRCv3 away-notify](https://ircv3.net/specs/extensions/away-notify) — checked 2026-10-19.
+23. <a id="source-23"></a> [AWAY profile](https://modern.ircdocs.horse/#away-message) — checked 2026-10-19.
