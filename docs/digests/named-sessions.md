@@ -1,6 +1,6 @@
 # Named agent sessions
 
-Verification: `27f727f80b97f0682b201e87d2d83ff2dc8125e9` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `c1aaff4f72a8cea262c129b0c14f243c0758fd38` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] The existing Rust binary supports explicit connect/read/wait/send/status/
 disconnect commands alongside unchanged JSONL version 1. A spawned local Unix
@@ -46,7 +46,10 @@ uncertain text. Losing stdout does not authorize a resend. [2](#source-2)
 [4](#source-4)
 
 [FACT] Explicit reconnect queries AFTER saved channel msgids, bounded by six
-pages of twenty per channel and twenty seconds overall. Missing references are
+pages of at most twenty msgid-bearing messages per channel and twenty seconds
+overall. Only an empty page ends paging, because server pages can be byte-bounded.
+Multiline fallback lines without msgids are ingested but neither counted nor used
+as anchors; the client does not negotiate draft/multiline. Missing references are
 reported before a bounded LATEST window. Initial history, page caps and server
 errors are visible. Incoming live events during recovery are capped at 512;
 recovery deduplication survives eviction from the smaller reply-reference ring.

@@ -148,12 +148,23 @@ impl Peer {
         }
     }
     async fn login(server: &RunningServer, name: &str, extensions: bool) -> Self {
+        Self::login_caps(
+            server,
+            name,
+            extensions.then_some(
+                "message-tags server-time batch echo-message account-tag draft/chathistory",
+            ),
+        )
+        .await
+    }
+    async fn login_caps(server: &RunningServer, name: &str, caps: Option<&str>) -> Self {
         let mut peer = Self::open(server).await;
-        if extensions {
+        let extensions = caps.is_some();
+        if let Some(caps) = caps {
             peer.send("CAP LS 302").await;
             peer.until("CAP").await;
-            peer.send("CAP REQ :message-tags server-time batch echo-message account-tag draft/chathistory").await;
-            peer.until("CAP").await;
+            peer.send(&format!("CAP REQ :{caps}")).await;
+            assert_eq!(peer.until("CAP").await.params[1], "ACK");
         }
         peer.send(&format!("PASS {name}:{TOKEN}")).await;
         peer.send(&format!("NICK {name}")).await;
@@ -996,9 +1007,9 @@ async fn schema_one_migrates_without_losing_state_and_newer_versions_are_refused
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
-        db.execute_batch("PRAGMA user_version=3;").unwrap();
+        db.execute_batch("PRAGMA user_version=4;").unwrap();
     }
     let error = server::start(fixture.config.clone())
         .await
@@ -1009,11 +1020,384 @@ async fn schema_one_migrates_without_losing_state_and_newer_versions_are_refused
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
             .unwrap(),
         1
     );
+}
+
+const MULTILINE_CAPS: &str =
+    "message-tags server-time batch echo-message account-tag draft/chathistory draft/multiline";
+
+/// Collect one draft/multiline batch after its opening BATCH, returning the
+/// opener and the combined text with each line's concat flag.
+async fn multiline_batch(peer: &mut Peer, open: Message) -> (Message, String, Vec<bool>) {
+    assert_eq!(open.params[1], "draft/multiline", "{open:?}");
+    let reference = open.params[0].strip_prefix('+').unwrap().to_owned();
+    let mut text = String::new();
+    let mut concat = Vec::new();
+    loop {
+        let m = peer.next().await;
+        if m.command == "BATCH" {
+            assert_eq!(m.params[0], format!("-{reference}"));
+            return (open, text, concat);
+        }
+        assert_eq!(m.tags["batch"], reference);
+        assert!(!m.tags.contains_key("msgid"), "lines carry no msgid");
+        let joined = m.tags.contains_key("draft/multiline-concat");
+        if !concat.is_empty() && !joined {
+            text.push('\n');
+        }
+        text.push_str(&m.params[1]);
+        concat.push(joined);
+    }
+}
+
+async fn send_batch(peer: &mut Peer, reference: &str, lines: &[&str]) {
+    peer.send(&format!(
+        "@+reply=r1 BATCH +{reference} draft/multiline #work"
+    ))
+    .await;
+    for line in lines {
+        peer.send(line).await;
+    }
+    peer.send(&format!("BATCH -{reference}")).await;
+}
+
+#[tokio::test]
+async fn multiline_batches_deliver_one_message_with_fallback_history_and_restart() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.multiline_lines = 8;
+    let server = fixture.start().await;
+    let mut alice = Peer::open(&server).await;
+    alice.send("CAP LS 302").await;
+    let offered = alice.until("CAP").await;
+    assert!(
+        offered.params[2]
+            .split(' ')
+            .any(|cap| cap == "draft/multiline=max-bytes=65536,max-lines=8"),
+        "{offered:?}"
+    );
+    drop(alice);
+    let mut alice = Peer::login_caps(&server, "alice", Some(MULTILINE_CAPS)).await;
+    let mut bob = Peer::login(&server, "bob", true).await;
+    alice.join().await;
+    bob.join().await;
+    send_batch(
+        &mut alice,
+        "a1",
+        &[
+            "@batch=a1 PRIVMSG #work :hello",
+            "@batch=a1 PRIVMSG #work :",
+            "@batch=a1 PRIVMSG #work :how is ",
+            "@batch=a1;draft/multiline-concat PRIVMSG #work :everyone? ```code```",
+        ],
+    )
+    .await;
+    let expected = "hello\n\nhow is everyone? ```code```";
+    let open = alice.until("BATCH").await;
+    let (open, text, concat) = multiline_batch(&mut alice, open).await;
+    assert_eq!(text, expected);
+    assert_eq!(concat, [false, false, false, true]);
+    assert_eq!(open.tags["account"], "alice");
+    assert_eq!(open.tags["+reply"], "r1");
+    assert_eq!(open.prefix.as_deref(), Some("alice!alice@airc"));
+    let msgid = open.tags["msgid"].clone();
+    // Fallback: component lines without blanks; only the first carries the msgid.
+    let first = bob.until("PRIVMSG").await;
+    assert_eq!(first.params[1], "hello");
+    assert_eq!(first.tags["msgid"], msgid);
+    assert_eq!(first.tags["+reply"], "r1");
+    for part in ["how is ", "everyone? ```code```"] {
+        let next = bob.next().await;
+        assert_eq!(next.params[1], part);
+        assert_eq!(next.tags["account"], "alice");
+        assert!(!next.tags.contains_key("msgid") && !next.tags.contains_key("+reply"));
+    }
+    // History keeps one logical record: nested for multiline clients, lines otherwise.
+    alice.send("CHATHISTORY LATEST #work * 10").await;
+    let outer = alice.until("BATCH").await;
+    assert_eq!(outer.params[1], "chathistory");
+    let parent = outer.params[0].strip_prefix('+').unwrap().to_owned();
+    let nested = alice.next().await;
+    assert_eq!(nested.tags["batch"], parent);
+    let (nested, text, _) = multiline_batch(&mut alice, nested).await;
+    assert_eq!(
+        (nested.tags["msgid"].as_str(), text.as_str()),
+        (msgid.as_str(), expected)
+    );
+    assert_eq!(alice.next().await.params[0], format!("-{parent}"));
+    // Stored history is re-split into relay-sized lines, not the live composition.
+    let history = bob.history("CHATHISTORY LATEST #work * 10").await;
+    assert_eq!(
+        history
+            .iter()
+            .map(|m| m.params[1].as_str())
+            .collect::<Vec<_>>(),
+        ["hello", "how is everyone? ```code```"]
+    );
+    assert_eq!(history[0].tags["msgid"], msgid);
+    assert!(!history[1].tags.contains_key("msgid"));
+    server.shutdown().await.unwrap();
+    drop((alice, bob));
+    let server = fixture.start().await;
+    let mut alice = Peer::login_caps(&server, "alice", Some(MULTILINE_CAPS)).await;
+    alice.join().await;
+    alice.send("CHATHISTORY LATEST #work * 10").await;
+    alice.until("BATCH").await;
+    let nested = alice.next().await;
+    let (_, text, _) = multiline_batch(&mut alice, nested).await;
+    assert_eq!(text, expected, "restart keeps the logical message");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_interrupted_or_unauthorized_batches_are_never_delivered() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.multiline_lines = 3;
+    fixture.config.limits.multiline_bytes = 1024;
+    let server = fixture.start().await;
+    let mut alice = Peer::login_caps(&server, "alice", Some(MULTILINE_CAPS)).await;
+    let mut bob = Peer::login(&server, "bob", true).await;
+    let mut human = Peer::login(&server, "human", true).await;
+    for peer in [&mut alice, &mut bob, &mut human] {
+        peer.join().await;
+    }
+    let long = "x".repeat(400);
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (
+            vec!["@batch=b PRIVMSG #other :x".into()],
+            "MULTILINE_INVALID_TARGET #work #other",
+        ),
+        (
+            vec![
+                "@batch=b PRIVMSG #work :x".into(),
+                "@batch=b NOTICE #work :y".into(),
+            ],
+            "MULTILINE_INVALID",
+        ),
+        (
+            vec![
+                "@batch=b PRIVMSG #work :x".into(),
+                "@batch=b;draft/multiline-concat PRIVMSG #work :".into(),
+            ],
+            "MULTILINE_INVALID",
+        ),
+        (
+            vec![
+                "@batch=b PRIVMSG #work :".into(),
+                "@batch=b PRIVMSG #work :".into(),
+            ],
+            "MULTILINE_INVALID",
+        ),
+        (
+            vec!["@batch=b;+reply=x PRIVMSG #work :x".into()],
+            "MULTILINE_INVALID",
+        ),
+        (
+            (0..4)
+                .map(|n| format!("@batch=b PRIVMSG #work :{n}"))
+                .collect(),
+            "MULTILINE_MAX_LINES 3",
+        ),
+        (
+            (0..3)
+                .map(|_| format!("@batch=b PRIVMSG #work :{long}"))
+                .collect(),
+            "MULTILINE_MAX_BYTES 1024",
+        ),
+        (
+            vec!["@batch=b PRIVMSG #work :x".into(), "JOIN #work".into()],
+            "MULTILINE_INVALID",
+        ),
+        (
+            vec![
+                "@batch=b PRIVMSG #work :x".into(),
+                "BATCH +c draft/multiline #work".into(),
+                "@batch=c PRIVMSG #work :y".into(),
+                "BATCH -c".into(),
+            ],
+            "MULTILINE_INVALID",
+        ),
+    ];
+    for (n, (lines, expected)) in cases.iter().enumerate() {
+        alice.send("BATCH +b draft/multiline #work").await;
+        for line in lines {
+            alice.send(line).await;
+        }
+        alice.send("BATCH -b").await;
+        alice.send(&format!("PING :case{n}")).await;
+        let fail = alice.until("FAIL").await;
+        assert_eq!(
+            fail.params[1..fail.params.len() - 1].join(" "),
+            *expected,
+            "case {n}: {fail:?}"
+        );
+        let pong = alice.until("PONG").await;
+        assert_eq!(
+            pong.params[1],
+            format!("case{n}"),
+            "one FAIL per invalid batch"
+        );
+    }
+    for (line, expected) in [
+        ("@batch=zz PRIVMSG #work :orphan", "MULTILINE_INVALID"),
+        ("BATCH +t vendor/other #work", "UNKNOWN_TYPE t vendor/other"),
+        ("BATCH +bad_ref draft/multiline #work", "INVALID_REFTAG *"),
+        (
+            "@batch=p BATCH +n draft/multiline #work",
+            "MULTILINE_INVALID",
+        ),
+    ] {
+        alice.send(line).await;
+        let fail = alice.until("FAIL").await;
+        assert_eq!(fail.params[1..fail.params.len() - 1].join(" "), expected);
+    }
+    // Opener metadata over the relay budget is a batch error, even for NOTICE.
+    let tags = "a".repeat(1100);
+    for command in ["PRIVMSG", "NOTICE"] {
+        alice
+            .send(&format!("@+x={tags} BATCH +big draft/multiline #work"))
+            .await;
+        alice
+            .send(&format!("@batch=big {command} #work :first"))
+            .await;
+        alice
+            .send(&format!("@batch=big {command} #work :second"))
+            .await;
+        alice.send("BATCH -big").await;
+        let fail = alice.until("FAIL").await;
+        assert_eq!(
+            fail.params[1..].join(" "),
+            "MULTILINE_INVALID Tags too long",
+            "{command}"
+        );
+    }
+    // Lines of a rejected batch, including a non-negotiated sender's, stay silent.
+    bob.send("BATCH +q draft/multiline #work").await;
+    assert_eq!(bob.until("FAIL").await.params[1], "MULTILINE_INVALID");
+    bob.send("@batch=q PRIVMSG #work :not delivered").await;
+    bob.send("BATCH -q").await;
+    bob.send("PING :quiet").await;
+    assert_eq!(bob.until("PONG").await.params[1], "quiet");
+    // Permission is checked when the batch closes; PING may interleave.
+    alice.send("BATCH +m draft/multiline #work").await;
+    alice.send("@batch=m PRIVMSG #work :line one").await;
+    human.send("MODE #work +m").await;
+    human.until("MODE").await;
+    alice.until("MODE").await;
+    alice.send("PING :kept").await;
+    assert_eq!(alice.until("PONG").await.params[1], "kept");
+    alice.send("@batch=m PRIVMSG #work :line two").await;
+    alice.send("BATCH -m").await;
+    let fail = alice.until("FAIL").await;
+    assert_eq!(
+        fail.params[1..].join(" "),
+        "MULTILINE_INVALID Cannot send to channel",
+        "close-time denial keeps batch context"
+    );
+    human.send("MODE #work -m").await;
+    alice.until("MODE").await;
+    send_batch(
+        &mut alice,
+        "ok",
+        &[
+            "@batch=ok PRIVMSG #work :first",
+            "@batch=ok PRIVMSG #work :second",
+        ],
+    )
+    .await;
+    let open = alice.until("BATCH").await;
+    assert_eq!(multiline_batch(&mut alice, open).await.1, "first\nsecond");
+    // The observer saw only the mode changes and the one valid message.
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        let m = bob.next().await;
+        if m.command == "PRIVMSG" {
+            seen.push(m.params[1].clone());
+        }
+    }
+    assert_eq!(seen, ["first", "second"]);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_pages_are_byte_bounded_and_page_on_without_loss() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.multiline_lines = 200;
+    fixture.config.limits.history_page_bytes = 64 * 1024;
+    let server = fixture.start().await;
+    let mut alice = Peer::login_caps(&server, "alice", Some(MULTILINE_CAPS)).await;
+    alice.join().await;
+    let line = "y".repeat(300);
+    let mut ids = Vec::new();
+    for reference in ["l1", "l2", "l3"] {
+        alice
+            .send(&format!("BATCH +{reference} draft/multiline #work"))
+            .await;
+        for _ in 0..140 {
+            alice
+                .send(&format!("@batch={reference} PRIVMSG #work :{line}"))
+                .await;
+        }
+        alice.send(&format!("BATCH -{reference}")).await;
+        let open = alice.until("BATCH").await;
+        let (open, text, _) = multiline_batch(&mut alice, open).await;
+        assert_eq!(text.len(), 140 * 300 + 139);
+        ids.push(open.tags["msgid"].clone());
+    }
+    // One 42 KB message fits a 64 KiB page: each page keeps the row nearest its
+    // reference, including the AROUND anchor, so paging on never skips one.
+    for (request, expected) in [
+        ("CHATHISTORY LATEST #work * 10".to_string(), &ids[2]),
+        (
+            format!("CHATHISTORY BEFORE #work msgid={} 10", ids[2]),
+            &ids[1],
+        ),
+        (
+            format!("CHATHISTORY AFTER #work msgid={} 10", ids[0]),
+            &ids[1],
+        ),
+        (
+            format!("CHATHISTORY AROUND #work msgid={} 3", ids[1]),
+            &ids[1],
+        ),
+        (
+            format!(
+                "CHATHISTORY BETWEEN #work msgid={} msgid={} 10",
+                ids[0], ids[2]
+            ),
+            &ids[1],
+        ),
+        (
+            format!(
+                "CHATHISTORY BETWEEN #work msgid={} msgid={} 10",
+                ids[2], ids[0]
+            ),
+            &ids[1],
+        ),
+    ] {
+        alice.send(&request).await;
+        alice.until("BATCH").await;
+        let mut found = Vec::new();
+        loop {
+            let m = alice.next().await;
+            if m.command == "BATCH" && m.params[0].starts_with('-') {
+                break;
+            }
+            if m.command == "BATCH" && m.params[0].starts_with('+') {
+                found.push(m.tags["msgid"].clone());
+                multiline_batch(&mut alice, m).await;
+            }
+        }
+        assert_eq!(
+            found.as_slice(),
+            std::slice::from_ref(expected),
+            "{request}"
+        );
+    }
+    server.shutdown().await.unwrap();
 }

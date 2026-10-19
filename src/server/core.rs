@@ -1,14 +1,17 @@
 use super::{Event, ban};
 use crate::{
     config::Config,
-    protocol::{Message, fold, valid_nick},
-    store::{Ban, Record, Store},
+    protocol::{Message, fold, valid_channel, valid_nick},
+    store::{Ban, Entry, Store},
 };
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
@@ -22,7 +25,24 @@ const CAPS: &[&str] = &[
     "echo-message",
     "draft/chathistory",
     "cap-notify",
+    MULTILINE,
 ];
+const MULTILINE: &str = "draft/multiline";
+const CONCAT: &str = "draft/multiline-concat";
+const BATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One client-initiated draft/multiline batch, assembled before any delivery.
+struct OpenBatch {
+    reference: String,
+    target: String,
+    tags: BTreeMap<String, String>,
+    command: Option<String>,
+    text: String,
+    /// Byte length and draft/multiline-concat flag of each received line.
+    lines: Vec<(usize, bool)>,
+    /// Last accepted line; human clients may pace batch lines slowly.
+    active: Instant,
+}
 
 struct Client {
     nick: String,
@@ -34,8 +54,12 @@ struct Client {
     caps: BTreeSet<String>,
     sasl: Option<String>,
     failures: u8,
-    out: mpsc::Sender<Message>,
+    out: mpsc::Sender<String>,
+    queued: Arc<AtomicUsize>,
     kill: watch::Sender<bool>,
+    batch: Option<OpenBatch>,
+    /// Recently failed batch references whose remaining lines are ignored.
+    discarded: VecDeque<String>,
     created: Instant,
     active: Instant,
 }
@@ -104,7 +128,12 @@ impl State {
 
     pub fn handle(&mut self, event: Event) {
         match event {
-            Event::Connect { id, out, kill } => {
+            Event::Connect {
+                id,
+                out,
+                queued,
+                kill,
+            } => {
                 self.clients.insert(
                     id,
                     Client {
@@ -118,7 +147,10 @@ impl State {
                         sasl: None,
                         failures: 0,
                         out,
+                        queued,
                         kill,
+                        batch: None,
+                        discarded: VecDeque::new(),
                         created: Instant::now(),
                         active: Instant::now(),
                     },
@@ -143,6 +175,19 @@ impl State {
                     .collect();
                 for id in expired {
                     self.disconnect(id, "Connection timed out");
+                }
+                let late: Vec<_> = self
+                    .clients
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.batch
+                            .as_ref()
+                            .is_some_and(|b| b.active.elapsed() > BATCH_TIMEOUT)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in late {
+                    self.timeout_batch(id);
                 }
                 let idle: Vec<_> = self
                     .clients
@@ -187,18 +232,44 @@ impl State {
         }
     }
 
-    fn send(&mut self, id: u64, mut message: Message) {
-        if let Some(c) = self.clients.get(&id) {
+    fn send(&mut self, id: u64, message: Message) {
+        self.send_frames(id, vec![message]);
+    }
+
+    /// Queue frames contiguously, filtered for the recipient. A recipient whose
+    /// unwritten bytes or queued groups exceed their limits is disconnected.
+    fn send_frames(&mut self, id: u64, frames: Vec<Message>) {
+        let Some(c) = self.clients.get(&id) else {
+            return;
+        };
+        let mut lines = String::new();
+        for mut message in frames {
             message.tags.retain(|key, _| match key.as_str() {
                 "time" => c.caps.contains("server-time"),
                 "account" => c.caps.contains("account-tag"),
                 "batch" => c.caps.contains("batch"),
+                CONCAT => c.caps.contains(MULTILINE),
                 _ => c.caps.contains("message-tags"),
             });
-            if message.encode().is_err() || c.out.try_send(message).is_err() {
-                let _ = c.kill.send(true);
+            match message.encode() {
+                Ok(line) => lines.push_str(&line),
+                Err(_) => {
+                    let _ = c.kill.send(true);
+                    return;
+                }
             }
         }
+        let size = lines.len();
+        let queued = c.queued.fetch_add(size, Ordering::Relaxed) + size;
+        if queued > self.config.limits.outbound_bytes || c.out.try_send(lines).is_err() {
+            let _ = c.kill.send(true);
+        }
+    }
+
+    fn multiline(&self, id: u64) -> bool {
+        self.clients
+            .get(&id)
+            .is_some_and(|c| c.caps.contains(MULTILINE) && c.caps.contains("batch"))
     }
 
     fn reply(&mut self, id: u64, command: &str, params: &[&str]) {
@@ -263,6 +334,21 @@ impl State {
     }
 
     fn command(&mut self, id: u64, m: Message) -> Result<()> {
+        if m.command == "BATCH" || m.tags.contains_key("batch") {
+            if !self.clients[&id].registered {
+                self.numeric(id, "451", &["Register first"]);
+                return Ok(());
+            }
+            return self.client_batch(id, m);
+        }
+        // Client batches must be contiguous; keepalives may still interleave.
+        if self.clients[&id].batch.is_some() && !matches!(m.command.as_str(), "PING" | "PONG") {
+            self.abort_batch(
+                id,
+                &["MULTILINE_INVALID"],
+                "Batch interrupted by another command",
+            );
+        }
         let p = &m.params;
         let required = match m.command.as_str() {
             "NICK" | "PASS" | "AUTHENTICATE" | "JOIN" | "PART" | "PING" | "NAMES" | "WHO"
@@ -448,14 +534,16 @@ impl State {
                     c.cap302 = true;
                     c.caps.insert("cap-notify".into());
                 }
+                let multiline = format!(
+                    "{MULTILINE}=max-bytes={},max-lines={}",
+                    self.config.limits.multiline_bytes, self.config.limits.multiline_lines
+                );
                 let caps = CAPS
                     .iter()
-                    .map(|cap| {
-                        if *cap == "sasl" && c.cap302 {
-                            "sasl=PLAIN"
-                        } else {
-                            cap
-                        }
+                    .map(|cap| match *cap {
+                        "sasl" if c.cap302 => "sasl=PLAIN",
+                        MULTILINE if c.cap302 => multiline.as_str(),
+                        cap => cap,
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -701,8 +789,7 @@ impl State {
         self.numeric(id, "366", &[&name, "End of NAMES"]);
     }
 
-    fn chat(&mut self, id: u64, mut m: Message) -> Result<()> {
-        let target = m.params[0].clone();
+    fn chat(&mut self, id: u64, m: Message) -> Result<()> {
         let notice = m.command == "NOTICE";
         let expected = if m.command == "TAGMSG" { 1 } else { 2 };
         if m.params.len() != expected {
@@ -711,13 +798,25 @@ impl State {
             }
             return Ok(());
         }
-        if target.contains(',') {
-            if !notice {
-                self.numeric(id, "407", &["*", "One target per message"]);
-            }
+        if m.command == "TAGMSG" && !self.clients[&id].caps.contains("message-tags") {
             return Ok(());
         }
-        if m.command == "TAGMSG" && !self.clients[&id].caps.contains("message-tags") {
+        self.relay(id, m, None, false)
+    }
+
+    /// Check permission, persist and deliver one logical message. `lines` holds
+    /// the (text, concat) composition of a multiline message.
+    fn relay(
+        &mut self,
+        id: u64,
+        mut m: Message,
+        lines: Option<Vec<(String, bool)>>,
+        batch: bool,
+    ) -> Result<()> {
+        let target = m.params[0].clone();
+        let notice = m.command == "NOTICE";
+        if target.contains(',') {
+            self.deny(id, batch, notice, "407", &["*", "One target per message"]);
             return Ok(());
         }
         m.tags
@@ -729,34 +828,46 @@ impl State {
             .sum::<usize>()
             > 2048
         {
-            if !notice {
-                self.numeric(id, "417", &["Tags too long"]);
-            }
+            self.deny(id, batch, notice, "417", &["Tags too long"]);
             return Ok(());
         }
         m.prefix = Some(self.prefix(id));
         m.tags
             .insert("account".into(), self.clients[&id].account.clone().unwrap());
         m.tags.insert("time".into(), crate::store::now());
-        if m.encode().is_err() {
-            if !notice {
-                self.numeric(id, "417", &["Message too long after relay prefix"]);
-            }
+        let fits = match &lines {
+            None => m.encode().is_ok(),
+            Some(lines) => lines.iter().all(|(text, _)| {
+                let mut line = Message::new(&m.command, [target.clone(), text.clone()]);
+                line.prefix = m.prefix.clone();
+                line.encode().is_ok()
+            }),
+        };
+        if !fits {
+            self.deny(
+                id,
+                batch,
+                notice,
+                "417",
+                &["Message too long after relay prefix"],
+            );
             return Ok(());
         }
         let mut peers;
         if target.starts_with('#') {
             let key = fold(&target);
             let Some(c) = self.channels.get(&key) else {
-                if !notice {
-                    self.numeric(id, "403", &[&target, "No such channel"]);
-                }
+                self.deny(id, batch, notice, "403", &[&target, "No such channel"]);
                 return Ok(());
             };
             if !self.may_speak(id, &key) {
-                if !notice {
-                    self.numeric(id, "404", &[&target, "Cannot send to channel"]);
-                }
+                self.deny(
+                    id,
+                    batch,
+                    notice,
+                    "404",
+                    &[&target, "Cannot send to channel"],
+                );
                 return Ok(());
             }
             m.params[0] = c.name.clone();
@@ -766,9 +877,13 @@ impl State {
             }
         } else {
             if !self.config.allow_private_messages {
-                if !notice {
-                    self.numeric(id, "404", &[&target, "Private messages are disabled"]);
-                }
+                self.deny(
+                    id,
+                    batch,
+                    notice,
+                    "404",
+                    &[&target, "Private messages are disabled"],
+                );
                 return Ok(());
             }
             let Some(target_id) = self
@@ -777,9 +892,7 @@ impl State {
                 .find(|(_, c)| c.registered && fold(&c.nick) == fold(&target))
                 .map(|(id, _)| *id)
             else {
-                if !notice {
-                    self.numeric(id, "401", &[&target, "No such nick"]);
-                }
+                self.deny(id, batch, notice, "401", &[&target, "No such nick"]);
                 return Ok(());
             };
             peers = BTreeSet::from([target_id]);
@@ -792,8 +905,366 @@ impl State {
         if m.command == "TAGMSG" {
             peers.retain(|id| self.clients[id].caps.contains("message-tags"));
         }
-        self.broadcast(peers, m);
+        for peer in peers {
+            let multiline = self.multiline(peer);
+            let frames = self.chat_frames(&m, lines.as_deref(), multiline, None);
+            self.send_frames(peer, frames);
+        }
         Ok(())
+    }
+
+    /// Reject one message. A rejected multiline batch always reports
+    /// `FAIL BATCH`, even for NOTICE, so its sender gets a definite outcome.
+    fn deny(&mut self, id: u64, batch: bool, notice: bool, code: &str, params: &[&str]) {
+        if batch {
+            let reason = params.last().copied().unwrap_or("Message rejected");
+            self.fail_batch(id, &["MULTILINE_INVALID"], reason);
+        } else if !notice {
+            self.numeric(id, code, params);
+        }
+    }
+
+    /// Frames for one logical message. Multiline-capable recipients receive a
+    /// draft/multiline batch; others receive its non-blank lines, with the
+    /// message ID and client tags only on the first line.
+    fn chat_frames(
+        &mut self,
+        m: &Message,
+        lines: Option<&[(String, bool)]>,
+        multiline: bool,
+        parent: Option<&str>,
+    ) -> Vec<Message> {
+        let nest = |mut m: Message| {
+            if let Some(parent) = parent {
+                m.tags.insert("batch".into(), parent.into());
+            }
+            m
+        };
+        let Some(lines) = lines else {
+            return vec![nest(m.clone())];
+        };
+        let target = m.params[0].clone();
+        let line = |text: &str| {
+            let mut line = Message::new(&m.command, [target.clone(), text.to_owned()]);
+            line.prefix = m.prefix.clone();
+            line
+        };
+        if !multiline {
+            let mut frames = Vec::new();
+            for (text, _) in lines.iter().filter(|(text, _)| !text.is_empty()) {
+                let mut fallback = line(text);
+                fallback.tags = m
+                    .tags
+                    .iter()
+                    .filter(|(key, _)| {
+                        frames.is_empty() || ["account", "time"].contains(&key.as_str())
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                frames.push(nest(fallback));
+            }
+            return frames;
+        }
+        self.batch += 1;
+        let reference = format!("m{}", self.batch);
+        let mut open = Message::new(
+            "BATCH",
+            [format!("+{reference}"), MULTILINE.into(), target.clone()],
+        );
+        open.tags = m.tags.clone();
+        open.prefix = m.prefix.clone();
+        let mut frames = vec![nest(open)];
+        for (text, concat) in lines {
+            let mut part = line(text);
+            part.tags.insert("batch".into(), reference.clone());
+            if *concat {
+                part.tags.insert(CONCAT.into(), String::new());
+            }
+            frames.push(part);
+        }
+        let mut close = Message::new("BATCH", [format!("-{reference}")]);
+        close.prefix = m.prefix.clone();
+        frames.push(nest(close));
+        frames
+    }
+
+    fn fail_batch(&mut self, id: u64, params: &[&str], reason: &str) {
+        let mut p = vec!["BATCH"];
+        p.extend(params);
+        p.push(reason);
+        self.reply(id, "FAIL", &p);
+    }
+
+    fn discard(&mut self, id: u64, reference: &str) {
+        let c = self.clients.get_mut(&id).unwrap();
+        if reference.len() <= 128 {
+            c.discarded.push_back(reference.into());
+            if c.discarded.len() > 4 {
+                c.discarded.pop_front();
+            }
+        }
+    }
+
+    /// Reject the open batch; its later lines and closing BATCH are ignored.
+    fn abort_batch(&mut self, id: u64, params: &[&str], reason: &str) {
+        if let Some(batch) = self.clients.get_mut(&id).unwrap().batch.take() {
+            self.fail_batch(id, params, reason);
+            self.discard(id, &batch.reference);
+        }
+    }
+
+    fn timeout_batch(&mut self, id: u64) {
+        if let Some(reference) = self.clients[&id]
+            .batch
+            .as_ref()
+            .map(|b| b.reference.clone())
+        {
+            self.abort_batch(id, &["TIMEOUT", &reference], "Batch timed out");
+        }
+    }
+
+    fn client_batch(&mut self, id: u64, m: Message) -> Result<()> {
+        if m.command != "BATCH" {
+            let reference = m.tags["batch"].clone();
+            let open = self.clients[&id]
+                .batch
+                .as_ref()
+                .map(|b| b.reference.clone());
+            if open.as_deref() == Some(reference.as_str()) {
+                return self.batch_line(id, m);
+            }
+            if !self.clients[&id].discarded.contains(&reference) {
+                self.fail_batch(id, &["MULTILINE_INVALID"], "Unknown batch reference");
+            }
+            return Ok(());
+        }
+        let Some(first) = m.params.first().cloned() else {
+            self.numeric(id, "461", &["BATCH", "Not enough parameters"]);
+            return Ok(());
+        };
+        if m.tags.contains_key("batch") {
+            let reason = "Nested client batches are not supported";
+            if self.clients[&id].batch.is_some() {
+                self.abort_batch(id, &["MULTILINE_INVALID"], reason);
+            } else {
+                self.fail_batch(id, &["MULTILINE_INVALID"], reason);
+            }
+            if let Some(reference) = first.strip_prefix('+') {
+                self.discard(id, reference);
+            }
+            return Ok(());
+        }
+        if let Some(reference) = first.strip_prefix('-') {
+            let open = self.clients[&id]
+                .batch
+                .as_ref()
+                .map(|b| b.reference.clone());
+            if open.as_deref() == Some(reference) {
+                return self.close_batch(id);
+            }
+            let c = self.clients.get_mut(&id).unwrap();
+            if let Some(n) = c.discarded.iter().position(|r| r == reference) {
+                c.discarded.remove(n);
+            } else {
+                self.fail_batch(id, &["MULTILINE_INVALID"], "Unknown batch reference");
+            }
+            return Ok(());
+        }
+        let Some(reference) = first.strip_prefix('+') else {
+            self.fail_batch(id, &["MULTILINE_INVALID"], "Invalid BATCH reference");
+            return Ok(());
+        };
+        if self.clients[&id].batch.is_some() {
+            // Overlapping batches violate client-batch framing; reject both.
+            self.abort_batch(
+                id,
+                &["MULTILINE_INVALID"],
+                "A batch was opened before the previous batch closed",
+            );
+            self.discard(id, reference);
+            return Ok(());
+        }
+        if reference.is_empty()
+            || reference.len() > 64
+            || !reference
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            self.fail_batch(id, &["INVALID_REFTAG", "*"], "Invalid batch reference");
+            self.discard(id, reference);
+            return Ok(());
+        }
+        let kind = m.params.get(1).map(String::as_str).unwrap_or("");
+        let failure = if kind != MULTILINE {
+            let kind = if valid_middle(kind) { kind } else { "*" };
+            Some((
+                vec!["UNKNOWN_TYPE", reference, kind],
+                "Unsupported batch type",
+            ))
+        } else if !self.multiline(id) {
+            Some((
+                vec!["MULTILINE_INVALID"],
+                "Negotiate batch and draft/multiline first",
+            ))
+        } else if m.params.len() != 3 || !(valid_channel(&m.params[2]) || valid_nick(&m.params[2]))
+        {
+            Some((
+                vec!["MULTILINE_INVALID"],
+                "A multiline batch needs one valid target",
+            ))
+        } else {
+            None
+        };
+        if let Some((params, reason)) = failure {
+            self.fail_batch(id, &params, reason);
+            self.discard(id, reference);
+            return Ok(());
+        }
+        let mut tags = m.tags;
+        tags.retain(|key, _| key.starts_with('+'));
+        self.clients.get_mut(&id).unwrap().batch = Some(OpenBatch {
+            reference: reference.into(),
+            target: m.params[2].clone(),
+            tags,
+            command: None,
+            text: String::new(),
+            lines: Vec::new(),
+            active: Instant::now(),
+        });
+        Ok(())
+    }
+
+    fn batch_line(&mut self, id: u64, m: Message) -> Result<()> {
+        let limits = &self.config.limits;
+        let prefix = self.prefix(id);
+        let b = self.clients[&id].batch.as_ref().unwrap();
+        let concat = m.tags.contains_key(CONCAT);
+        let max_lines = limits.multiline_lines.to_string();
+        let max_bytes = limits.multiline_bytes.to_string();
+        let mut relayed = Message::new(
+            &m.command,
+            [
+                b.target.clone(),
+                m.params.last().cloned().unwrap_or_default(),
+            ],
+        );
+        relayed.prefix = Some(prefix);
+        let too_long = relayed.encode().is_err();
+        let failure: Option<(Vec<String>, &str)> = if b.active.elapsed() > BATCH_TIMEOUT {
+            Some((
+                vec!["TIMEOUT".into(), b.reference.clone()],
+                "Batch timed out",
+            ))
+        } else if !["PRIVMSG", "NOTICE"].contains(&m.command.as_str()) || m.params.len() != 2 {
+            Some((
+                vec!["MULTILINE_INVALID".into()],
+                "Multiline batches contain only PRIVMSG or NOTICE lines",
+            ))
+        } else if b.command.as_ref().is_some_and(|c| *c != m.command) {
+            Some((vec!["MULTILINE_INVALID".into()], "Invalid multiline batch"))
+        } else if fold(&m.params[0]) != fold(&b.target) {
+            let provided = if valid_middle(&m.params[0]) {
+                m.params[0].clone()
+            } else {
+                "*".into()
+            };
+            Some((
+                vec![
+                    "MULTILINE_INVALID_TARGET".into(),
+                    b.target.clone(),
+                    provided,
+                ],
+                "Invalid multiline target",
+            ))
+        } else if m.tags.keys().any(|key| key != "batch" && key != CONCAT) {
+            Some((
+                vec!["MULTILINE_INVALID".into()],
+                "Line tags belong on the opening BATCH",
+            ))
+        } else if concat && m.params[1].is_empty() {
+            Some((
+                vec!["MULTILINE_INVALID".into()],
+                "Invalid multiline batch with concatenated blank line",
+            ))
+        } else if too_long {
+            Some((
+                vec!["MULTILINE_INVALID".into()],
+                "Multiline line too long after relay prefix",
+            ))
+        } else if b.lines.len() >= limits.multiline_lines {
+            Some((
+                vec!["MULTILINE_MAX_LINES".into(), max_lines],
+                "Multiline batch max-lines exceeded",
+            ))
+        } else if b.text.len() + m.params[1].len() + usize::from(!b.lines.is_empty() && !concat)
+            > limits.multiline_bytes
+        {
+            Some((
+                vec!["MULTILINE_MAX_BYTES".into(), max_bytes],
+                "Multiline batch max-bytes exceeded",
+            ))
+        } else {
+            None
+        };
+        if let Some((params, reason)) = failure {
+            let params = params.iter().map(String::as_str).collect::<Vec<_>>();
+            self.abort_batch(id, &params, reason);
+            return Ok(());
+        }
+        let b = self.clients.get_mut(&id).unwrap().batch.as_mut().unwrap();
+        if !b.lines.is_empty() && !concat {
+            b.text.push('\n');
+        }
+        b.text.push_str(&m.params[1]);
+        b.lines.push((m.params[1].len(), concat));
+        b.command = Some(m.command);
+        b.active = Instant::now();
+        Ok(())
+    }
+
+    fn close_batch(&mut self, id: u64) -> Result<()> {
+        if self.clients[&id]
+            .batch
+            .as_ref()
+            .is_some_and(|b| b.active.elapsed() > BATCH_TIMEOUT)
+        {
+            self.timeout_batch(id);
+            return Ok(());
+        }
+        if self.clients[&id]
+            .batch
+            .as_ref()
+            .is_some_and(|b| b.lines.iter().all(|(len, _)| *len == 0))
+        {
+            self.abort_batch(
+                id,
+                &["MULTILINE_INVALID"],
+                "Invalid multiline batch with blank lines only",
+            );
+            return Ok(());
+        }
+        let b = self.clients.get_mut(&id).unwrap().batch.take().unwrap();
+        let mut lines = Vec::with_capacity(b.lines.len());
+        let mut offset = 0;
+        for (n, (len, concat)) in b.lines.iter().enumerate() {
+            if n > 0 && !concat {
+                offset += 1;
+            }
+            lines.push((b.text[offset..offset + len].to_owned(), *concat));
+            offset += len;
+        }
+        let message = Message {
+            tags: b.tags,
+            prefix: None,
+            command: b.command.unwrap(),
+            params: vec![b.target, b.text],
+        };
+        // A lone unconcatenated line is an ordinary message.
+        if lines.len() == 1 && !lines[0].1 {
+            self.relay(id, message, None, true)
+        } else {
+            self.relay(id, message, Some(lines), true)
+        }
     }
 
     fn mode(&mut self, id: u64, p: &[String]) -> Result<()> {
@@ -1160,7 +1631,7 @@ impl State {
         };
         let rows = self.store.history(&channel)?;
         let selected = select_history(&rows, sub, &p[2], p.get(3).map(String::as_str), limit);
-        let selected = match selected {
+        let (selected, trim) = match selected {
             Ok(rows) => rows,
             Err(e) => {
                 self.fail(
@@ -1177,14 +1648,30 @@ impl State {
                 return Ok(());
             }
         };
+        // Selection uses the index; only the bounded page is decoded.
+        let selected = self.store.messages(&selected)?;
         let name = self.channels[&channel].name.clone();
         let batch = self.begin_batch(id, "chathistory", &name);
-        for row in selected {
-            let mut m = row.message.clone();
-            if let Some(batch) = &batch {
-                m.tags.insert("batch".into(), batch.clone());
-            }
-            self.send(id, m);
+        let multiline = self.multiline(id);
+        let mut pages = Vec::new();
+        for message in &selected {
+            // Stored multiline messages are re-split into relay-sized lines.
+            let lines = message.encode().is_err().then(|| split_lines(message));
+            let frames = self.chat_frames(message, lines.as_deref(), multiline, batch.as_deref());
+            let size: usize = frames
+                .iter()
+                .map(|m| m.encode().map_or(0, |line| line.len()))
+                .sum();
+            pages.push((frames, size));
+        }
+        // Pages are byte-bounded and always hold one message. Trimming keeps a
+        // contiguous run nearest the reference (the anchor for AROUND), so
+        // paging on from the returned edge never skips one; clients page until
+        // an empty batch.
+        let sizes = pages.iter().map(|(_, size)| *size).collect::<Vec<_>>();
+        let (start, end) = page_window(&sizes, trim, self.config.limits.history_page_bytes);
+        for (frames, _) in pages.into_iter().take(end).skip(start) {
+            self.send_frames(id, frames);
         }
         if let Some(batch) = batch {
             self.reply(id, "BATCH", &[&format!("-{batch}")]);
@@ -1326,6 +1813,50 @@ impl State {
     }
 }
 
+fn valid_middle(param: &str) -> bool {
+    !param.is_empty()
+        && param.len() <= 128
+        && !param.starts_with(':')
+        && !param.contains([' ', '\r', '\n', '\0'])
+}
+
+/// Split a stored multiline message into lines that fit after its relay prefix.
+/// Long logical lines become draft/multiline-concat parts, preferably after a space.
+fn split_lines(m: &Message) -> Vec<(String, bool)> {
+    let overhead = format!(
+        ":{} {} {} :\r\n",
+        m.prefix.as_deref().unwrap_or(""),
+        m.command,
+        m.params[0]
+    )
+    .len();
+    let budget = 512usize.saturating_sub(overhead).max(4);
+    let mut lines = Vec::new();
+    for logical in m.params[1].split('\n') {
+        let mut rest = logical;
+        let mut concat = false;
+        loop {
+            let mut cut = rest.len().min(budget);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if cut < rest.len()
+                && let Some(space) = rest[..cut].rfind(' ')
+                && space + 1 > cut / 2
+            {
+                cut = space + 1;
+            }
+            lines.push((rest[..cut].to_owned(), concat));
+            rest = &rest[cut..];
+            concat = true;
+            if rest.is_empty() {
+                break;
+            }
+        }
+    }
+    lines
+}
+
 fn timestamp(reference: &str) -> Result<String> {
     let raw = reference
         .strip_prefix("timestamp=")
@@ -1341,7 +1872,7 @@ enum Reference {
     All,
 }
 impl Reference {
-    fn parse(reference: &str, rows: &[Record], allow_all: bool) -> Result<Self> {
+    fn parse(reference: &str, rows: &[Entry], allow_all: bool) -> Result<Self> {
         if allow_all && reference == "*" {
             return Ok(Self::All);
         }
@@ -1355,7 +1886,7 @@ impl Reference {
             Ok(Self::Time(timestamp(reference)?))
         }
     }
-    fn compare(&self, row: &Record) -> std::cmp::Ordering {
+    fn compare(&self, row: &Entry) -> std::cmp::Ordering {
         match self {
             Self::Sequence(seq) => row.seq.cmp(seq),
             Self::Time(time) => row.time.cmp(time),
@@ -1364,13 +1895,54 @@ impl Reference {
     }
 }
 
+/// Which end of a selected page stays nearest the request's reference.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Trim {
+    Forward,
+    Backward,
+    /// Index of the first row at or after an AROUND reference.
+    Around(usize),
+}
+
+/// The contiguous `[start, end)` rows that fit `budget`, always at least one,
+/// grown outward from the end nearest the reference.
+fn page_window(sizes: &[usize], trim: Trim, budget: usize) -> (usize, usize) {
+    let n = sizes.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let (mut start, mut end) = match trim {
+        Trim::Forward => (0, 1),
+        Trim::Backward => (n - 1, n),
+        Trim::Around(anchor) => (anchor.min(n - 1), anchor.min(n - 1) + 1),
+    };
+    let mut used = sizes[start];
+    loop {
+        let mut grew = false;
+        if trim != Trim::Backward && end < n && used + sizes[end] <= budget {
+            used += sizes[end];
+            end += 1;
+            grew = true;
+        }
+        if trim != Trim::Forward && start > 0 && used + sizes[start - 1] <= budget {
+            start -= 1;
+            used += sizes[start];
+            grew = true;
+        }
+        if !grew {
+            return (start, end);
+        }
+    }
+}
+
+/// Selected rows in ascending order, and which end is nearest the reference.
 fn select_history<'a>(
-    rows: &'a [Record],
+    rows: &'a [Entry],
     sub: &str,
     reference: &str,
     second: Option<&str>,
     limit: usize,
-) -> Result<Vec<&'a Record>> {
+) -> Result<(Vec<&'a Entry>, Trim)> {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let reference = Reference::parse(reference, rows, sub == "LATEST")?;
     let second = if sub == "BETWEEN" {
@@ -1383,6 +1955,7 @@ fn select_history<'a>(
         None
     };
     let mut out = Vec::new();
+    let mut trim = Trim::Backward;
     match sub {
         "LATEST" => {
             for r in rows {
@@ -1411,6 +1984,7 @@ fn select_history<'a>(
                     }
                 }
             }
+            trim = Trim::Forward;
         }
         "AROUND" => {
             let anchor = rows
@@ -1421,6 +1995,7 @@ fn select_history<'a>(
                 .saturating_sub(limit / 2)
                 .min(rows.len().saturating_sub(limit));
             out = rows.iter().skip(start).take(limit).collect();
+            trim = Trim::Around(anchor - start.min(anchor));
         }
         "BETWEEN" => {
             let second = second.ok_or_else(|| anyhow::anyhow!("missing second reference"))?;
@@ -1441,10 +2016,15 @@ fn select_history<'a>(
             if reverse {
                 out.reverse();
             }
+            trim = if reverse {
+                Trim::Backward
+            } else {
+                Trim::Forward
+            };
         }
         _ => bail!("invalid history operation"),
     }
-    Ok(out)
+    Ok((out, trim))
 }
 
 #[cfg(test)]
@@ -1484,23 +2064,131 @@ mod tests {
         state.handle(Event::Connect {
             id: 1,
             out: slow,
+            queued: Arc::default(),
             kill: slow_kill,
         });
         state.handle(Event::Connect {
             id: 2,
             out: fast,
+            queued: Arc::default(),
             kill: fast_kill,
         });
         for n in 0..10 {
             let message = Message::new("NOTICE", ["#work".into(), n.to_string()]);
             state.broadcast([1, 2], message);
-            assert_eq!(reading.try_recv().unwrap().params[1], n.to_string());
+            assert_eq!(
+                reading.try_recv().unwrap(),
+                format!("NOTICE #work :{n}\r\n")
+            );
         }
         assert!(*slow_status.borrow());
         assert!(!*fast_status.borrow());
-        assert_eq!(unread.try_recv().unwrap().params[1], "0");
+        assert_eq!(unread.try_recv().unwrap(), "NOTICE #work :0\r\n");
         state.handle(Event::Tick);
         assert!(!state.clients.contains_key(&1));
         assert!(state.clients.contains_key(&2));
+    }
+
+    fn batch_state(lines: &[&str]) -> (State, mpsc::Receiver<String>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Arc::new(Config {
+            server_name: "test.airc".into(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            database: directory.path().join("state.db"),
+            allow_insecure: false,
+            allow_private_messages: false,
+            tls: None,
+            limits: Limits::default(),
+            accounts: vec![Account {
+                name: "alice".into(),
+                token_sha256: token_hash("test"),
+            }],
+            channels: vec![ChannelConfig {
+                name: "#work".into(),
+                members: vec!["alice".into()],
+                operators: vec![],
+                moderated: false,
+            }],
+            artifacts: None,
+        });
+        let store = Store::open(&config).unwrap();
+        let mut state = State::new(config, store).unwrap();
+        let (out, output) = mpsc::channel(64);
+        let (kill, _status) = watch::channel(false);
+        state.handle(Event::Connect {
+            id: 1,
+            out,
+            queued: Arc::default(),
+            kill,
+        });
+        for line in [
+            "CAP REQ :batch draft/multiline echo-message",
+            "PASS alice:test",
+            "NICK alice",
+            "USER alice 0 * :x",
+            "CAP END",
+            "JOIN #work",
+        ]
+        .iter()
+        .chain(lines)
+        {
+            state.handle(Event::Message(1, Message::parse(line).unwrap()));
+        }
+        (state, output, directory)
+    }
+
+    #[test]
+    fn unfinished_batch_times_out_on_tick_and_is_never_delivered() {
+        let (mut state, mut output, _dir) = batch_state(&[
+            "BATCH +slow draft/multiline #work",
+            "@batch=slow PRIVMSG #work :never",
+        ]);
+        let open = state.clients.get_mut(&1).unwrap().batch.as_mut().unwrap();
+        open.active = Instant::now()
+            .checked_sub(BATCH_TIMEOUT + Duration::from_secs(1))
+            .unwrap();
+        state.handle(Event::Tick);
+        state.handle(Event::Message(1, Message::parse("BATCH -slow").unwrap()));
+        let mut sent = String::new();
+        while let Ok(lines) = output.try_recv() {
+            sent.push_str(&lines);
+        }
+        assert!(
+            sent.contains("FAIL BATCH TIMEOUT slow :Batch timed out"),
+            "{sent}"
+        );
+        assert!(!sent.contains("never"), "{sent}");
+        assert!(state.clients[&1].batch.is_none());
+    }
+
+    #[test]
+    fn page_window_is_contiguous_and_keeps_the_reference_edge() {
+        let sizes = [5, 5, 5, 5, 5];
+        assert_eq!(page_window(&sizes, Trim::Forward, 12), (0, 2));
+        assert_eq!(page_window(&sizes, Trim::Backward, 12), (3, 5));
+        assert_eq!(page_window(&sizes, Trim::Around(2), 16), (1, 4));
+        assert_eq!(page_window(&sizes, Trim::Around(5), 1), (4, 5));
+        assert_eq!(page_window(&[50, 1], Trim::Forward, 10), (0, 1));
+        assert_eq!(page_window(&[], Trim::Forward, 10), (0, 0));
+    }
+
+    #[test]
+    fn paced_batch_lines_renew_the_inactivity_timeout() {
+        let (mut state, mut output, _dir) = batch_state(&["BATCH +paced draft/multiline #work"]);
+        for text in ["one", "two", "three"] {
+            // Each line arrives 25 s after the previous: 75 s in total.
+            let open = state.clients.get_mut(&1).unwrap().batch.as_mut().unwrap();
+            open.active = Instant::now().checked_sub(Duration::from_secs(25)).unwrap();
+            state.handle(Event::Tick);
+            let line = format!("@batch=paced PRIVMSG #work :{text}");
+            state.handle(Event::Message(1, Message::parse(&line).unwrap()));
+        }
+        state.handle(Event::Message(1, Message::parse("BATCH -paced").unwrap()));
+        let mut sent = String::new();
+        while let Ok(lines) = output.try_recv() {
+            sent.push_str(&lines);
+        }
+        assert!(!sent.contains("FAIL"), "{sent}");
+        assert!(sent.contains("PRIVMSG #work :three"), "{sent}");
     }
 }

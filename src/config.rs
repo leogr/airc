@@ -42,6 +42,20 @@ pub struct Limits {
     pub history_per_channel: usize,
     pub history_page: usize,
     pub history_days: u32,
+    /// Combined text bytes of one draft/multiline message.
+    pub multiline_bytes: usize,
+    /// PRIVMSG/NOTICE lines in one draft/multiline message.
+    pub multiline_lines: usize,
+    /// Encoded bytes queued for one connection before it is disconnected.
+    pub outbound_bytes: usize,
+    /// Encoded bytes of one CHATHISTORY page; a page always holds one message.
+    pub history_page_bytes: usize,
+}
+
+/// Worst-case encoded size of one relayed multiline message: content, a
+/// bounded per-line prefix/tag overhead, plus opening and closing BATCH lines.
+pub fn multiline_wire_bytes(limits: &Limits) -> usize {
+    limits.multiline_bytes + limits.multiline_lines * 256 + 2 * 4608
 }
 
 impl Default for Limits {
@@ -52,6 +66,10 @@ impl Default for Limits {
             history_per_channel: 10_000,
             history_page: 100,
             history_days: 30,
+            multiline_bytes: 64 * 1024,
+            multiline_lines: 1024,
+            outbound_bytes: 4 * 1024 * 1024,
+            history_page_bytes: 1024 * 1024,
         }
     }
 }
@@ -137,6 +155,18 @@ impl Config {
             (1..=100_000).contains(&self.limits.history_per_channel)
                 && (1..=3650).contains(&self.limits.history_days),
             "invalid history retention"
+        );
+        ensure!(
+            (1024..=1024 * 1024).contains(&self.limits.multiline_bytes)
+                && (2..=4096).contains(&self.limits.multiline_lines),
+            "multiline_bytes must be 1 KiB-1 MiB and multiline_lines 2-4096"
+        );
+        ensure!(
+            (64 * 1024..=64 * 1024 * 1024).contains(&self.limits.history_page_bytes)
+                && self.limits.outbound_bytes <= 256 * 1024 * 1024
+                && self.limits.outbound_bytes
+                    >= 2 * multiline_wire_bytes(&self.limits) + self.limits.history_page_bytes,
+            "outbound_bytes must hold two maximal multiline messages plus history_page_bytes"
         );
         let mut accounts = BTreeSet::new();
         for account in &self.accounts {

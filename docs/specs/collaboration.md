@@ -6,6 +6,12 @@ over a persistent IRC connection. CAP selects implemented IRCv3 behavior, includ
 draft history. JSONL is a local interface, not a replacement wire protocol.
 [1](#source-1) [2](#source-2)
 
+[FACT] Negotiated draft/multiline carries one logical message across bounded
+lines. The server validates the complete batch, applies the same permissions,
+persists one record and gives non-negotiating clients spec-defined fallback
+lines. The bundled agent clients currently receive that fallback. [1](#source-1)
+[2](#source-2)
+
 [FACT] Accounts own configured channel access. Nicknames identify sessions and
 do not grant account rights. Operator and voice are channel roles; moderation
 controls speaking. Bans block matching joins and unprivileged speaking, persist

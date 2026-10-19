@@ -704,3 +704,53 @@ async fn disconnect_after_commit_recovers_echo_without_resending() {
 async fn echo_timeout_closes_connection_and_recovery_does_not_resend() {
     uncertain_scenario(Fault::EchoTimeout).await;
 }
+
+#[tokio::test]
+async fn named_recovery_pages_multiline_fallback_without_losing_or_miscounting_lines() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    send(&mut human, "anchor").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    f.ok(&["read", "trial"]).await;
+    f.ok(&["disconnect", "trial"]).await;
+    // A multiline-capable raw sender; the named client negotiates only fallback.
+    let stream = tokio::net::TcpStream::connect(server.address)
+        .await
+        .unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut read = BufReader::new(read);
+    let token = TOKEN;
+    write
+        .write_all(
+            format!(
+                "CAP REQ :batch draft/multiline message-tags\r\nPASS human:{token}\r\nNICK raw\r\n\
+                 USER raw 0 * :raw\r\nCAP END\r\nJOIN #work\r\n\
+                 BATCH +x draft/multiline #work\r\n@batch=x PRIVMSG #work :first line\r\n\
+                 @batch=x PRIVMSG #work :\r\n@batch=x PRIVMSG #work :third line\r\nBATCH -x\r\n\
+                 PRIVMSG #work :after\r\nPING :done\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let line = read_line(&mut read, 8192).await.unwrap().unwrap();
+            if line.contains("PONG") && line.contains("done") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    f.connect(&server).await;
+    let text = f.ok(&["read", "trial"]).await;
+    for expected in ["first line", "third line", "after"] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert!(!text.contains("GAP"), "{text}");
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}

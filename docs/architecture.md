@@ -28,8 +28,9 @@ The connection's read future owns each complete frame. It is not restarted every
 time output becomes ready, which would lose partially consumed TCP frames. Size
 checks happen during framing, not after an unbounded `read_line` allocation.
 
-SQLite schema 2 stores channel messages, persistent channel state, ban lists and
-artifacts; schema 1 upgrades transactionally without discarding state.
+SQLite schema 3 stores channel messages (including combined multiline text),
+persistent channel state, ban lists and artifacts; schemas 1 and 2 upgrade
+transactionally without discarding state.
 WAL uses FULL synchronization and an exclusive connection lock, so two
 servers cannot independently own one database. Broadcast happens after commit;
 artifacts and their announcements share a transaction. Roles and connections are

@@ -8,12 +8,12 @@ pub struct Store {
     days: u32,
 }
 
+/// History index row: selection never decodes message bodies.
 #[derive(Clone)]
-pub struct Record {
+pub struct Entry {
     pub seq: i64,
     pub id: String,
     pub time: String,
-    pub message: Message,
 }
 
 pub struct Artifact {
@@ -46,7 +46,9 @@ impl Store {
         let mut db = Connection::open(&config.database)?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 2, "database schema is newer than this binary");
+        // Version 3 adds no columns: it marks rows that may hold multiline text,
+        // which older binaries cannot replay, so they refuse the database.
+        ensure!(version <= 3, "database schema is newer than this binary");
         db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction()?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, channel TEXT NOT NULL, time TEXT NOT NULL, message TEXT NOT NULL);
@@ -55,7 +57,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, channel TEXT NOT NULL, filename TEXT NOT NULL, data BLOB NOT NULL, time TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS artifacts_channel ON artifacts(channel, time);
             CREATE TABLE IF NOT EXISTS bans (channel TEXT NOT NULL REFERENCES channels(name), mask TEXT NOT NULL, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, PRIMARY KEY(channel, mask));
-            PRAGMA user_version=2;")?;
+            PRAGMA user_version=3;")?;
         for c in &config.channels {
             tx.execute(
                 "INSERT OR IGNORE INTO channels(name, moderated) VALUES (?1, ?2)",
@@ -151,28 +153,33 @@ impl Store {
         Ok(())
     }
 
-    pub fn history(&self, channel: &str) -> Result<Vec<Record>> {
+    /// Retained history index in sequence order, without message bodies.
+    pub fn history(&self, channel: &str) -> Result<Vec<Entry>> {
         let mut stmt = self.db.prepare(
-            "SELECT seq,id,time,message FROM messages WHERE channel=?1 AND time>=?2 ORDER BY seq",
+            "SELECT seq,id,time FROM messages WHERE channel=?1 AND time>=?2 ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![channel, self.cutoff()], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        rows.map(|r| {
-            let (seq, id, time, message) = r?;
-            Ok(Record {
-                seq,
-                id,
-                time,
-                message: serde_json::from_str(&message)?,
+            Ok(Entry {
+                seq: r.get(0)?,
+                id: r.get(1)?,
+                time: r.get(2)?,
             })
-        })
-        .collect()
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Decode only the selected (page-bounded) history messages.
+    pub fn messages(&self, entries: &[&Entry]) -> Result<Vec<Message>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT message FROM messages WHERE seq=?1")?;
+        entries
+            .iter()
+            .map(|e| {
+                let message: String = stmt.query_row([e.seq], |r| r.get(0))?;
+                Ok(serde_json::from_str(&message)?)
+            })
+            .collect()
     }
 
     pub fn artifact(&self, id: &str) -> Result<Option<Artifact>> {

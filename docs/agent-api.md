@@ -75,7 +75,15 @@ Unrecognized incoming reply IDs display as `reply=msgid:...`, capped at 128
 characters with an explicit truncation marker; they are not local references.
 
 Every explicit reconnect uses saved per-channel msgids for AFTER catch-up,
-up to six pages of 20 messages per channel under a 20-second recovery deadline.
+up to six pages of at most 20 messages per channel under a 20-second recovery
+deadline. Byte-bounded pages can be short; paging stops at an empty page.
+
+Named sessions and JSONL do not yet negotiate `draft/multiline`. A multiline
+message from another participant therefore arrives as its non-blank component
+lines: the first carries the msgid (and reference), later lines are `live-only`
+records. Sending text with newlines is still rejected locally.
+If a live fallback message overlaps reconnect history, its continuation lines
+can appear again: only the first line has the msgid needed for deduplication.
 A missing reference is reported as GAP, followed by a bounded LATEST window.
 An initial connection also reads up to 20 recent messages and labels the limit.
 A server with a smaller history-page limit can reject that request; this is
@@ -134,6 +142,8 @@ History requests enqueue results as IRC events, collected through `read`. BATCH
 start/end identifies their boundaries. Live messages can be interleaved; inspect
 the `batch` tag to distinguish replay. A server FAIL/numeric error also arrives
 through `read`. A history limit above a server's configured maximum is rejected.
+A page can hold fewer messages than requested when it reaches the server's byte
+bound; continue from its edge until an empty batch.
 
 For bans, `{"op":"mode","channel":"#work","modes":"b"}` queries the list;
 `"modes":"+b","nick":"*!agent-a@airc"` adds that mask, and `-b` removes it.

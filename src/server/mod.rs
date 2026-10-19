@@ -8,7 +8,14 @@ use crate::{
     transport::{self, Stream},
 };
 use anyhow::Result;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -17,9 +24,11 @@ use tokio::{
 };
 
 pub(super) enum Event {
+    /// `out` carries pre-encoded frame groups; `queued` counts their unwritten bytes.
     Connect {
         id: u64,
-        out: mpsc::Sender<Message>,
+        out: mpsc::Sender<String>,
+        queued: Arc<AtomicUsize>,
         kill: watch::Sender<bool>,
     },
     Message(u64, Message),
@@ -172,9 +181,16 @@ async fn session(
     limit: usize,
     mut stopping: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (out, mut output) = mpsc::channel::<Message>(limit);
+    let (out, mut output) = mpsc::channel::<String>(limit);
+    let queued = Arc::new(AtomicUsize::new(0));
     let (kill, mut killed) = watch::channel(false);
-    tx.send(Event::Connect { id, out, kill }).await?;
+    tx.send(Event::Connect {
+        id,
+        out,
+        queued: queued.clone(),
+        kill,
+    })
+    .await?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     // Keep reads in their own future: cancelling read_line after consuming partial
@@ -193,10 +209,11 @@ async fn session(
         Ok::<_, anyhow::Error>(())
     };
     let output = async {
-        while let Some(message) = output.recv().await {
-            let line = message.encode()?;
-            tokio::time::timeout(Duration::from_secs(10), writer.write_all(line.as_bytes()))
+        // A frame group (for example one multiline batch) is written contiguously.
+        while let Some(lines) = output.recv().await {
+            tokio::time::timeout(Duration::from_secs(10), writer.write_all(lines.as_bytes()))
                 .await??;
+            queued.fetch_sub(lines.len(), Ordering::Relaxed);
         }
         Ok::<_, anyhow::Error>(())
     };

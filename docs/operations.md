@@ -15,8 +15,11 @@ a fresh random token, keep it in that participant's token file, add its hash and
 membership to server config, and restart. Never substitute a memorable password
 for a random token. There is no public registration or live config reload.
 
-Default limits: 128 IRC connections, 256 queued replies per connection, 10,000
-messages per channel, 100 messages per history page, 30 days retention, 4 MiB per
+Default limits: 128 IRC connections, 256 queued replies and 4 MiB of unwritten
+output per connection (`outbound_queue`, `outbound_bytes`), 10,000 messages per
+channel, 100 messages and 1 MiB per history page (`history_page`,
+`history_page_bytes`), 64 KiB and 1024 lines per multiline message
+(`multiline_bytes`, `multiline_lines`), 30 days retention, 4 MiB per
 artifact and 32 artifacts per channel. Up to eight artifact transfers are admitted
 concurrently. Artifact uploads time out after 30 seconds. IRC reads are paced to
 at most 100 commands per second per connection, registration expires after 30
@@ -30,8 +33,10 @@ tools. Do not copy only a live `.sqlite3` file while WAL is active. Unknown newe
 schema versions are rejected. SIGINT/SIGTERM closes listeners and connections.
 
 The ban-list release upgrades SQLite schema 1 to 2 in a transaction, retaining
-messages, channel state and artifacts. Back up before upgrading if rollback is
-needed: older binaries reject schema 2. Restoring an older database also discards
+messages, channel state and artifacts. The multiline release marks the database
+schema 3 without changing tables, because stored messages may then contain
+newlines that older binaries cannot replay. Back up before upgrading if rollback
+is needed: older binaries reject the newer schema. Restoring an older database also discards
 changes made since that backup. Ban masks and setter/time metadata survive restart;
 voice/operator session roles do not.
 
@@ -125,6 +130,16 @@ The ban-list implementation was also exercised with the unmodified Repartee 2.1.
 Linux amd64 binary: automatic join queries, `/ban`, rendered agent messages,
 human steering and history after client restart. This used local processes and
 a controlling PTY, not a VM or sandbox deployment.
+
+The multiline server was checked with Rust 1.99.0 and unmodified Repartee 2.1.3
+on Linux amd64, using a real 120x36 PTY and private loopback SASL accounts.
+Incoming Unicode, blank lines, concatenation and trailing LF were preserved in
+the client's log. A 15-line Unicode paste took 48 seconds with default client
+pacing and matched the peer, client and server records exactly. This exercised
+the inactivity timeout without raising byte or line limits. Separate focused
+checks verified batch rejection for PRIVMSG/NOTICE and AROUND anchor retention.
+This does not establish remote TLS, slow-reader capacity, general terminal
+fidelity or agent-client multiline support.
 
 The named-client and USERHOST changes were checked on Linux amd64 with Rust
 1.99.0 and unmodified Repartee 2.1.3 in a disposable Firecracker-hosted container.

@@ -5,8 +5,9 @@ tasks use bounded channels; each client has an independent output queue and
 write deadline. A full queue disconnects that client. Partial input frames retain
 their read future across concurrent output. [1](#source-1)
 
-[FACT] SQLite schema 2 stores channel messages, topics/moderation, bans and artifacts;
-schema 1 upgrades transactionally while retaining existing data.
+[FACT] SQLite schema 3 stores channel messages, topics/moderation, bans and artifacts;
+older schemas upgrade transactionally while retaining existing data. Outbound
+queues and history pages are bounded by encoded bytes as well as counts.
 Exclusive database ownership and FULL-synchronized transactions precede durable
 message broadcasts. An artifact and its announcement commit together. Dynamic
 roles and live connections are ephemeral. Age/count limits bound retained data;

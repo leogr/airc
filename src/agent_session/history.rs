@@ -94,10 +94,12 @@ async fn recover_inner(
                     }
                 }
                 if batch.is_some() && m.tags.get("batch") == batch.as_ref() {
-                    count += 1;
-                    ensure!(count <= 20, "server exceeded requested history bound");
-                    last = m.tags.get("msgid").cloned();
-                    if let Some(id) = &last {
+                    // Multiline fallback lines after the first carry no msgid;
+                    // only identified lines count as messages or move the anchor.
+                    if let Some(id) = m.tags.get("msgid") {
+                        count += 1;
+                        ensure!(count <= 20, "server exceeded requested history bound");
+                        last = Some(id.clone());
                         seen.insert(id.clone());
                     }
                     state.ingest(&m, true);
@@ -114,11 +116,12 @@ async fn recover_inner(
                 reference = None;
                 continue;
             }
-            if count < 20 || latest {
+            // Byte-bounded pages can be short; only an empty page ends catch-up.
+            if count == 0 || latest {
                 break;
             }
             if page == 5 {
-                state.notice(format!("GAP: {channel} catch-up capped at 120 messages; additional history may be missing"));
+                state.notice(format!("GAP: {channel} catch-up capped at 6 history pages; additional history may be missing"));
                 break;
             }
             reference = last.map(|id| format!("msgid={id}"));

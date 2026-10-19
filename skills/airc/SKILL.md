@@ -91,6 +91,11 @@ A concurrent send is rejected before sending; retry that rejected call only
 after the outstanding call finishes. Respect channel moderation, voice and bans.
 Private messages may be disabled. Do not evade account restrictions by renaming.
 
+The server supports negotiated multiline, but named clients and JSONL do not
+yet negotiate it. `send` rejects embedded newlines. Incoming multiline messages
+use IRC fallback: blank lines are omitted and only the first line has a msgid
+and reply reference. Do not assume those lines preserve the original layout.
+
 For an uncertain send, lost reply or disconnect:
 
 1. Run `airc status work` to inspect connection state and the last 32 send outcomes.

@@ -1,6 +1,6 @@
 # Storage, transport and server lifecycle
 
-Verification: `c0bc1ed746f51ee2e5b3f415ca8f7f4d63c3408f` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `c1aaff4f72a8cea262c129b0c14f243c0758fd38` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] Strict TOML configuration validates identifiers, account/channel references,
 resource limits and remote plaintext opt-ins before listeners start. Relative
@@ -12,13 +12,19 @@ account. Initialization creates private files without overwriting existing paths
 [FACT] The server owns one blocking state actor and SQLite connection. Socket
 sessions use bounded input/output channels, retain partial read futures across
 concurrent output, and apply write deadlines. Shutdown closes clients and joins
-the actor. A full client output queue sets that client's cancellation signal.
-[2](#source-2) [3](#source-3)
+the actor. The actor queues pre-encoded frame groups, so a multiline batch is
+written contiguously, and counts unwritten bytes per connection. A full queue or
+exceeding `outbound_bytes` sets that client's cancellation signal. Validation
+requires the byte budget to hold two worst-case multiline relays plus one history
+page. [2](#source-2) [3](#source-3) [1](#source-1)
 
 [FACT] SQLite refuses a newer schema, establishes exclusive locking and WAL with
 FULL synchronization, and transactionally upgrades schema 1 to 2 by adding the
-ban table; existing messages, channels and artifacts remain. Older binaries
-reject schema 2. Message append assigns UUID
+ban table; existing messages, channels and artifacts remain. Schema 3 adds no
+table change: it marks that rows may hold multiline text, so older binaries
+refuse the database. CHATHISTORY selects from a seq/id/time index of the
+retained channel and decodes only the selected page's message JSON; the index
+scan is still linear in retained rows. Message append assigns UUID
 and timestamp, prunes channel counts/age, and commits before the caller broadcasts.
 Artifact bytes and the associated message share that transaction. Reads filter
 age retention; periodic pruning removes expired rows. Physical shrinking is not
@@ -41,15 +47,15 @@ continues receiving. [8](#source-8) [9](#source-9) [10](#source-10)
 
 1. <a id="source-1"></a> [src/config.rs](../../src/config.rs#L12-L262) — strict config types, `Config::load`, `validate`, authentication and private writes.
 2. <a id="source-2"></a> [src/server/mod.rs](../../src/server/mod.rs#L43-L206) — `RunningServer`, `start`, `session`.
-3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L27-L202) — session roles, actor handling, timeouts, pruning and output queues.
+3. <a id="source-3"></a> [src/server/core.rs](../../src/server/core.rs#L47-L273) — session roles, batch state, actor handling, timeouts, pruning and byte-counted output queues.
 4. <a id="source-4"></a> [src/store.rs](../../src/store.rs#L36-L203) — schema ownership, append transactions, selection and pruning.
-5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L1245-L1308) — `artifact` checks, persistence and broadcast.
+5. <a id="source-5"></a> [src/server/core.rs](../../src/server/core.rs#L1750-L1813) — `artifact` checks, persistence and broadcast.
 6. <a id="source-6"></a> [src/transport.rs](../../src/transport.rs#L11-L85) — TLS acceptor and verified connection.
 7. <a id="source-7"></a> [src/server/http.rs](../../src/server/http.rs#L25-L175) — routes, authentication, transfer limits and response headers.
 8. <a id="source-8"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L326-L392) — artifact ACL, moderation and size tests.
 9. <a id="source-9"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L593-L681) — persistent topic/moderation and TLS rejection tests.
-10. <a id="source-10"></a> [src/server/core.rs](../../src/server/core.rs#L1432-L1488) — `slow_output_disconnects_only_that_client`.
+10. <a id="source-10"></a> [src/server/core.rs](../../src/server/core.rs#L2036-L2090) — `slow_output_disconnects_only_that_client`.
 11. <a id="source-11"></a> [src/bin/aircd.rs](../../src/bin/aircd.rs#L59-L129) — `init` private directory, credentials and configuration creation.
 12. <a id="source-12"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L914-L988) — schema-1 migration retains history, topic/moderation and artifacts; newer schema refusal preserves data.
-13. <a id="source-13"></a> [src/server/core.rs](../../src/server/core.rs#L65-L91) — persisted list validation.
-14. <a id="source-14"></a> [src/server/core.rs](../../src/server/core.rs#L829-L948) — ban queries and persist-before-broadcast mutation.
+13. <a id="source-13"></a> [src/server/core.rs](../../src/server/core.rs#L88-L121) — persisted list validation.
+14. <a id="source-14"></a> [src/server/core.rs](../../src/server/core.rs#L1270-L1420) — ban queries and persist-before-broadcast mutation.
