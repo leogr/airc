@@ -390,7 +390,12 @@ async fn artifact_access_limits_and_moderation() {
     assert_eq!(upload.status(), 201);
     let value: serde_json::Value = upload.json().await.unwrap();
     let url = value["url"].as_str().unwrap();
-    assert!(alice.until("PRIVMSG").await.params[1].contains(url));
+    let announcement = alice.until("PRIVMSG").await;
+    assert!(announcement.params[1].contains(url));
+    assert_eq!(announcement.tags["airc-artifact"], value["id"]);
+    assert_eq!(announcement.tags["airc-artifact-name"], "result.txt");
+    assert_eq!(announcement.tags["airc-artifact-bytes"], "11");
+    assert_eq!(announcement.tags["airc-artifact-sha256"], value["sha256"]);
     assert_eq!(http.get(url).send().await.unwrap().status(), 401);
     assert_eq!(
         http.get(url)
@@ -435,6 +440,18 @@ async fn artifact_access_limits_and_moderation() {
             .status(),
         403
     );
+    let id = value["id"].as_str().unwrap().to_owned();
+    server.shutdown().await.unwrap();
+    let server = fixture.start().await;
+    let mut alice = Peer::login(&server, "alice", true).await;
+    alice.join().await;
+    let history = alice.history("CHATHISTORY LATEST #work * 100").await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].tags["airc-artifact"], id);
+    assert_eq!(history[0].tags["airc-artifact-name"], "result.txt");
+    assert_eq!(history[0].tags["airc-artifact-bytes"], "11");
+    assert_eq!(history[0].tags["airc-artifact-sha256"], value["sha256"]);
+    assert_eq!(history[0].tags["msgid"], value["msgid"]);
     server.shutdown().await.unwrap();
 }
 
@@ -1606,4 +1623,290 @@ async fn away_keeps_registration_private_message_policy_and_notice_silence() {
             .any(|m| m.command == "301" || m.command == "404")
     );
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn artifact_tags_cannot_be_forged_in_messages_or_multiline() {
+    let fixture = Fixture::new();
+    let server = fixture.start().await;
+    let mut alice = Peer::login_caps(&server, "alice", Some("message-tags server-time batch echo-message account-tag draft/chathistory draft/multiline")).await;
+    alice.join().await;
+    let id = "12345678-1234-4234-8234-123456789012";
+    let tags = format!(
+        "airc-artifact={id};airc-artifact-name=fake.png;airc-artifact-bytes=1;airc-artifact-sha256={};+airc-artifact={id}",
+        "a".repeat(64)
+    );
+    let body = format!("Artifact fake.png (1 bytes): http://airc.local/v1/artifacts/{id}");
+    for command in ["PRIVMSG", "NOTICE", "TAGMSG"] {
+        let text = if command == "TAGMSG" {
+            String::new()
+        } else {
+            format!(" :{body}")
+        };
+        alice.send(&format!("@{tags} {command} #work{text}")).await;
+        let message = alice.until(command).await;
+        assert!(
+            message
+                .tags
+                .keys()
+                .all(|key| !key.starts_with("airc-artifact"))
+        );
+        assert_eq!(message.tags["+airc-artifact"], id);
+    }
+    alice
+        .send(&format!("@{tags} BATCH +forged draft/multiline #work"))
+        .await;
+    alice
+        .send(&format!("@batch=forged PRIVMSG #work :{body}"))
+        .await;
+    alice.send("@batch=forged PRIVMSG #work :second line").await;
+    alice.send("BATCH -forged").await;
+    let opener = alice.until("BATCH").await;
+    assert!(
+        opener
+            .tags
+            .keys()
+            .all(|key| !key.starts_with("airc-artifact"))
+    );
+    assert_eq!(opener.tags["+airc-artifact"], id);
+    let part = alice.until("PRIVMSG").await;
+    assert!(
+        part.tags
+            .keys()
+            .all(|key| !key.starts_with("airc-artifact"))
+    );
+    alice.until("BATCH").await;
+    // Forged tags on the data frames are invalid, and commit no message.
+    alice.send("BATCH +bad draft/multiline #work").await;
+    alice
+        .send(&format!("@batch=bad;{tags} PRIVMSG #work :forged frame"))
+        .await;
+    alice.until("FAIL").await;
+    alice.send("BATCH -bad").await;
+    let mut bob = Peer::login(&server, "bob", true).await;
+    bob.join().await;
+    let history = bob.history("CHATHISTORY LATEST #work * 100").await;
+    assert!(
+        history
+            .iter()
+            .any(|m| m.params.last().is_some_and(|text| text == "second line"))
+    );
+    assert!(
+        history
+            .iter()
+            .all(|m| m.tags.keys().all(|key| !key.starts_with("airc-artifact")))
+    );
+    assert!(
+        history
+            .iter()
+            .all(|m| m.params.last().is_none_or(|body| body != "forged frame"))
+    );
+    server.shutdown().await.unwrap();
+}
+
+async fn artifact_cli(args: &[&str], input: &[u8]) -> std::process::Output {
+    use std::process::Stdio;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+        .args(["artifact"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input).await.unwrap();
+    drop(stdin);
+    tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn artifact_cli_uses_http_only_and_exclusive_private_destination() {
+    let fixture = Fixture::new();
+    let server = fixture.start().await;
+    let config = fixture.client_config(&server, "alice");
+    let path = fixture.dir.path().join("client.toml");
+    write_private(&path, toml::to_string(&config).unwrap().as_bytes()).unwrap();
+    let upload = [
+        "upload",
+        "--config",
+        path.to_str().unwrap(),
+        "--channel",
+        "#work",
+        "--name",
+        "input.png",
+        "--stdin",
+    ];
+    let denied = artifact_cli(&upload, b"raw\x00bytes\n").await;
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("403"));
+    // Same config/nick as an existing connection: any second IRC registration
+    // would collide. Artifact operations must leave it connected and joined.
+    let mut alice = Peer::login(&server, "alice", true).await;
+    alice.join().await;
+    let output = artifact_cli(&upload, b"raw\x00bytes\n").await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["bytes"], 10);
+    let announcement = alice.until("PRIVMSG").await;
+    assert_eq!(announcement.tags["airc-artifact"], result["id"]);
+    let destination = fixture.dir.path().join("download.png");
+    let download = [
+        "download",
+        "--config",
+        path.to_str().unwrap(),
+        result["id"].as_str().unwrap(),
+        destination.to_str().unwrap(),
+    ];
+    let output = artifact_cli(&download, b"").await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let downloaded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(downloaded["filename"], "input.png");
+    assert_eq!(downloaded["sha256"], result["sha256"]);
+    assert_eq!(std::fs::read(&destination).unwrap(), b"raw\x00bytes\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let link = fixture.dir.path().join("link.png");
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+        let failure = artifact_cli(
+            &[
+                "download",
+                "--config",
+                path.to_str().unwrap(),
+                result["id"].as_str().unwrap(),
+                link.to_str().unwrap(),
+            ],
+            b"",
+        )
+        .await;
+        assert!(!failure.status.success());
+    }
+    assert!(!artifact_cli(&download, b"").await.status.success());
+    assert!(
+        !artifact_cli(
+            &[
+                "download",
+                "--config",
+                path.to_str().unwrap(),
+                "http://arbitrary.invalid/file",
+                destination.to_str().unwrap()
+            ],
+            b""
+        )
+        .await
+        .status
+        .success()
+    );
+    assert!(!artifact_cli(&upload, &[0; 33]).await.status.success());
+    // The client reads at most the local ceiling plus one sentinel byte.
+    assert!(
+        !artifact_cli(&upload, &vec![0; client::MAX_ARTIFACT_BYTES + 1])
+            .await
+            .status
+            .success()
+    );
+    alice.send("PING :still-connected").await;
+    alice.until("PONG").await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn artifact_http_rejects_redirects_oversized_and_malformed_replies() {
+    use axum::routing::post;
+    use axum::{Router, body::Body, http::Response, routing::get};
+    for (status, body, disposition) in [
+        (
+            503,
+            b"actor reply lost".to_vec(),
+            "attachment; filename=\"safe.png\"",
+        ),
+        (302, vec![], "attachment; filename=\"safe.png\""),
+        (200, vec![b'x'; 8193], "attachment; filename=\"safe.png\""),
+        (
+            200,
+            b"{}".to_vec(),
+            "attachment; filename=\"../unsafe.png\"",
+        ),
+        (
+            200,
+            vec![0; client::MAX_ARTIFACT_BYTES + 1],
+            "attachment; filename=\"safe.png\"",
+        ),
+    ] {
+        let valid_download = status == 200 && body.len() == 8193;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let redirect = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/stolen", redirect.local_addr().unwrap());
+        let handler = move || {
+            let body = body.clone();
+            let location = location.clone();
+            async move {
+                Response::builder()
+                    .status(status)
+                    .header("Location", location)
+                    .header("Content-Disposition", disposition)
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        };
+        let app = Router::new()
+            .route("/v1/channels/{channel}/artifacts", post(handler.clone()))
+            .route("/v1/artifacts/{id}", get(handler));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let fixture = Fixture::new();
+        let token = fixture.dir.path().join("token");
+        write_private(&token, TOKEN.as_bytes()).unwrap();
+        let config: ClientConfig = toml::from_str(&format!("host = '127.0.0.1'\nport = 1\ntls = false\naccount = 'alice'\nnick = 'alice'\ntoken_file = '{}'\nartifact_url = 'http://{endpoint}'\n", token.display())).unwrap();
+        let upload_error = client::upload_bytes(&config, "#work", "safe.png", b"test".to_vec())
+            .await
+            .unwrap_err();
+        assert!(upload_error.to_string().contains("outcome unconfirmed"));
+
+        let destination = fixture.dir.path().join("destination");
+        let result = client::download(
+            &config,
+            "12345678-1234-4234-8234-123456789012",
+            &destination,
+        )
+        .await;
+        if valid_download {
+            assert!(result.is_ok());
+            assert_eq!(std::fs::metadata(&destination).unwrap().len(), 8193);
+        } else {
+            assert!(result.is_err());
+            assert!(!destination.exists());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), redirect.accept())
+                .await
+                .is_err()
+        );
+        task.abort();
+    }
 }

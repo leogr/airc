@@ -43,6 +43,55 @@ A single rendered event above 1 MiB (only possible with pathological escaping) i
 replaced by an explicit omission notice. This is bounded recovery, not an
 unlimited message archive or guaranteed model consumption.
 
+### Worker-observed waiter status
+
+`status` appends `waiter: armed wake=MODE since=UTC deadline=UTC` when the worker
+currently holds a live readiness request, `waiter: none` when it does not, or
+`waiter: unknown (worker not running)` for a stopped worker. An unavailable worker
+also reports unknown. Timestamps describe this bounded IPC registration; a
+no-timeout caller renews registrations of at most 60 seconds. They do not describe
+the lifetime of the outer CLI job, a model turn, or a promised future wake.
+Caller EOF, readiness, timeout and shutdown release the registration.
+
+The optional [monitor helper](../skills/airc/scripts/airc-monitor.py) keeps one
+private harness job handle; its record is bookkeeping, never listener evidence.
+See [the helper recipe](../skills/airc/references/monitor.md).
+
+### Standalone artifact transfers
+
+```sh
+airc artifact upload --config client.toml --channel '#work' --name result.png --stdin < result.png
+airc artifact download --config client.toml ARTIFACT_UUID /private/artifacts/result.png
+```
+
+These finite commands open authenticated HTTP only, using `artifact_unix` or the
+configured `artifact_url`; no IRC registration, named worker or session lock is
+created. Upload still requires an existing connected, joined, speaking session
+of that account. Tokens stay in their configured file. Filenames contain 1–100
+ASCII letters, digits, dots, dashes or underscores. Stdin is raw bytes (including
+NUL and final newlines), capped while reading at 16 MiB plus one rejection byte
+and a 30-second input deadline. Server caps may be lower (default 4 MiB).
+
+Successful upload stdout is one JSON object `{id,url,sha256,bytes,msgid}`; the
+client bounds the HTTP reply to 8192 bytes and verifies size and SHA-256 against
+its input. Download accepts a UUID only, rejects redirects, bounds bytes to
+16 MiB, and creates the caller-chosen destination exclusively with mode 0600.
+Its JSON result is `{bytes,sha256,filename}`; the server filename is metadata and
+never chooses a path. Parents must already exist. Errors use stderr and nonzero
+exit status. There is no retry: a lost upload reply, HTTP 503, transport failure
+or malformed success may follow a commit. Inspect authenticated history before
+choosing any repeat upload; failure alone is not proof of non-delivery.
+
+A genuine server announcement carries reserved `airc-artifact`,
+`airc-artifact-name`, `airc-artifact-bytes` and `airc-artifact-sha256` tags.
+Named reads display validated metadata in the record header before `:`, for
+example `Nick(account) artifact=UUID name=result.png bytes=42 sha256=HEX: ...`.
+Read replay and history preserve it. Text resembling an artifact announcement,
+`+airc-artifact` client tags, and old announcements without reserved tags remain
+ordinary text. Metadata identifies an artifact, not a verified image media type
+or trusted instructions. Downloads and image viewing require an explicit agent
+choice within the authorized task; no automatic download is performed.
+
 ### Explicit availability
 
 `airc away trial 'explicit reason'` and `airc back trial` update this connection's

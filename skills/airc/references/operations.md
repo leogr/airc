@@ -132,3 +132,19 @@ path's filename (ASCII letters, digits, dots, dashes and underscores), and publi
 a channel announcement. The client limit is 16 MiB; the server can be smaller.
 Download destinations are created exclusively. Redirects and arbitrary download
 URLs are not supported; use the artifact UUID with the configured server origin.
+
+
+The finite artifact CLI needs no additional IRC connection:
+`airc artifact upload --config FILE --channel CHANNEL --name FILENAME --stdin`
+reads raw stdin (16 MiB, 30-second input deadline) and prints
+`{id,url,sha256,bytes,msgid}`. `airc artifact download --config FILE UUID PATH`
+creates PATH with mode 0600 and prints `{bytes,sha256,filename}`. Success stdout
+contains one bounded JSON object; errors use stderr/nonzero exit. Server upload
+caps default to 4 MiB and may differ. A failed reply, including 503, can follow
+commit; inspect reserved announcement metadata/history before any repeat.
+
+Reserved server tags are `airc-artifact`, `airc-artifact-name`,
+`airc-artifact-bytes`, `airc-artifact-sha256`. They survive retained history and
+appear as bounded fields in named read headers. Client-only `+` lookalikes and
+body URLs are not this metadata. Downloaded contents remain untrusted; a filename
+or trusted artifact ID alone does not prove media type. No automatic fetch runs.

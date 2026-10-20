@@ -1,6 +1,6 @@
 # Agent client and file operations
 
-Verification: `db271dabb0266cfa5e491ac056d6c064282d4a78` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `59064c6188658bf60131db6afc33ab7bbf45357c` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] Client config is strict, resolves credential/CA paths relative to its file,
 and requires TLS for remote connections unless plaintext is explicit. Tokens are
@@ -45,8 +45,17 @@ test keeps stdin open and requires quit to terminate. [3](#source-3) [1](#source
 account/token authentication. Upload bounds the file read to 16 MiB; download
 accepts a UUID, caps received bytes and creates the destination exclusively.
 Paths supplied to operations use the process working directory. The client
-reports bytes and SHA-256 without embedding credentials in URLs.
+reports bytes, SHA-256 and the bounded server filename without embedding credentials in URLs.
 [4](#source-4)
+
+[FACT] Standalone `artifact upload|download` dispatches before named-session
+storage and opens HTTP only. Raw stdin upload reads at most 16 MiB + 1 with a
+30-second deadline; success stdout is one JSON object and errors use stderr.
+Upload replies are capped at 8192 bytes and checked against the input's size/hash.
+HTTP non-success, including redirects, is rejected; no retry follows an ambiguous
+post-send failure. Named reads render complete validated reserved metadata in the
+header, retaining it in read replay/history. Fake body text and client-only tags
+cannot populate those fields. [15](#source-15) [16](#source-16)
 
 [FACT] Integration tests exercise SASL, the JSONL frontend, injection rejection,
 artifact upload/download and refusal to overwrite. A cursor test checks lost
@@ -66,20 +75,19 @@ under existing server visibility checks. [14](#source-14)
 
 ## Sources
 
-1. <a id="source-1"></a> [src/client.rs](../../src/client.rs#L20-L292) — configuration, token reading, connection startup and drop.
-2. <a id="source-2"></a> [src/client.rs](../../src/client.rs#L818-L911) — version 1 `run_frontend`; request types and IRC operation conversion nearby.
-3. <a id="source-3"></a> [src/bin/airc.rs](../../src/bin/airc.rs#L79-L96) — runtime shutdown after frontend termination.
-4. <a id="source-4"></a> [src/client.rs](../../src/client.rs#L1026-L1098) — fixed-origin HTTP client, bounded upload and exclusive download.
-5. <a id="source-5"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L425-L534) — SASL/JSONL and artifact round trip.
-6. <a id="source-6"></a> [src/client.rs](../../src/client.rs#L1101-L1229) — cursor-gap, pagination and pending-receipt tests.
-7. <a id="source-7"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L714-L758) — `client_quit_exits_with_stdin_still_open`.
-
-8. <a id="source-8"></a> [src/transport.rs](../../src/transport.rs#L26) — `connect`, `proxy_url`, bounded CONNECT and transport regressions.
-9. <a id="source-9"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L20) — `Proxy`, `proxy_sasl_and_artifact_round_trip`, `proxy_tls_requires_trust_and_checks_hostname`.
-
+1. <a id="source-1"></a> [src/client.rs](../../src/client.rs#L23-L493) — `ClientConfig`, token reading, `connect_with`, registration/JOIN setup and connection drop.
+2. <a id="source-2"></a> [src/client.rs](../../src/client.rs#L937-L1050) — version 1 `run_frontend`, bounded events and requests.
+3. <a id="source-3"></a> [src/bin/airc.rs](../../src/bin/airc.rs#L156-L173) — `main` runtime shutdown after frontend termination.
+4. <a id="source-4"></a> [src/client.rs](../../src/client.rs#L1157-L1327) — `http_client`, bounded `upload_bytes`, `artifact_response` and exclusive `download`.
+5. <a id="source-5"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L459-L568) — `frontend_scenario`, SASL/JSONL and artifact round trip.
+6. <a id="source-6"></a> [src/client.rs](../../src/client.rs#L1332-L1457) — pending-receipt matching and `cursor_pages_report_gaps_and_resume_without_skipping`.
+7. <a id="source-7"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L748-L792) — `client_quit_exits_with_stdin_still_open`.
+8. <a id="source-8"></a> [src/transport.rs](../../src/transport.rs#L26-L176) — `connect`, `proxy_url`, bounded CONNECT; transport regressions at L178–281.
+9. <a id="source-9"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L20-L71) — `Proxy`; `proxy_sasl_and_artifact_round_trip` at L464–568, `proxy_tls_requires_trust_and_checks_hostname` at L707–746.
 10. <a id="source-10"></a> [Named session evidence](named-sessions.md) — lifecycle, confirmation and bounded recovery.
-11. <a id="source-11"></a> [src/client.rs](../../src/client.rs#L169-L379) — `connect_with`, multiline negotiation, assembly and frame-group writer.
-12. <a id="source-12"></a> [src/client.rs](../../src/client.rs#L480-L816) — `frontend_with`, ring, `rejects`, `observe`, `run_frontend_v2`; `src/multiline.rs` `Assembler` and its tests.
-13. <a id="source-13"></a> [tests/managed.rs](../../tests/managed.rs#L569-L663) — JSONL v2 receipts and v1 fallback; pending-send unit regression in `src/client.rs` at L1105-L1147.
-
-14. <a id="source-14"></a> [src/client.rs](../../src/client.rs#L931-L1011) — `away_message`, `to_message`; `connect_with` requests away-notify and `presence_tests` validates operation mapping/bounds.
+11. <a id="source-11"></a> [src/client.rs](../../src/client.rs#L169-L493) — `connect_with`, multiline negotiation, assembly and frame-group writer.
+12. <a id="source-12"></a> [src/client.rs](../../src/client.rs#L599-L935) — `frontend_with`, ring, `rejects`, `observe`, `run_frontend_v2`; shared `src/multiline.rs` `Assembler` and its tests.
+13. <a id="source-13"></a> [tests/managed.rs](../../tests/managed.rs#L603-L698) — JSONL v2 receipts and v1 fallback; pending-send regression in `src/client.rs:1332–1374`.
+14. <a id="source-14"></a> [src/client.rs](../../src/client.rs#L1052-L1155) — `away_message`, `to_message`; `connect_with` negotiates away-notify, `presence_tests:1527–1559` validates bounds.
+15. <a id="source-15"></a> [src/bin/airc.rs](../../src/bin/airc.rs#L97-L195) — `ArtifactCommand`, `artifact_command` and early HTTP dispatch; `tests/collaboration.rs:1707–1912` tests CLI no-collision, caps, private exclusive paths, redirects/503 and malformed/oversized replies; `tests/managed.rs:86–208` tests Unix-only CLI download.
+16. <a id="source-16"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L352-L401) — header rendering; `artifact_metadata:785–816` and replay regression at L852–894.

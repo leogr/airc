@@ -2166,6 +2166,13 @@ impl State {
         );
         m.prefix = Some(self.prefix(sender));
         m.tags.insert("account".into(), account.into());
+        // Reserved non-client tags: normal and multiline input strip these.
+        // Store them in the same transaction as the artifact and announcement.
+        m.tags.insert("airc-artifact".into(), id.clone());
+        m.tags.insert("airc-artifact-name".into(), filename.into());
+        m.tags
+            .insert("airc-artifact-bytes".into(), data.len().to_string());
+        m.tags.insert("airc-artifact-sha256".into(), digest.clone());
         m.encode()?;
         self.store.append(
             &channel,

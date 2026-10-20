@@ -257,18 +257,18 @@ async fn typing_does_not_wake_read_and_concurrent_reader_is_rejected() {
     let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
     f.connect(&server).await;
     f.ok(&["read", "trial"]).await;
-    // Start a real IPC wait and synchronize acceptance through a second read.
+    // Measure the requested wait from submission, not after another CLI starts.
     let mut socket = BufReader::new(
         UnixStream::connect(f.root.join("trial/client.sock"))
             .await
             .unwrap(),
     );
+    let start = Instant::now();
     socket.get_mut().write_all(b"{\"version\":2,\"operation\":{\"op\":\"read\",\"wait\":1,\"limit\":50,\"again\":false}}\n").await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let duplicate = f.cli(&["read", "trial"]).await;
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stdout).contains("another read"));
-    let start = Instant::now();
     let mut typing = Message::new("TAGMSG", ["#work"]);
     typing.tags.insert("+typing".into(), "active".into());
     for _ in 0..30 {
@@ -385,7 +385,26 @@ async fn canceled_wait_releases_its_slot_and_shutdown_wakes_waiter() {
     let server = f.start().await;
     f.connect(&server).await;
     f.ok(&["read", "trial"]).await;
+    assert!(f.ok(&["status", "trial"]).await.contains("waiter: none"));
     let canceled = blocked_wait(&f).await;
+    let status = f.ok(&["status", "trial"]).await;
+    let waiter = status
+        .lines()
+        .find(|line| line.starts_with("waiter:"))
+        .unwrap();
+    assert!(
+        waiter.starts_with("waiter: armed wake=messages since="),
+        "{waiter}"
+    );
+    let (since, deadline) = waiter
+        .split_once(" since=")
+        .unwrap()
+        .1
+        .split_once(" deadline=")
+        .unwrap();
+    let since = chrono::DateTime::parse_from_rfc3339(since).unwrap();
+    let deadline = chrono::DateTime::parse_from_rfc3339(deadline).unwrap();
+    assert!((deadline - since).num_seconds() <= 60);
     drop(canceled);
     // Read-only status remains available while the canceled socket unwinds.
     timeout(Duration::from_secs(5), async {
@@ -402,6 +421,7 @@ async fn canceled_wait_releases_its_slot_and_shutdown_wakes_waiter() {
     .await
     .unwrap();
     assert!(f.ok(&["status", "trial"]).await.starts_with("connected"));
+    assert!(f.ok(&["status", "trial"]).await.contains("waiter: none"));
     let mut waiting = blocked_wait(&f).await;
     f.ok(&["disconnect", "trial"]).await;
     let line = timeout(Duration::from_secs(5), read_line(&mut waiting, 16384))
@@ -535,6 +555,10 @@ async fn killed_worker_reports_unclean_exit_and_recovers_without_losing_read_rep
     let status = f.ok(&["status", "trial"]).await;
     assert!(
         status.starts_with("stopped") && status.contains("without a recorded shutdown"),
+        "{status}"
+    );
+    assert!(
+        status.contains("waiter: unknown (worker not running)"),
         "{status}"
     );
     assert_eq!(f.ok(&["read", "trial", "--again"]).await, batch);

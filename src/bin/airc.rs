@@ -20,6 +20,11 @@ struct Args {
 enum Command {
     /// Print the machine-readable supported-feature probe as JSON.
     Features,
+    /// Transfer an artifact using authenticated HTTP only; no IRC connection.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
     /// Start a named persistent connection, or explicitly reconnect a stopped one.
     Connect {
         session: String,
@@ -92,12 +97,68 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ArtifactCommand {
+    /// Upload raw stdin once. Requires an existing joined speaking session.
+    Upload {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, required = true)]
+        stdin: bool,
+    },
+    /// Download a UUID into a new private file; refuses URLs and overwrites.
+    Download {
+        #[arg(long)]
+        config: PathBuf,
+        artifact: String,
+        path: PathBuf,
+    },
+}
+
+async fn artifact_command(command: ArtifactCommand) -> Result<()> {
+    let value = match command {
+        ArtifactCommand::Upload {
+            config,
+            channel,
+            name,
+            stdin: _,
+        } => {
+            use tokio::io::AsyncReadExt;
+            let config = airc::client::ClientConfig::load(&config)?;
+            let mut bytes = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                tokio::io::stdin()
+                    .take(airc::client::MAX_ARTIFACT_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("artifact stdin timed out"))??;
+            airc::client::upload_bytes(&config, &channel, &name, bytes).await?
+        }
+        ArtifactCommand::Download {
+            config,
+            artifact,
+            path,
+        } => {
+            let config = airc::client::ClientConfig::load(&config)?;
+            airc::client::download(&config, &artifact, &path).await?
+        }
+    };
+    println!("{value}");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let named = args.command.is_some();
+    let named = args.command.is_some() && !matches!(args.command, Some(Command::Artifact { .. }));
     let result = runtime.block_on(run(args));
     // Tokio stdin uses an uncancellable blocking read. After explicit quit, do
     // not require the caller to close its pipe or type another character.
@@ -121,6 +182,10 @@ async fn run(args: Args) -> Result<()> {
             args.config.is_none(),
             "use connect SESSION --config FILE, or --config FILE alone for JSONL"
         );
+        let command = match command {
+            Command::Artifact { command } => return artifact_command(command).await,
+            command => command,
+        };
         #[cfg(unix)]
         {
             use airc::agent_session::{self as sessions, Operation};
@@ -228,7 +293,9 @@ async fn run(args: Args) -> Result<()> {
                 Command::Disconnect { session } => {
                     sessions::call(&root, &session, Operation::Disconnect).await?
                 }
-                Command::Features => unreachable!("handled before named sessions"),
+                Command::Features | Command::Artifact { .. } => {
+                    unreachable!("handled before named sessions")
+                }
                 Command::SessionWorker { session, config } => {
                     return sessions::worker(&root, &session, &config).await;
                 }

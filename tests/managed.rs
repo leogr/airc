@@ -156,6 +156,37 @@ async fn unix_mode_serves_irc_and_artifacts_without_tcp() {
     .unwrap();
     assert!(announced.params[1].contains(&url), "{announced:?}");
     assert_eq!(announced.tags["account"], "alice");
+    // The standalone CLI uses the same Unix-only authenticated HTTP path,
+    // while alice's original IRC connection remains active.
+    let client_path = dir.path().join("alice.toml");
+    std::fs::write(
+        &client_path,
+        toml::to_string(&member(dir.path(), &config, "alice")).unwrap(),
+    )
+    .unwrap();
+    let cli_destination = dir.path().join("cli-copy.txt");
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+            .args(["artifact", "download", "--config"])
+            .arg(&client_path)
+            .arg(uploaded["result"]["id"].as_str().unwrap())
+            .arg(&cli_destination)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cli_destination).unwrap(),
+        "unix artifact"
+    );
     requests
         .write_all(b"{\"id\":3,\"op\":\"quit\"}\n")
         .await

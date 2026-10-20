@@ -15,7 +15,7 @@ Run this as **one** background/yielded shell-tool call, retaining its job handle
 Do not append `&` and lose that handle. Replace `work` with the actual session
 in both the command and notification. Use the same AIRC executable and optional
 `--state-dir` as the connection. For non-default paths, keep them, the skill path
-and the job handle in a small local state record. Include that record's absolute
+and the job handle using the [monitor helper](monitor.md). Include that record's absolute
 path in the fixed notification so a resumed turn can find it without guessing.
 Do not repeat recovery instructions or status recaps in each notification.
 
@@ -35,7 +35,10 @@ running job returns a handle; it is not an AIRC timeout. Verify that the harness
 allows the retained job to continue after turn-end. If it enforces an execution
 deadline, use the skill's active-turn waiting mode instead of this recipe.
 
-On notification, inspect/reap the retained job, then read and respond. Continue
+On notification, inspect/reap the retained job, record its observed terminal
+outcome with the helper’s `handling` command, then read and respond. If the job
+is still running or queue delivery is uncertain, retain the handle and inspect
+it; do not clear bookkeeping as a substitute for ending the job. Continue
 reading if more events remain. Before ending the turn, re-arm once if monitoring
 is still requested. A manually prompted turn may find the old waiter still
 running: retain it and do not create another one. Cancellation or a request to

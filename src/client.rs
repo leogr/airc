@@ -1191,55 +1191,137 @@ async fn upload(config: &ClientConfig, channel: &str, path: &Path) -> Result<Val
     let file = tokio::fs::File::open(path).await?;
     let metadata = file.metadata().await?;
     ensure!(
-        metadata.is_file() && metadata.len() <= 16 * 1024 * 1024,
+        metadata.is_file() && metadata.len() <= MAX_ARTIFACT_BYTES as u64,
         "upload requires a regular file of at most 16 MiB"
     );
     let mut bytes = Vec::new();
-    file.take(16 * 1024 * 1024 + 1)
+    file.take(MAX_ARTIFACT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .await?;
-    ensure!(bytes.len() <= 16 * 1024 * 1024, "file too large");
+    ensure!(bytes.len() <= MAX_ARTIFACT_BYTES, "file too large");
     let filename = path
         .file_name()
         .and_then(|s| s.to_str())
         .context("invalid filename")?;
+    upload_bytes(config, channel, filename, bytes).await
+}
+
+/// Client-side upload/download ceiling; managed servers may impose a lower cap.
+pub const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ARTIFACT_REPLY: usize = 8192;
+
+fn valid_artifact_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename.len() <= 100
+        && filename
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+async fn artifact_response(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    response.error_for_status_ref()?;
+    ensure!(
+        response.status().is_success(),
+        "artifact redirects are not supported"
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            chunk.len() <= limit.saturating_sub(bytes.len()),
+            "artifact response too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// One authenticated HTTP upload, without opening an IRC connection or retrying.
+pub async fn upload_bytes(
+    config: &ClientConfig,
+    channel: &str,
+    filename: &str,
+    bytes: Vec<u8>,
+) -> Result<Value> {
+    ensure!(valid_channel(channel), "invalid channel");
+    ensure!(
+        valid_artifact_filename(filename),
+        "filename must use 1–100 letters, digits, dots, dashes or underscores"
+    );
+    ensure!(bytes.len() <= MAX_ARTIFACT_BYTES, "upload exceeds 16 MiB");
+    let size = bytes.len();
+    let digest = crate::config::token_hash_bytes(&bytes);
     let base = artifact_origin(config)?;
     let mut url = reqwest::Url::parse(base)?;
     url.path_segments_mut()
         .map_err(|_| anyhow::anyhow!("invalid artifact URL"))?
         .extend(["v1", "channels", channel, "artifacts"]);
-    let response = http_client(config)?
-        .post(url)
-        .basic_auth(&config.account, Some(config.token()?))
-        .header("x-airc-filename", filename)
-        .body(bytes)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
-}
-async fn download(config: &ClientConfig, artifact: &str, path: &Path) -> Result<Value> {
-    uuid::Uuid::parse_str(artifact).context("artifact must be an ID, not a URL")?;
-    let base = artifact_origin(config)?;
-    let mut response = http_client(config)?
-        .get(format!(
-            "{}/v1/artifacts/{artifact}",
-            base.trim_end_matches('/')
-        ))
-        .basic_auth(&config.account, Some(config.token()?))
-        .send()
-        .await?
-        .error_for_status()?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    let result: Result<Value> = async {
+        let response = http_client(config)?
+            .post(url)
+            .basic_auth(&config.account, Some(config.token()?))
+            .header("x-airc-filename", filename)
+            .body(bytes)
+            .send()
+            .await?
+            .error_for_status()?;
+        let value: Value =
+            serde_json::from_slice(&artifact_response(response, MAX_ARTIFACT_REPLY).await?)?;
+        let id = value["id"].as_str().context("missing artifact ID")?;
+        uuid::Uuid::parse_str(id).context("invalid artifact ID")?;
+        let url = value["url"].as_str().context("missing artifact URL")?;
+        let parsed = reqwest::Url::parse(url)?;
         ensure!(
-            bytes.len() + chunk.len() <= 16 * 1024 * 1024,
-            "artifact too large"
+            url.len() <= 2048
+                && matches!(parsed.scheme(), "http" | "https")
+                && parsed.username().is_empty()
+                && parsed.password().is_none(),
+            "invalid artifact URL"
         );
-        bytes.extend_from_slice(&chunk);
+        ensure!(
+            value["bytes"].as_u64() == Some(size as u64)
+                && value["sha256"].as_str() == Some(&digest),
+            "artifact upload digest/size mismatch; inspect history before retrying"
+        );
+        let msgid = value["msgid"].as_str().context("missing artifact msgid")?;
+        ensure!(
+            !msgid.is_empty() && msgid.len() <= 128 && msgid.bytes().all(|b| b.is_ascii_graphic()),
+            "invalid artifact msgid"
+        );
+        Ok(json!({"id":id, "url":url, "sha256":digest, "bytes":size, "msgid":msgid}))
     }
+    .await;
+    result.context("upload outcome unconfirmed; inspect authenticated history before retrying")
+}
+
+/// Download a UUID from the configured origin into a new private local file.
+/// The returned server filename is metadata only; it never selects the path.
+pub async fn download(config: &ClientConfig, artifact: &str, path: &Path) -> Result<Value> {
+    let id = uuid::Uuid::parse_str(artifact).context("artifact must be an ID, not a URL")?;
+    let base = artifact_origin(config)?;
+    let response = http_client(config)?
+        .get(format!("{}/v1/artifacts/{id}", base.trim_end_matches('/')))
+        .basic_auth(&config.account, Some(config.token()?))
+        .send()
+        .await?;
+    response.error_for_status_ref()?;
+    ensure!(
+        response.status().is_success(),
+        "artifact redirects are not supported"
+    );
+    let filename = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("attachment; filename=\""))
+        .and_then(|h| h.strip_suffix('"'))
+        .filter(|name| valid_artifact_filename(name))
+        .context("invalid artifact filename response")?
+        .to_owned();
+    let bytes = artifact_response(response, MAX_ARTIFACT_BYTES).await?;
     crate::config::write_private(path, &bytes)?;
-    Ok(json!({"bytes":bytes.len(),"sha256":crate::config::token_hash_bytes(&bytes)}))
+    Ok(
+        json!({"bytes":bytes.len(),"sha256":crate::config::token_hash_bytes(&bytes),"filename":filename}),
+    )
 }
 
 #[cfg(test)]

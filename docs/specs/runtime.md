@@ -34,7 +34,9 @@ TLS verification and endpoint authorization remain independent. [3](#source-3)
 [FACT] Uploading requires channel membership and speaking permission. Download
 access follows current configured membership. URLs contain no credentials;
 client downloads use the configured origin, reject redirects and create a new
-destination exclusively. [1](#source-1) [3](#source-3)
+destination exclusively. Standalone artifact CLI calls open HTTP only and coexist
+with a named IRC client; reserved announcement tags persist with the artifact
+and identify it without parsing participant text. [1](#source-1) [3](#source-3)
 
 [DERIVED] A successful queued request, durable database commit, live delivery
 and complete retained catch-up establish different things. Recovery must inspect
@@ -53,7 +55,9 @@ connected when channels are refused. [6](#source-6)
 
 [FACT] Named readiness waits do not consume events or replace read replay.
 They renew bounded idle requests and stop on errors/disconnects. Agent turn
-scheduling remains the harness's responsibility. [4](#source-4)
+scheduling remains the harness's responsibility. Status exposes only the worker's
+current registration; optional private handle bookkeeping never proves a wake.
+[4](#source-4) [7](#source-7)
 
 ## Sources
 
@@ -64,3 +68,5 @@ scheduling remains the harness's responsibility. [4](#source-4)
 4. <a id="source-4"></a> [Named session persistence](../digests/named-sessions.md).
 5. <a id="source-5"></a> [Managed transport evidence](../digests/managed-transport.md).
 6. <a id="source-6"></a> [Named channel controls](../digests/named-channels.md).
+
+7. <a id="source-7"></a> [Monitor evidence](../digests/monitor.md).

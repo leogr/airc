@@ -190,10 +190,32 @@ struct WaitingRead {
     reply: oneshot::Sender<Response>,
 }
 struct WaitingNotice {
+    armed_at: chrono::DateTime<chrono::Utc>,
     until: Instant,
     wake: Wake,
     reply: oneshot::Sender<Response>,
 }
+fn waiter_status(waiter: Option<&WaitingNotice>) -> String {
+    let Some(waiter) = waiter.filter(|w| !w.reply.is_closed() && w.until > Instant::now()) else {
+        return "waiter: none\n".into();
+    };
+    let wake = match waiter.wake {
+        Wake::All => "all",
+        Wake::Messages => "messages",
+        Wake::Mentions => "mentions",
+    };
+    let deadline = chrono::Utc::now()
+        + chrono::Duration::from_std(waiter.until.saturating_duration_since(Instant::now()))
+            .unwrap_or_default();
+    format!(
+        "waiter: armed wake={wake} since={} deadline={}\n",
+        waiter
+            .armed_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    )
+}
+
 struct WaitingSend {
     until: Instant,
     token: String,
@@ -291,16 +313,19 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
             if ownership.is_err() && matches!(operation, Operation::Status) {
                 return Ok(Response::ok(match store.load()? {
                     Some(state) => format!(
-                        "! Session is starting/stopping or unavailable; saved state follows.\n{}",
+                        "! Session is starting/stopping or unavailable; saved state follows.\n{}waiter: unknown (worker unavailable)\n",
                         state.describe(true).replacen("connected", "unavailable", 1)
                     ),
-                    None => "Session is starting; no saved state yet.\n".into(),
+                    None => "Session is starting; no saved state yet.\nwaiter: unknown (worker unavailable)\n".into(),
                 }));
             }
             let _lock = ownership?;
             let state = store.load()?;
             return Ok(match (operation, state) {
-                (Operation::Status, Some(state)) => Response::ok(state.describe(false)),
+                (Operation::Status, Some(state)) => Response::ok(format!(
+                    "{}waiter: unknown (worker not running)\n",
+                    state.describe(false)
+                )),
                 (Operation::Read { again: true, .. }, Some(state)) => Response::ok(state.last_read),
                 (Operation::Disconnect, _) => Response::ok("Already stopped.\n"),
                 _ => Response::error(format!(
@@ -601,10 +626,10 @@ async fn serve(
                         if waiter.as_ref().is_some_and(|w| !w.reply.is_closed()) {
                             let _ = call.reply.send(Response::error("another waiter is active; keep one waiter per session"));
                         } else {
-                            waiter = Some(WaitingNotice { until: Instant::now() + Duration::from_secs(wait), wake, reply: call.reply });
+                            waiter = Some(WaitingNotice { armed_at: chrono::Utc::now(), until: Instant::now() + Duration::from_secs(wait), wake, reply: call.reply });
                         }
                     }
-                    Operation::Status => { let _ = call.reply.send(Response::ok(state.describe(true))); }
+                    Operation::Status => { let _ = call.reply.send(Response::ok(format!("{}{}", state.describe(true), waiter_status(waiter.as_ref())))); }
                     Operation::Disconnect => {
                         state.status = "explicitly disconnected".into();
                         store.save(state)?;

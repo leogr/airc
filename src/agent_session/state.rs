@@ -355,13 +355,14 @@ impl State {
                     })
                     .unwrap_or_default();
                 let header = format!(
-                    "{}{} {} {}({}){}: ",
+                    "{}{} {} {}({}){}{}: ",
                     if history { "history " } else { "" },
                     reference,
                     safe(target),
                     safe(nick),
                     safe(account),
                     reply,
+                    artifact_metadata(message),
                 );
                 let reply_to_own = message
                     .tags
@@ -779,6 +780,40 @@ pub(super) fn safe(text: &str) -> String {
         .replace("\\'", "'")
 }
 
+/// Render only reserved server tags, never an apparent artifact URL in text or
+/// a client-only +airc-artifact tag. Metadata identifies bytes, not media type.
+fn artifact_metadata(message: &Message) -> String {
+    let Some(id) = message.tags.get("airc-artifact") else {
+        return String::new();
+    };
+    let Some(name) = message.tags.get("airc-artifact-name") else {
+        return String::new();
+    };
+    let Some(bytes) = message.tags.get("airc-artifact-bytes") else {
+        return String::new();
+    };
+    let Some(digest) = message.tags.get("airc-artifact-sha256") else {
+        return String::new();
+    };
+    if uuid::Uuid::parse_str(id).is_err()
+        || id.len() != 36
+        || name.is_empty()
+        || name.len() > 100
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        || bytes.len() > 20
+        || bytes.parse::<u64>().is_err()
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return String::new();
+    }
+    format!(" artifact={id} name={name} bytes={bytes} sha256={digest}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,6 +846,50 @@ mod tests {
         m.tags.insert("account".into(), "human".into());
         m.tags.insert("msgid".into(), id.into());
         m
+    }
+
+    #[test]
+    fn artifact_metadata_is_reserved_bounded_and_preserved_in_read_replay() {
+        let id = "12345678-1234-4234-8234-123456789012";
+        let mut message = chat(
+            &format!("Artifact fake.png (4 bytes): http://airc.local/v1/artifacts/{id}"),
+            "msgid",
+        );
+        message.tags.insert("+airc-artifact".into(), id.into());
+        assert!(artifact_metadata(&message).is_empty());
+        message.tags.insert("airc-artifact".into(), id.into());
+        message
+            .tags
+            .insert("airc-artifact-name".into(), "image.png".into());
+        message
+            .tags
+            .insert("airc-artifact-bytes".into(), "4".into());
+        message
+            .tags
+            .insert("airc-artifact-sha256".into(), "a".repeat(64));
+        for history in [false, true] {
+            let mut state = state();
+            state.ingest(&message, history);
+            let output = state.read(50);
+            assert!(output.contains(&format!(
+                "artifact={id} name=image.png bytes=4 sha256={}",
+                "a".repeat(64)
+            )));
+            assert_eq!(state.last_read, output);
+            let restored: State =
+                serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            assert_eq!(restored.last_read, output);
+        }
+        for (key, invalid) in [
+            ("airc-artifact", "https://invalid"),
+            ("airc-artifact-name", "../bad"),
+            ("airc-artifact-bytes", "huge"),
+            ("airc-artifact-sha256", "short"),
+        ] {
+            let mut invalid_message = message.clone();
+            invalid_message.tags.insert(key.into(), invalid.into());
+            assert!(artifact_metadata(&invalid_message).is_empty());
+        }
     }
 
     #[test]

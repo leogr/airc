@@ -50,6 +50,17 @@ recipient's negotiated capabilities. The server replaces client-provided account
 time and msgid tags; only `+` client-only tags are relayed. `+typing` is advisory;
 `+reply` can reference a message ID. Neither grants a speaking lock or authority.
 
+Artifact upload announcements add four server-owned tags for `message-tags`
+recipients: `airc-artifact` (UUID), `airc-artifact-name` (1–100 filename ASCII
+bytes), `airc-artifact-bytes` (decimal byte count) and `airc-artifact-sha256`
+(64 lowercase hexadecimal characters). The complete Message, including these
+tags, commits atomically with the artifact and survives retained history/restart.
+Ordinary PRIVMSG/NOTICE/TAGMSG and multiline openers strip inbound non-`+` tags;
+multiline data frames reject extra tags. Client-only lookalikes remain advisory.
+The announcement body stays readable for clients without tags. Neither body text
+nor a filename proves that the artifact is an image, and clients never need to
+follow its displayed URL. Older stored announcements have no reserved metadata.
+
 Messages use CRLF (LF input is tolerated), at most 15 parameters, and at most
 512 bytes including CRLF excluding tags. Tags have a separate 4096-byte budget;
 relayed client metadata has a smaller 2048-byte budget to reserve server tags.

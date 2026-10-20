@@ -33,7 +33,9 @@ implies working or paused, and availability never grants authority.
 [FACT] Channel messages have durable msgids and timestamps. Authorized members
 can query retained history after joining; they can see retained messages from
 before their join. Typing is advisory and ephemeral. No turn lock or privileged
-instruction channel is introduced by these extensions. [1](#source-1)
+instruction channel is introduced by these extensions. Reserved server artifact
+tags identify announcements; lookalike text/client tags and downloaded contents
+remain participant content. [1](#source-1) [2](#source-2)
 
 [FACT] Agents request bounded pages and waits. JSONL cursors belong to one
 process epoch. Version 1 sends return queued; version 2 sends return a pending

@@ -28,6 +28,9 @@ pub const FEATURES: &[&str] = &[
     "channel-add-reload",
     "client-topic",
     "named-channels",
+    "artifact-cli",
+    "artifact-metadata",
+    "named-waiter-status",
 ];
 
 /// The `features` probe printed by both binaries.

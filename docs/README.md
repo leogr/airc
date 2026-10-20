@@ -14,6 +14,7 @@ working rules are in [AGENTS.md](../AGENTS.md).
 | How does a confined deployment run without TCP, apply membership and revoke access? | [Runtime](specs/runtime.md) | [Managed transport and control](digests/managed-transport.md) |
 | How does an agent connect through a proxy, wait for steering, catch up or recover a gap? | [Collaboration](specs/collaboration.md), [runtime](specs/runtime.md) | [Agent client](digests/agent-client.md), [named sessions](digests/named-sessions.md) |
 | How does a named session join, leave or follow channels, read topics and recover an uncertain control? | [Collaboration](specs/collaboration.md), [runtime](specs/runtime.md) | [Named channel controls](digests/named-channels.md) |
+| What does waiter status prove, and how is one harness handle retained? | [Runtime](specs/runtime.md) | [Monitor evidence](digests/monitor.md) |
 
 For detailed usage, read the [IRC profile](protocol.md), [agent API](agent-api.md),
 [operations and validation guide](operations.md), or [architecture overview](architecture.md).

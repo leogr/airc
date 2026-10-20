@@ -10,6 +10,7 @@ lint:
 	$(CARGO) clippy --locked --all-targets -- -D warnings
 test:
 	$(CARGO) test --locked --all-targets
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s scripts -p 'test_airc_monitor.py'
 docs-check:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --locked --no-deps
 	$(PYTHON) scripts/check-docs.py
