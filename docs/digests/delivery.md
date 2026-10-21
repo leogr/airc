@@ -1,6 +1,6 @@
 # Named delivery and context lookup
 
-Verification: `a9d1d9bbf24858c64e1ce2c398ee7a2ec1e0c5a9` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `b1e88a82d83554b94ff53a04cb2fa8563bf6e37b` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] Saved named state version 3 adds one optional delivery record: its own
 cursor, a lost-relevance summary, at most one pending batch and the last
@@ -37,23 +37,20 @@ cursor, pending ID/range, last outcome, kind, pid and request times.
 [3](#source-3) [4](#source-4) [7](#source-7)
 
 [FACT] `wait --deliver` prints, flushes, then accepts. `subscribe` spawns its
-adapter argv directly (no shell) in its own process group with
-`kill_on_drop`, batch on stdin, `AIRC_SESSION`, `AIRC_DELIVERY_ID`,
+adapter argv directly (no shell, own process group, `kill_on_drop`), batch on stdin, `AIRC_SESSION`, `AIRC_DELIVERY_ID`,
 `AIRC_DELIVERY_RETRY` and `AIRC_SUBSCRIBER_PID` in the environment, inherited
 stdout and the last 4 KiB of stderr captured. Exit 0 within `--sink-timeout`
 accepts; any other outcome leaves the batch pending and ends `subscribe` with
 exit 1. Only the direct child is killed; its descendants are not.
 [4](#source-4) [7](#source-7)
 
-[FACT] `show` resolves `@N`, `msgid:ID` or a raw msgid, walks up to eight reply
-ancestors through retained records, and otherwise queues one correlated
-`CHATHISTORY AROUND <channel> msgid=<id> 1` per missing channel ancestor; a
-private-message ancestor is reported, never fetched. Each lookup result carries
-its msgid and only the show that requested it claims it, so a stale result is
-discarded. Non-multiline fallback lines are assembled within the join byte
-bound. Lookups never enter the transcript or checkpoints, are refused when
-history is quarantined, and report unretained messages as errors. One show
-fetches at a time.
+[FACT] `show` resolves `@N`, `msgid:ID` or a raw msgid and walks up to eight
+reply ancestors through retained records, else queues one correlated
+`CHATHISTORY AROUND <channel> msgid=<id> 1` per missing channel ancestor;
+private-message ancestors are reported, never fetched. Only the requesting show
+claims a result, by msgid. Fallback lines assemble within the join bound.
+Lookups never enter the transcript or checkpoints, are refused while history is
+quarantined, report unretained messages as errors and run one at a time.
 [3](#source-3) [5](#source-5) [8](#source-8)
 
 [FACT] `@all`/`@here` match only as a standalone word preceded by start,
@@ -64,28 +61,41 @@ backtick spans. [9](#source-9)
 checks the header ID against `AIRC_DELIVERY_ID` and its parent against
 `AIRC_SUBSCRIBER_PID`, then runs `codex queue --thread ID --message BATCH` with
 literal argv. It accepts only a clean exit whose bounded stdout matches
-`Queued message … for thread <ID>.`. It exits 3 when nothing was sent and 4
-when the outcome is uncertain; the queue call is killed after 30 seconds, and
-output is bounded and escaped. [10](#source-10) [11](#source-11)
+`Queued message … for thread <ID>.`, exits 3 when nothing was sent and 4 when
+uncertain, kills the queue call after 30 seconds and escapes bounded output. [10](#source-10) [11](#source-11)
 
-[FACT] Tests cover cursor separation, mentions context counts, complete-record
-splitting, truncation, durable unique pending IDs, eviction gaps,
-version upgrade, manual reads during delivery, failed sinks, a pending batch
-kept across explicit disconnect/connect, ID-bound retry/accept/drop, consumer exclusivity, adapter
-environment and show history gaps. Adapter tests use a fake `codex` and do not
-themselves establish live turns; the operations guide records the separate live
-codex-cli 0.163.0 check and its limits. [6](#source-6) [7](#source-7) [8](#source-8) [11](#source-11)
+[FACT] `subscribe --wrap N` (64–65536) splits each line after the header
+longer than N bytes at char boundaries before the sink sees it; continuations
+start with `| `, so no split begins a record- or header-like line. `bytes=`
+counts unwrapped records. [2](#source-2) [12](#source-12)
+
+[FACT] The `airc-delivery` Claude Code plugin's monitor launcher is silent
+without `AIRC_DELIVERY_SESSION`. It polls `status` for `connected;` (1–30 s
+backoff), pauses 2 s once if a consumer is still registered, runs
+`subscribe --wake ${AIRC_DELIVERY_WAKE:-mentions} --min-interval 15
+--max-bytes 2560 --wrap 480 -- -` (stderr merged), forwards HUP/INT/TERM and
+prints one `AIRC delivery stopped: …` line after it exits. [13](#source-13) [14](#source-14)
+
+[FACT] Tests cover cursors, context counts, record splitting and truncation,
+pending IDs, eviction gaps, upgrade, reads during delivery, failed sinks,
+pending batches across reconnect, ID-bound recovery, consumer exclusivity,
+adapter environment, show gaps and wrapped stdout. Adapter and launcher tests
+use fakes, not live turns; the operations guide records live checks. [6](#source-6) [7](#source-7) [8](#source-8) [11](#source-11) [14](#source-14) [15](#source-15)
 
 ## Sources
 
-1. <a id="source-1"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L591-L796) — `begin_delivery`, `delivery_readiness`, `prepare_delivery`, `finish_delivery`, `revert_delivery`, `describe_delivery`; `VERSION` and `upgrade` at L33 and L879–893.
-2. <a id="source-2"></a> [src/agent_session/delivery.rs](../../src/agent_session/delivery.rs#L1-L254) — `Delivery`, `Lost`, `Batch`, `Header::open`/`bound`, `prefix` and unit tests.
-3. <a id="source-3"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1217-L1342) — `serve` handling of `Consume`, `Deliver`, `Accept`, `DropPending`, `Deliveries` and `Show`; `revert_delivery` call at L1524.
-4. <a id="source-4"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L283-L320) — `Consumer`, `consumer_status`, `pending_refusal`, `recovery`; `deliver` and `run_sink` at L713–968.
-5. <a id="source-5"></a> [src/agent_session/history.rs](../../src/agent_session/history.rs#L127-L151) — `lookup`, `take_lookup`; AROUND request at L210; correlation test at L792.
-6. <a id="source-6"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L1419-L1704) — delivery unit tests from `delivering` to `evicting_a_pending_batchs_own_events_is_not_a_gap`.
-7. <a id="source-7"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1621-L1853) — `wait_deliver_prints_only_mentions_and_manual_reads_never_steal`, `failed_sinks_leave_one_pending_batch_until_explicit_id_bound_recovery`; `subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_slot` at L1918.
-8. <a id="source-8"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1854-L1917) — `show_prints_reply_ancestors_without_consuming_and_reports_history_gaps`; `ShowWalk`, DM short-circuit and `claim_lookup` in `src/agent_session/mod.rs` at L326–445; r2 regressions in its tests from L1690.
+1. <a id="source-1"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L591-L796) — delivery state methods; `VERSION` and `upgrade` at L33 and L879–893.
+2. <a id="source-2"></a> [src/agent_session/delivery.rs](../../src/agent_session/delivery.rs#L1-L320) — batch types, header, `prefix`, `wrap` and unit tests.
+3. <a id="source-3"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1232-L1357) — `serve` delivery and show operations; `revert_delivery` call at L1539.
+4. <a id="source-4"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L283-L320) — consumer status and refusals; `deliver` and `run_sink` at L716–983.
+5. <a id="source-5"></a> [src/agent_session/history.rs](../../src/agent_session/history.rs#L127-L151) — lookups; AROUND request at L210; test at L792.
+6. <a id="source-6"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L1419-L1704) — delivery unit tests.
+7. <a id="source-7"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1621-L1853) — delivery regressions; `subscribe` test at L1918.
+8. <a id="source-8"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1854-L1917) — show regression; `ShowWalk` and `claim_lookup` in `src/agent_session/mod.rs` at L326–445.
 9. <a id="source-9"></a> [src/agent_session/attention.rs](../../src/agent_session/attention.rs#L153-L175) — `broadcast`; test `only_explicit_bounded_all_and_here_broadcast` at L588.
-10. <a id="source-10"></a> [src/bin/airc-codex.rs](../../src/bin/airc-codex.rs#L1-L297) — constants, `main`, `classify`, `run_bounded`, `read_batch`, `check_delivery_id`, `check_subscriber`, `queued_receipt`.
-11. <a id="source-11"></a> [tests/codex_adapter.rs](../../tests/codex_adapter.rs#L1-L183) — fake-`codex` argv, refusal, lost-subscriber, uncertain, noisy-stderr and lingering-descendant tests; unit tests in `src/bin/airc-codex.rs` from L298.
+10. <a id="source-10"></a> [src/bin/airc-codex.rs](../../src/bin/airc-codex.rs#L1-L297) — adapter bounds, checks, queue call and receipt classification.
+11. <a id="source-11"></a> [tests/codex_adapter.rs](../../tests/codex_adapter.rs#L1-L183) — fake-`codex` adapter tests; unit tests in `src/bin/airc-codex.rs` from L298.
+12. <a id="source-12"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L686-L698) — `DeliverOptions::wrap`; checked at L733–740, applied at L831–834.
+13. <a id="source-13"></a> [integrations/claude-plugin/scripts/airc-delivery](../../integrations/claude-plugin/scripts/airc-delivery#L1-L41) — launcher, run by `monitors/monitors.json`.
+14. <a id="source-14"></a> [tests/claude_plugin.rs](../../tests/claude_plugin.rs#L1-L236) — launcher tests with a fake `airc`.
+15. <a id="source-15"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2030-L2096) — `subscribe_wrap_splits_long_stdout_lines_into_continuations`.

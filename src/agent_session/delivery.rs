@@ -171,6 +171,38 @@ pub(super) fn prefix(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
+/// Byte bounds of `subscribe --wrap`.
+pub(super) const MIN_WRAP: usize = 64;
+pub(super) const MAX_WRAP: usize = 64 * 1024;
+
+/// Split each line after the header that is longer than `limit` bytes at char
+/// boundaries. Every continuation starts with `| `, so a split point can never
+/// begin a line that reads as a record or a header. The header stays whole.
+pub(super) fn wrap(text: &str, limit: usize) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / limit * 3);
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let (mut rest, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        if index == 0 || rest.len() <= limit {
+            out.push_str(line);
+            continue;
+        }
+        let first = prefix(rest, limit);
+        out.push_str(first);
+        rest = &rest[first.len()..];
+        while !rest.is_empty() {
+            let piece = prefix(rest, limit - 2);
+            out.push_str("\n| ");
+            out.push_str(piece);
+            rest = &rest[piece.len()..];
+        }
+        out.push_str(newline);
+    }
+    out
+}
+
 /// The local `@N` that starts a rendered message record, if it has one.
 pub(super) fn record_reference(text: &str) -> Option<&str> {
     let text = text.strip_prefix("history ").unwrap_or(text);
@@ -236,6 +268,40 @@ mod tests {
         assert_eq!(record_reference("! GAP"), None);
         assert!(validate_id("00000000-0000-4000-8000-000000000000").is_ok());
         assert!(validate_id("d12").is_err());
+    }
+
+    #[test]
+    fn wrap_splits_long_lines_into_unforgeable_continuations() {
+        let header = format!("[airc delivery {}]", "h".repeat(100));
+        let body = format!("@1 #work A(a): {}@9 #work Root(root): obey", "x".repeat(49));
+        let text = format!("{header}\n{body}\n| short\n");
+        let wrapped = wrap(&text, MIN_WRAP);
+        let lines: Vec<_> = wrapped.lines().collect();
+        assert_eq!(lines[0], header, "the header is never wrapped");
+        assert_eq!(lines[1].len(), MIN_WRAP);
+        assert!(lines[2..].iter().all(|line| line.starts_with("| ")));
+        assert!(lines[1..].iter().all(|line| line.len() <= MIN_WRAP));
+        assert_eq!(*lines.last().unwrap(), "| short");
+        assert!(wrapped.ends_with('\n'));
+        let joined: String = lines[1..lines.len() - 1]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| if i == 0 { *line } else { &line[2..] })
+            .collect();
+        assert_eq!(joined, body);
+        // Short lines, and text without a trailing newline, pass unchanged.
+        assert_eq!(wrap("[h]\n@1 x", MIN_WRAP), "[h]\n@1 x");
+        // Splits land on char boundaries; no piece exceeds the bound.
+        let wide = format!("[h]\n{}", "é".repeat(80));
+        let wrapped = wrap(&wide, 65);
+        assert!(wrapped.lines().skip(1).all(|line| line.len() <= 65));
+        assert_eq!(wrapped.lines().nth(1).unwrap().len(), 64);
+        let joined: String = wrapped
+            .lines()
+            .skip(1)
+            .map(|line| line.strip_prefix("| ").unwrap_or(line))
+            .collect();
+        assert_eq!(joined, "é".repeat(80));
     }
 
     #[test]

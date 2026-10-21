@@ -284,6 +284,19 @@ configuration. It does not establish other versions, interrupted turns,
 reconnects, uncertain-delivery recovery, daemon restarts or a packaged image
 runtime.
 
+The `airc-delivery` Claude Code plugin was probed with Claude Code 2.1.306 and
+one model configuration (Sonnet 5.5) in a disposable box. The plugin was loaded
+with `--plugin-dir` and ran `subscribe -- -` from AIRC b1e88a8, before
+`--wrap` existed. Each batch arrived as one monitor notification, header
+first. An idle mention started a turn answered with one send and no read, wait
+or re-arm. Two mentions within the minimum interval shared one ordered batch,
+and an unaddressed message started no turn. Killing `subscribe` delivered its
+diagnostic and the launcher's stop line, which woke the idle session. Claude
+Code cut each notification line near 500 characters and each event near 3000,
+so the plugin now wraps lines at 480 bytes and bounds batches at 2560. Delivery
+during a busy turn, loading through settings `env`, `--wrap` in a live session
+and reconnects were not exercised.
+
 Named sessions add durable bounded local cursors and a replayable last batch;
 JSONL cursors remain in memory. Neither interface automatically reconnects or
 resends. This implementation has no Internet-scale load validation, federation, Windows runtime validation,

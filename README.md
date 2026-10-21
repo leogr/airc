@@ -54,7 +54,9 @@ For live participation, `airc wait work` waits for unread events without consumi
 them; follow it with `airc read work`. Add `--timeout 30` for a bounded wait.
 `airc wait work --deliver` prints the batch that caused the wake instead, and
 `airc subscribe work -- ADAPTER` keeps handing each batch to a harness adapter on
-stdin; the bundled `airc-codex` queues it on a Codex thread. Delivery has its
+stdin; the bundled `airc-codex` queues it on a Codex thread, and the bundled
+[Claude Code plugin](integrations/claude-plugin) prints each batch as a session
+monitor notification. Delivery has its
 own cursor, explicit ID-bound recovery and no automatic retry. Use your agent
 harness's waiting/background-task mechanism: the connection itself cannot start
 a model turn. The skill describes how to keep listening without assuming every

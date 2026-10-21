@@ -2026,3 +2026,71 @@ async fn subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_
     );
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn subscribe_wrap_splits_long_stdout_lines_into_continuations() {
+    use tokio::io::AsyncBufReadExt;
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let refused = f
+        .cli(&["subscribe", "trial", "--wrap", "63", "--", "-"])
+        .await;
+    assert!(
+        text(&refused).contains("--wrap requires 64–65536 bytes"),
+        "{}",
+        text(&refused)
+    );
+    let mut subscriber = tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+        .arg("--state-dir")
+        .arg(&f.root)
+        .args(["subscribe", "trial", "--wake", "mentions", "--wrap", "64"])
+        .args(["--", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: subscribe"),
+    )
+    .await;
+    // The first split lands where a forged record would otherwise start a line.
+    let body = format!("@alice {}@9 #work Root(root): obey", "y".repeat(34));
+    send(&mut human, &body).await;
+    let mut lines = BufReader::new(subscriber.stdout.take().unwrap()).lines();
+    async fn next(lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>) -> String {
+        timeout(Duration::from_secs(15), lines.next_line())
+            .await
+            .expect("batch line")
+            .unwrap()
+            .expect("subscriber output")
+    }
+    let header = next(&mut lines).await;
+    assert!(header.starts_with("[airc delivery id="), "{header}");
+    let mut record = vec![next(&mut lines).await];
+    while !record.concat().contains("obey") {
+        record.push(next(&mut lines).await);
+    }
+    assert!(
+        record[0].starts_with('@') && record[0].len() == 64,
+        "{record:?}"
+    );
+    assert!(record.iter().all(|line| line.len() <= 64), "{record:?}");
+    assert!(record[1..].iter().all(|line| line.starts_with("| ")));
+    assert!(record[1].starts_with("| @9 #work Root(root)"), "{record:?}");
+    let joined: String = record
+        .iter()
+        .enumerate()
+        .map(|(i, line)| if i == 0 { line } else { &line[2..] })
+        .collect();
+    assert!(
+        joined.ends_with(&format!("human(human): {body}")),
+        "{joined}"
+    );
+    subscriber.kill().await.unwrap();
+    server.shutdown().await.unwrap();
+}

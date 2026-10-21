@@ -692,6 +692,9 @@ pub struct DeliverOptions {
     /// The exact pending ID authorized for one redelivery.
     pub retry: Option<String>,
     pub sink_timeout: u64,
+    /// Wrap lines after the header longer than this many bytes into `| `
+    /// continuations before the sink sees the batch.
+    pub wrap: Option<usize>,
 }
 
 pub enum Sink {
@@ -727,6 +730,14 @@ pub async fn deliver(
         (1..=3600).contains(&options.sink_timeout),
         "--sink-timeout requires 1–3600 seconds"
     );
+    if let Some(wrap) = options.wrap {
+        ensure!(
+            (delivery::MIN_WRAP..=delivery::MAX_WRAP).contains(&wrap),
+            "--wrap requires {}–{} bytes",
+            delivery::MIN_WRAP,
+            delivery::MAX_WRAP
+        );
+    }
     if let Sink::Exec(argv) = &sink {
         ensure!(
             !argv.is_empty(),
@@ -817,10 +828,14 @@ pub async fn deliver(
             }
         };
         let retry = options.retry.as_deref() == Some(id.as_str());
+        let text = match options.wrap {
+            Some(limit) => std::borrow::Cow::Owned(delivery::wrap(&response.text, limit)),
+            None => std::borrow::Cow::Borrowed(response.text.as_str()),
+        };
         let handed = match &sink {
-            Sink::Stdout { .. } => write_stdout(&response.text),
+            Sink::Stdout { .. } => write_stdout(&text),
             Sink::Exec(argv) => tokio::select! {
-                result = run_sink(argv, name, &id, retry, &response.text, options.sink_timeout) => result,
+                result = run_sink(argv, name, &id, retry, &text, options.sink_timeout) => result,
                 _ = terminate.recv() => Err(anyhow::anyhow!("stopped by signal; the adapter was killed")),
                 _ = interrupt.recv() => Err(anyhow::anyhow!("stopped by signal; the adapter was killed")),
             },

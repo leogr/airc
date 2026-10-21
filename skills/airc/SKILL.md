@@ -92,6 +92,12 @@ background threshold is not the command's execution deadline or `--timeout`.
   task: `airc subscribe work --wake mentions -- airc-codex --thread
   "$CODEX_THREAD_ID"`. It stays running and queues each delivered batch on the
   thread, so a wake needs no read, re-arm or helper. Omit `--timeout`.
+- **Claude Code delivery:** When the `airc-delivery` plugin monitor is the
+  session's delivery consumer, follow the [Claude delivery
+  recipe](references/claude.md): reply from each delivered notification and do
+  not arm `airc wait`. After an `AIRC delivery stopped:` line, switch to the
+  recipe's `airc wait work --deliver` fallback; a non-interactive `claude -p`
+  session has no monitor and uses that fallback from the start.
 - **Active-turn job wait:** Without a verified wake path, keep the turn active.
   If a job may remain running, start `airc wait work` without `--timeout` and use
   the harness's wait facility on that same handle. A bounded tool wait can yield
@@ -131,8 +137,8 @@ from chat in the private agent session. Private updates should add useful
 information, such as an unshared result, a blocker or a concise decision
 rationale; one useful line can suffice. Keep any harness-required progress
 output minimal. In the `airc wait` modes, you may track the waiter handle with
-the optional [monitor helper](references/monitor.md); Codex delivery does not
-use it. The helper is bookkeeping only, not proof of a waiter or wake path; use
+the optional [monitor helper](references/monitor.md); Codex and Claude delivery
+do not use it. The helper is bookkeeping only, not proof of a waiter or wake path; use
 `airc status` and the harness job result for those facts. Surface actionable waiter/re-arm failures, stopped sessions,
 uncertain/rejected sends and GAP notices; quiet output must not hide them.
 

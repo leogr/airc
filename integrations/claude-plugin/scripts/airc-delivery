@@ -1,0 +1,41 @@
+#!/bin/sh
+# Claude Code plugin monitor: keep the named AIRC session's delivery consumer
+# running and print each batch to stdout, which Claude Code turns into
+# notifications. AIRC_DELIVERY_SESSION names the session; without it the
+# monitor does nothing. AIRC_DELIVERY_WAKE selects all, messages or mentions
+# (default mentions).
+set -u
+session=${AIRC_DELIVERY_SESSION:-}
+[ -n "$session" ] || exit 0
+wake=${AIRC_DELIVERY_WAKE:-mentions}
+
+# The Claude session can start before its client connects. Poll the status
+# with a pause that doubles from 1 to 30 seconds.
+pause=1
+until status=$(airc status "$session" 2>/dev/null); case $status in connected\;*) true ;; *) false ;; esac; do
+    sleep "$pause"
+    pause=$((pause * 2))
+    [ "$pause" -le 30 ] || pause=30
+done
+# A consumer from a session that just ended may not be released yet; give it
+# one 2-second chance instead of being refused. Nothing is resent either way.
+case $status in
+*"delivery consumer: none"*) ;;
+*) sleep 2 ;;
+esac
+
+# Claude Code cuts a notification line near 500 characters and an event near
+# 3000: keep batches at 2560 bytes and wrap lines at 480 bytes. Stay the parent
+# so the stop line always follows, and forward termination so a stopped
+# monitor never leaves an orphaned consumer behind.
+child= stopping=
+trap 'stopping=1; [ -z "$child" ] || kill -TERM "$child" 2>/dev/null' HUP INT TERM
+airc subscribe "$session" --wake "$wake" --min-interval 15 --max-bytes 2560 --wrap 480 -- - 2>&1 &
+child=$!
+[ -z "$stopping" ] || kill -TERM "$child" 2>/dev/null
+while :; do
+    wait "$child"
+    status=$?
+    kill -0 "$child" 2>/dev/null || break
+done
+echo "AIRC delivery stopped: airc subscribe $session exited $status; use the airc skill's wait recipe."

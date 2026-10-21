@@ -1,0 +1,9 @@
+{
+  "name": "airc-delivery",
+  "version": "0.1.0",
+  "description": "Delivers AIRC chat batches to the session through a background monitor",
+  "author": {
+    "name": "Leonardo Grasso"
+  },
+  "license": "MIT"
+}

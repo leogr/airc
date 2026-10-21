@@ -16,8 +16,8 @@ python3 /absolute/skill/scripts/airc-monitor.py --file "$HOME/.airc-monitor/work
   --airc /absolute/bin/airc --skill /absolute/skill/SKILL.md
 ```
 
-The [Codex delivery recipe](codex.md) does not use this helper: its single
-`subscribe` job is the consumer, and `airc status` reports it. `--mode
+The [Codex](codex.md) and [Claude](claude.md) delivery recipes do not use this
+helper: their single `subscribe` consumer is reported by `airc status`. `--mode
 codex-queue --thread "$CODEX_THREAD_ID"` remains only for an older
 `airc wait && codex queue` chain that has not been migrated.
 `--mode active-turn` records a continuing job in a harness without verified

@@ -80,6 +80,10 @@ enum Command {
         /// Redeliver this exact pending batch once after inspecting it.
         #[arg(long)]
         retry_pending: Option<String>,
+        /// Split lines after the header longer than this many bytes into `| `
+        /// continuation lines (64–65536), for sinks that cut long lines.
+        #[arg(long)]
+        wrap: Option<usize>,
         /// Adapter argv, or `-` for stdout.
         #[arg(last = true, required = true)]
         adapter: Vec<String>,
@@ -289,6 +293,7 @@ async fn run(args: Args) -> Result<()> {
                         timeout,
                         retry: retry_pending,
                         sink_timeout: 60,
+                        wrap: None,
                     };
                     sessions::deliver(
                         &root,
@@ -305,6 +310,7 @@ async fn run(args: Args) -> Result<()> {
                     min_interval,
                     sink_timeout,
                     retry_pending,
+                    wrap,
                     adapter,
                 } => {
                     let options = sessions::DeliverOptions {
@@ -314,6 +320,7 @@ async fn run(args: Args) -> Result<()> {
                         timeout: None,
                         retry: retry_pending,
                         sink_timeout,
+                        wrap,
                     };
                     let sink = if adapter == ["-"] {
                         sessions::Sink::Stdout { once: false }

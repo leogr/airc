@@ -288,6 +288,13 @@ Exit 0 within `--sink-timeout` (default 60 s) accepts the batch. Anything else
 (non-zero exit, signal or timeout) ends `subscribe` with exit 1 and a bounded
 diagnostic that includes the adapter's captured stderr. Nothing is retried.
 `-- -` writes batches to stdout and accepts each after flushing.
+`--wrap N` (64–65536 bytes) first splits each line after the header that is
+longer than N bytes at UTF-8 boundaries. Every continuation starts with `| `,
+so a split never begins a line that reads as a record; `bytes` still counts the
+unwrapped records. The bundled [Claude Code plugin](../integrations/claude-plugin)
+runs `-- -` as a session monitor with `--max-bytes 2560 --wrap 480`. Claude Code
+starts plugin monitors only in interactive sessions; a non-interactive
+`claude -p` session gets no delivery and uses a `wait` recipe instead.
 `--min-interval` (0–3600 s, default 0) spaces accepted batches; critical
 events bypass it. Acceptance means the sink accepted the batch, never that an
 agent processed it.

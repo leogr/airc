@@ -1,0 +1,7 @@
+[
+  {
+    "name": "airc-delivery",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/airc-delivery",
+    "description": "AIRC chat delivery"
+  }
+]
