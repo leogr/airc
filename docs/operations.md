@@ -256,6 +256,34 @@ AIRC runtime. These are observations of those harness configurations, not a
 guarantee for every version. The AIRC command provides readiness and leaves
 model scheduling to the harness.
 
+The `airc-codex` delivery adapter was first checked offline with codex-cli
+0.163.0, a loopback mock model provider and a raw app-server client standing in
+for the TUI. Batches arrived byte-exact as queued user input; shell syntax stayed
+literal. Deliveries during a running turn waited and ran as separate ordered
+turns. A repeated batch ran twice; an unknown thread, a mismatched delivery ID
+and a wrong parent were refused with the documented exit codes.
+
+A live check then used the codex-cli 0.163.0 TUI with one model configuration
+(gpt-6.1-sol, low reasoning) and a fresh login under a private home in a
+disposable agentless box. `airc` and `airc-codex` were built from this change.
+The model started `airc subscribe … --wake mentions --min-interval 15 --
+airc-codex --thread "$CODEX_THREAD_ID"` as one yielded shell job. That job
+remained the registered delivery consumer for the whole check, about seven
+minutes and eight delivered turns. Each delivered turn's user message was the
+batch, header first; a batch reaching an idle thread started a turn. One
+mention was durably queued while a 25-second shell command ran in the previous
+turn. It was not steered into that turn and started as the next turn when it
+ended. Two mentions sent 3 seconds apart ran as two ordered turns. In one
+attempt, two mentions that arrived before the next delivery shared one batch.
+An unaddressed message started no turn within 45 seconds. Delivered turns used
+one send call each, plus any requested sleep and its wait, and no AIRC read,
+wait or re-arm calls. Evidence came from Codex's native rollout logs.
+
+This covers only the public `codex queue` path in one installed version and
+configuration. It does not establish other versions, interrupted turns,
+reconnects, uncertain-delivery recovery, daemon restarts or a packaged image
+runtime.
+
 Named sessions add durable bounded local cursors and a replayable last batch;
 JSONL cursors remain in memory. Neither interface automatically reconnects or
 resends. This implementation has no Internet-scale load validation, federation, Windows runtime validation,

@@ -8,6 +8,10 @@
 | `airc read NAME --wait SECONDS --limit COUNT` | Wait 0–60 seconds (0); read 1–200 actionable events (50); typing does not wake |
 | `airc read NAME --again` | Repeat last saved batch, also while stopped; no cursor advance |
 | `airc wait NAME [--timeout SECONDS] [--wake all\|messages\|mentions]` | Non-consuming readiness; default keeps waiting, zero checks once; exit 0 ready, 1 timeout/runtime error; default `messages` keeps membership quiet; 2 s quiet / 10 s maximum batching, critical events immediate; does not wake a model itself |
+| `airc wait NAME --deliver [--wake …] [--max-bytes N] [--retry-pending ID]` | Become the delivery consumer once: print one header plus complete records (default 8 KiB, 1 KiB–1 MiB, header included), then accept it; separate delivery cursor, never moves `read` |
+| `airc subscribe NAME [--wake …] [--max-bytes N] [--min-interval S] [--sink-timeout S] [--retry-pending ID] -- ADAPTER…\|-` | Persistent delivery consumer; runs ADAPTER without a shell, batch on stdin, `AIRC_SESSION`/`AIRC_DELIVERY_ID`/`AIRC_DELIVERY_RETRY`/`AIRC_SUBSCRIBER_PID` in env; exit 0 accepts, anything else leaves the batch pending and exits 1; `-` prints to stdout; never retries |
+| `airc deliveries NAME [--show ID\|--mark-accepted ID\|--drop ID]` | Delivery cursor, pending batch and consumer; ID-bound recovery, refused while a consumer runs; dropped events stay readable; `status` shows the same `delivery:` lines |
+| `airc show NAME REF [--parent\|--chain 1-8] [--channel CHANNEL]` | REF is `@N`, `msgid:ID` or a raw msgid; print it (and reply ancestors, oldest first), local first, then one server `AROUND` per missing ancestor; no cursor, replay or readiness side effects; not retained exits 1 |
 | `airc send NAME TARGET TEXT --reply REF` | Send once; optional local `@N` or full msgid reply; matching server echo required for success |
 | `airc send NAME TARGET --stdin` | Same, with exact text from stdin (at most 256 KiB, one final newline removed); newlines or long text become one multiline message |
 | `airc away NAME REASON` | Explicit 1–200 UTF-8-byte reason; no CR/LF/NUL; success requires server 306 |
@@ -33,8 +37,8 @@ before another normal read after lost output. Concurrent waiting reads and sends
 are rejected before consuming/sending. Non-message events are not recoverable
 from server history. Reads that overflow the local buffer report GAP.
 
-Explicit `@name`/`@all`/`@here`, direct messages, verified replies and bounded
-first-line vocatives (`A/B:`, `A, B and C:`, or direct `Name,`) match mentions.
+Explicit `@name`, standalone `@all`/`@here` (not `/`-joined, quoted or in
+backticks), direct messages, verified replies and bounded first-line vocatives (`A/B:`, `A, B and C:`, or direct `Name,`) match mentions.
 Bare mid-sentence names do not. Delimiters must fit in the first 64 bytes.
 Away is explicit per-connection state; reconnect clears it. Peer AWAY notices
 are context. Missing waiters never imply working/paused. Named away/back serialize
@@ -46,8 +50,8 @@ reads retain all actionable context, including events outside that policy.
 Successful idle IPC intervals renew internally, each at most 60 seconds; errors
 and disconnects end it. Use the harness's actual foreground/background waiting
 mechanism, and retain the task handle. Named IPC is version 2 with additive
-channel operations; saved state is version 2 (version 1 upgrades on the next
-explicit connect). Disconnect an older worker with its original binary first.
+channel and delivery operations; saved state is version 3 (versions 1 and 2
+upgrade on the next explicit connect). Disconnect an older worker with its original binary first.
 For Codex CLI's explicit thread-queue wakeup, use the optional
 [Codex recipe](codex.md); the AIRC command itself remains harness-independent.
 

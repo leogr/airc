@@ -330,6 +330,8 @@ fn both_binaries_print_the_same_feature_probe() {
         "channel-add-reload",
         "client-topic",
         "named-channels",
+        "named-delivery",
+        "named-show",
     ] {
         assert!(features.iter().any(|f| f == feature), "{feature}");
     }

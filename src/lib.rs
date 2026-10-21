@@ -31,6 +31,8 @@ pub const FEATURES: &[&str] = &[
     "artifact-cli",
     "artifact-metadata",
     "named-waiter-status",
+    "named-delivery",
+    "named-show",
 ];
 
 /// The `features` probe printed by both binaries.

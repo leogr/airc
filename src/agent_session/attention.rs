@@ -41,8 +41,18 @@ pub(super) enum Classification {
     Critical,
 }
 
+impl WakeMode {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Messages => "messages",
+            Self::Mentions => "mentions",
+        }
+    }
+}
+
 impl Classification {
-    fn relevant(self, mode: WakeMode) -> bool {
+    pub(super) fn relevant(self, mode: WakeMode) -> bool {
         match self {
             Self::Critical => true,
             Self::Context => mode == WakeMode::All,
@@ -92,7 +102,7 @@ pub(super) fn classify(
         })
         || ["all", "here"]
             .into_iter()
-            .any(|broadcast| explicit_mention(body, broadcast));
+            .any(|token| broadcast(body, token));
     Classification::Message {
         channel: valid_channel(target),
         addressed,
@@ -131,6 +141,33 @@ fn explicit_mention(body: &str, token: &str) -> bool {
             {
                 return true;
             }
+        }
+        previous = Some(c);
+    }
+    false
+}
+
+/// `@all`/`@here` only as a standalone word: not joined by `/` or other
+/// punctuation (as in `@all/@here` lists), quoted, or inside a backtick code
+/// span, so documentation and examples do not wake every listener.
+fn broadcast(body: &str, token: &str) -> bool {
+    let mut code = false;
+    let mut previous: Option<char> = None;
+    for (start, c) in body.char_indices() {
+        if c == '`' {
+            code = !code;
+        } else if c == '@'
+            && !code
+            && previous.is_none_or(|p| p.is_whitespace() || p == '(')
+            && body[start + 1..]
+                .get(..token.len())
+                .is_some_and(|word| word.eq_ignore_ascii_case(token))
+            && body[start + 1 + token.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| next.is_whitespace() || ",.:;!?)".contains(next))
+        {
+            return true;
         }
         previous = Some(c);
     }
@@ -559,6 +596,12 @@ mod tests {
             "@here_now",
             "@channel",
             "@room",
+            // Lists, quotes and code spans are examples, not broadcasts.
+            "It wakes for @all/@here or a reply",
+            "send `@all` only when needed",
+            "run `airc send space '#space' '@here status'`",
+            "the literal \"@all\"",
+            "a|@all",
         ] {
             assert!(!addressed(body, IDENTITY), "{body}");
         }

@@ -1,7 +1,7 @@
 # Retained monitor handle
 
-Use the bundled `scripts/airc-monitor.py` with Python 3 for private bookkeeping
-instead of inline JSON edits on each wake. It does not start, cancel, inspect or
+For the `airc wait` recipes, use the bundled `scripts/airc-monitor.py` with
+Python 3 for private bookkeeping instead of inline JSON edits on each wake. It does not start, cancel, inspect or
 wait for processes, execute recorded paths, send messages, or queue model turns.
 Use the actual harness handle and current session/thread. A stored handle is
 neither proof of a live waiter nor evidence of future model wake.
@@ -16,7 +16,10 @@ python3 /absolute/skill/scripts/airc-monitor.py --file "$HOME/.airc-monitor/work
   --airc /absolute/bin/airc --skill /absolute/skill/SKILL.md
 ```
 
-For the Codex queue recipe select `--mode codex-queue --thread "$CODEX_THREAD_ID"`.
+The [Codex delivery recipe](codex.md) does not use this helper: its single
+`subscribe` job is the consumer, and `airc status` reports it. `--mode
+codex-queue --thread "$CODEX_THREAD_ID"` remains only for an older
+`airc wait && codex queue` chain that has not been migrated.
 `--mode active-turn` records a continuing job in a harness without verified
 turn-end wake. Preserve a non-default `--state-dir /absolute/path` when needed.
 The script validates bounded inputs and uses owner-private, no-follow files,

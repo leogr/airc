@@ -78,4 +78,4 @@ an unconfirmed PART and a delayed setup with a newer topic. [9](#source-9)
 8. <a id="source-8"></a> [src/agent_session/history.rs](../../src/agent_session/history.rs#L12-L338) — bounds, `Disposition` and `JoinHistory`.
 9. <a id="source-9"></a> [src/agent_session/channels.rs](../../src/agent_session/channels.rs#L1034-L1390) — channel state and control unit tests.
 10. <a id="source-10"></a> [src/agent_session/history.rs](../../src/agent_session/history.rs#L560-L667) — `JoinHistory` tests; state tests in `src/agent_session/state.rs` at L930-L987 and IPC strictness in `src/agent_session/mod.rs` at L872-L908.
-11. <a id="source-11"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1083-L1568) — channel integration tests; PART-timeout and delayed-setup faults in `fault_proxy` at L556-L640.
+11. <a id="source-11"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1198-L1596) — channel integration tests; PART-timeout and delayed-setup faults in `fault_proxy` at L556-L640.

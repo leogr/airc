@@ -52,9 +52,15 @@ also reports unknown. Timestamps describe this bounded IPC registration; a
 no-timeout caller renews registrations of at most 60 seconds. They do not describe
 the lifetime of the outer CLI job, a model turn, or a promised future wake.
 Caller EOF, readiness, timeout and shutdown release the registration.
+`status` also reports the delivery state described below:
+`delivery: unused`, or `delivery: cursor=N pending=ID since=UTC events=A..B|none
+last=ID accepted|dropped=UTC|none`, then `delivery consumer: none` or
+`delivery consumer: wait|subscribe pid=PID since=UTC last_request=UTC`. A
+consumer is never released on a timer.
 
 The optional [monitor helper](../skills/airc/scripts/airc-monitor.py) keeps one
-private harness job handle; its record is bookkeeping, never listener evidence.
+private harness job handle for the `wait` recipes; its record is bookkeeping,
+never listener evidence, and delivery consumers do not need it.
 See [the helper recipe](../skills/airc/references/monitor.md).
 
 ### Standalone artifact transfers
@@ -197,8 +203,8 @@ preview with the full text's size and digest.
 `airc wait trial` waits for unread actionable events without reading them,
 advancing the cursor, or replacing `read --again`. Existing unread events are
 evaluated under the selected mode and debounce/bypass rules below; typing and
-own confirmed send echoes do not wake it. It prints a readiness notice, not
-message contents. Follow success with `airc read trial`.
+own confirmed send echoes do not wake it. Without `--deliver` it prints a
+readiness notice, not message contents; follow success with `airc read trial`.
 `--timeout SECONDS` bounds the wait; zero checks once, omission keeps waiting.
 Exit 0 means unread events were observed; exit 1 reports a timeout or runtime
 error on stdout.
@@ -206,8 +212,9 @@ error on stdout.
 `--wake` selects which unread events wake it; all events stay readable:
 `messages` (default) wakes for other participants' messages and local problems,
 `mentions` for explicit `@nick`/`@account`, direct messages, replies to this
-session's confirmed messages, bounded leading/group addresses and
-`@all`/`@here`, and `all` for every event including membership. Bare names only
+session's confirmed messages, bounded leading/group addresses and standalone
+`@all` or `@here` (not joined by `/` or other punctuation, quoted, or inside a
+backtick span), and `all` for every event including membership. Bare names only
 match a direct leading `name,` or a colon-terminated first-line address within
 64 bytes, such as `Fable/Sol:` or `Co-builder, Sol and QA especially:`. Group
 separators are `/`, `,`, `&` and the word `and`; arbitrary prose and mid-sentence
@@ -228,15 +235,96 @@ Only one readiness waiter can be pending per session. It is separate from the
 normal reader; another reader can consume events before the awakened caller
 reads them. Caller cancellation releases the wait without consuming anything.
 Disconnect wakes the waiter with failure. The CLI cannot itself start a model
-turn: use a verified harness background-completion mechanism, the optional
-[Codex queue recipe](../skills/airc/references/codex.md), or keep the agent
-turn active and await the foreground tool/job. A connected client alone does
+turn: use a verified harness background-completion mechanism, a delivery
+adapter such as the [Codex recipe](../skills/airc/references/codex.md), or keep
+the agent turn active and await the foreground tool/job. A connected client alone does
 not establish that its agent is listening.
 
-Named IPC is version 2; saved named state stays version 1. Disconnect a running
-worker with its original binary before connecting with the new binary. This
-release adds optional receipt fields to saved state, which older binaries refuse,
-and accepts IPC requests up to 2 MiB. No server restart or history migration is
+### Delivery
+
+```sh
+airc wait trial --deliver --wake mentions
+airc subscribe trial --wake mentions -- ADAPTER [ARG...]
+airc subscribe trial --wake mentions -- -
+airc deliveries trial [--show ID | --mark-accepted ID | --drop ID]
+airc show trial @14 [--parent | --chain 1-8] [--channel '#work']
+```
+
+Delivery hands the events that caused a wake to one **delivery consumer**
+instead of a readiness notice. It has its own durable cursor: `read`,
+`read --again` and plain `wait` never move it, and delivery never moves the
+read cursor, so a read cannot steal a pending batch and `read` still shows the
+full context. A first consumer starts at the current read cursor, so history
+already read is not delivered. Readiness, debounce and critical bypasses follow
+`wait`, measured from the delivery cursor; unread events outside the wake
+policy only advance it silently.
+
+A batch is one header line followed by ordinary read records:
+
+```text
+[airc delivery id=UUID session=trial account=ACCOUNT nick=NICK wake=mentions events=2 context=5 bytes=812 more=no gap=no retry=no]
+@14 #work Alice(alice): @agent-a please check the parser.
+```
+
+The client writes the header; a body line cannot forge it because continuation
+lines start with `| `. `id` is a random UUID per batch. `events` counts included
+records, and `context` counts unaddressed messages it left out (still unread
+for `read`). `bytes` is the size of the records. `more=yes` means the next batch
+follows without debounce, and `gap=yes` that relevant undelivered events above the
+pending or accepted batch were evicted (reported once). `retry=yes` marks an explicit redelivery. `mentions` includes only
+addressed messages and critical local notices; `messages` and `all` follow
+their wake policies. `--max-bytes` (default 8192, 1024–1048576) bounds the whole
+batch, header included, using complete records. A single larger record is
+delivered alone as a UTF-8-safe prefix that ends with
+`! record truncated: N of M bytes not delivered; airc show SESSION @R prints all of it`.
+
+`wait --deliver` prints one batch, flushes stdout, then accepts it; a caller
+that leaves before any reply is written reverts the batch. With `--timeout`, an
+idle wait prints `wait timed out; no events consumed`.
+`subscribe` keeps running. For each batch it starts ADAPTER directly (no
+shell) with the batch on stdin and `AIRC_SESSION`, `AIRC_DELIVERY_ID`,
+`AIRC_DELIVERY_RETRY` (`0` or `1`) and `AIRC_SUBSCRIBER_PID` in its environment.
+Exit 0 within `--sink-timeout` (default 60 s) accepts the batch. Anything else
+(non-zero exit, signal or timeout) ends `subscribe` with exit 1 and a bounded
+diagnostic that includes the adapter's captured stderr. Nothing is retried.
+`-- -` writes batches to stdout and accepts each after flushing.
+`--min-interval` (0–3600 s, default 0) spaces accepted batches; critical
+events bypass it. Acceptance means the sink accepted the batch, never that an
+agent processed it.
+
+Only one consumer can be registered per session: a second `wait --deliver` or
+`subscribe` is refused, and registration lasts as long as the consumer's
+connection to the worker. An unaccepted batch stays **pending**, and no restart
+replays it: a new consumer is refused with the pending ID. After inspecting it
+with `deliveries --show ID`, either rerun the consumer with
+`--retry-pending ID` (one redelivery, `retry=yes`), record
+`--mark-accepted ID`, or `--drop ID`; dropped events stay readable with `read`.
+These recovery commands are refused while a consumer is registered. Sinks do
+not deduplicate, so a retry after an uncertain hand-off can deliver a batch
+twice. On timeout or signal only the adapter process itself is killed, not
+its descendants, and it may already have handed the batch on; the pending
+state, not process cleanup, is the safety boundary. A consumer restarted
+immediately after the previous one died can be refused once, until the worker
+observes the old connection close.
+
+`show` prints one record by local `@N`, `msgid:ID` or a raw server msgid, and
+with `--parent` or `--chain N` its reply ancestors, oldest first, as `context`
+records. It uses retained local records first, then one `CHATHISTORY AROUND
+msgid=` request per missing channel ancestor (`--channel` names the channel
+for a msgid no longer retained locally). A private-message ancestor that is no
+longer retained is reported, never fetched: private messages have no server
+history. It never moves a cursor, changes the
+transcript, recovery checkpoints or `--again`, or wakes a waiter. A message the
+server no longer retains prints `! msgid:ID: not retained by the server: …` and
+exits 1. Descendant threads are not indexed. `airc features` lists
+`named-delivery` and `named-show`.
+
+Named IPC stays version 2; new operations reach an older worker as a visible
+error. Saved named state is version 3, adding the delivery cursor and pending
+batch; versions 1 and 2 load and upgrade only on the next explicit connect, and
+older binaries refuse version 3 state rather than reset it. Disconnect a running
+worker with its original binary before connecting with the new binary. IPC
+requests are accepted up to 2 MiB. No server restart or history migration is
 needed.
 
 `send` serializes confirmation: a competing send is rejected before sending.

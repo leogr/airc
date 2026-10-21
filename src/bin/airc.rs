@@ -42,6 +42,7 @@ enum Command {
         again: bool,
     },
     /// Wait for unread events without consuming them; does not wake a model itself.
+    /// With --deliver, print the batch that woke it instead (see subscribe).
     Wait {
         session: String,
         /// Stop after this many seconds (zero checks once); omit to keep waiting.
@@ -50,6 +51,67 @@ enum Command {
         /// Which unread events wake: all, messages (default) or mentions.
         #[arg(long, value_enum, default_value_t)]
         wake: airc::agent_session::Wake,
+        /// Act as the session's delivery consumer: print one batch, then accept it.
+        #[arg(long)]
+        deliver: bool,
+        /// Batch bound in bytes, header included (1024–1048576).
+        #[arg(long, requires = "deliver", default_value_t = airc::agent_session::DEFAULT_MAX_BYTES)]
+        max_bytes: usize,
+        /// Redeliver this exact pending batch once after inspecting it.
+        #[arg(long, requires = "deliver")]
+        retry_pending: Option<String>,
+    },
+    /// Stay the session's delivery consumer: for each batch, run ADAPTER (no
+    /// shell) with the batch on stdin, or print it with `-- -`. Exit 0 accepts;
+    /// anything else leaves the batch pending and stops. Never retries.
+    Subscribe {
+        session: String,
+        #[arg(long, value_enum, default_value_t)]
+        wake: airc::agent_session::Wake,
+        /// Batch bound in bytes, header included (1024–1048576).
+        #[arg(long, default_value_t = airc::agent_session::DEFAULT_MAX_BYTES)]
+        max_bytes: usize,
+        /// Minimum seconds between accepted batches; critical events bypass it.
+        #[arg(long, default_value_t = 0)]
+        min_interval: u64,
+        /// Seconds an adapter may take to accept a batch before it is killed.
+        #[arg(long, default_value_t = 60)]
+        sink_timeout: u64,
+        /// Redeliver this exact pending batch once after inspecting it.
+        #[arg(long)]
+        retry_pending: Option<String>,
+        /// Adapter argv, or `-` for stdout.
+        #[arg(last = true, required = true)]
+        adapter: Vec<String>,
+    },
+    /// Print a record (@N or msgid) and optionally its reply ancestors: local
+    /// retained records first, then bounded server history. Consumes nothing.
+    Show {
+        session: String,
+        reference: String,
+        /// Channel for a msgid that is no longer retained locally.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Also print the record it replies to.
+        #[arg(long, conflicts_with = "chain")]
+        parent: bool,
+        /// Also print up to this many reply ancestors (1–8).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=8))]
+        chain: Option<u8>,
+    },
+    /// Show the delivery cursor, pending batch and consumer, or recover a pending
+    /// batch by its exact ID (refused while a consumer runs).
+    Deliveries {
+        session: String,
+        /// Print the pending batch without changing anything.
+        #[arg(long, group = "action")]
+        show: Option<String>,
+        /// Record that the sink did receive it; moves only the delivery cursor.
+        #[arg(long, group = "action")]
+        mark_accepted: Option<String>,
+        /// Skip it undelivered; its events stay readable with read.
+        #[arg(long, group = "action")]
+        drop: Option<String>,
     },
     /// Send once and wait for the server's correlated echo. Never retries.
     /// Text with newlines is sent as one multiline message when supported.
@@ -209,7 +271,89 @@ async fn run(args: Args) -> Result<()> {
                     session,
                     timeout,
                     wake,
+                    deliver: false,
+                    ..
                 } => sessions::wait(&root, &session, timeout, wake).await?,
+                Command::Wait {
+                    session,
+                    timeout,
+                    wake,
+                    deliver: true,
+                    max_bytes,
+                    retry_pending,
+                } => {
+                    let options = sessions::DeliverOptions {
+                        wake,
+                        max_bytes,
+                        min_interval: 0,
+                        timeout,
+                        retry: retry_pending,
+                        sink_timeout: 60,
+                    };
+                    sessions::deliver(
+                        &root,
+                        &session,
+                        options,
+                        sessions::Sink::Stdout { once: true },
+                    )
+                    .await?
+                }
+                Command::Subscribe {
+                    session,
+                    wake,
+                    max_bytes,
+                    min_interval,
+                    sink_timeout,
+                    retry_pending,
+                    adapter,
+                } => {
+                    let options = sessions::DeliverOptions {
+                        wake,
+                        max_bytes,
+                        min_interval,
+                        timeout: None,
+                        retry: retry_pending,
+                        sink_timeout,
+                    };
+                    let sink = if adapter == ["-"] {
+                        sessions::Sink::Stdout { once: false }
+                    } else {
+                        sessions::Sink::Exec(adapter)
+                    };
+                    sessions::deliver(&root, &session, options, sink).await?
+                }
+                Command::Show {
+                    session,
+                    reference,
+                    channel,
+                    parent,
+                    chain,
+                } => {
+                    let depth = chain.unwrap_or(u8::from(parent));
+                    sessions::call(
+                        &root,
+                        &session,
+                        Operation::Show {
+                            reference,
+                            channel,
+                            depth,
+                        },
+                    )
+                    .await?
+                }
+                Command::Deliveries {
+                    session,
+                    show,
+                    mark_accepted,
+                    drop,
+                } => {
+                    let operation = match (show, mark_accepted, drop) {
+                        (_, Some(id), _) => Operation::Accept { id },
+                        (_, _, Some(id)) => Operation::DropPending { id },
+                        (show, ..) => Operation::Deliveries { show },
+                    };
+                    sessions::call(&root, &session, operation).await?
+                }
                 Command::Send {
                     session,
                     target,

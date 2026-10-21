@@ -41,6 +41,8 @@ struct Queued {
     channel: String,
     deadline: Instant,
     live: bool,
+    /// A `show` lookup of one msgid instead of a JOIN page.
+    lookup: Option<String>,
 }
 
 struct Active {
@@ -52,7 +54,13 @@ struct Active {
     complete: bool,
     canceled: bool,
     live: bool,
+    lookup: Option<String>,
+    /// The single correlated message a lookup returned.
+    found: Option<Message>,
 }
+
+/// The outcome of one `show` lookup: never recorded as an event.
+pub(super) type Lookup = Result<Message, String>;
 
 /// Event-driven initial history for fresh live JOINs: one correlated request
 /// at a time, streamed into the bounded event log while live input continues.
@@ -66,6 +74,8 @@ pub(super) struct JoinHistory {
     quarantined: bool,
     /// Per joined channel; removed when the channel is left.
     status: BTreeMap<String, String>,
+    /// A finished lookup and its msgid, awaiting the `show` that asked for it.
+    looked_up: Option<(String, Lookup)>,
 }
 
 impl JoinHistory {
@@ -82,8 +92,11 @@ impl JoinHistory {
         if self
             .active
             .as_ref()
-            .is_some_and(|a| fold(&a.channel) == key)
-            || self.queue.iter().any(|q| fold(&q.channel) == key)
+            .is_some_and(|a| a.lookup.is_none() && fold(&a.channel) == key)
+            || self
+                .queue
+                .iter()
+                .any(|q| q.lookup.is_none() && fold(&q.channel) == key)
         {
             return None;
         }
@@ -97,6 +110,7 @@ impl JoinHistory {
                 channel: channel.into(),
                 deadline: now + JOIN_DEADLINE,
                 live: false,
+                lookup: None,
             });
             self.set(channel, "queued");
             return None;
@@ -110,12 +124,54 @@ impl JoinHistory {
         })
     }
 
+    /// Queue one bounded `AROUND msgid=` fetch for `show`; its result arrives via
+    /// `take_lookup`, never as a transcript event or checkpoint.
+    pub fn lookup(&mut self, channel: &str, msgid: &str, now: Instant) -> Result<(), String> {
+        if self.quarantined {
+            return Err(
+                "history lookups are stopped for this connection; reconnect explicitly".into(),
+            );
+        }
+        if self.queue.len() >= MAX_QUEUED {
+            return Err("the history queue is full".into());
+        }
+        self.looked_up = None;
+        self.queue.push_back(Queued {
+            channel: channel.into(),
+            deadline: now + JOIN_DEADLINE,
+            live: false,
+            lookup: Some(msgid.into()),
+        });
+        Ok(())
+    }
+
+    /// The finished lookup's msgid and result; callers discard other msgids.
+    pub fn take_lookup(&mut self) -> Option<(String, Lookup)> {
+        self.looked_up.take()
+    }
+
+    fn settle(&mut self, msgid: Option<String>, result: Lookup) {
+        if let Some(msgid) = msgid {
+            self.looked_up = Some((msgid, result));
+        }
+    }
+
     /// The channel was left or kicked: drop it, keeping an in-flight reply correlated.
     pub fn cancel(&mut self, key: &str) -> Option<Notice> {
         self.status.remove(key);
-        self.queue.retain(|q| fold(&q.channel) != key);
+        let (dropped, kept) = std::mem::take(&mut self.queue)
+            .into_iter()
+            .partition::<VecDeque<_>, _>(|q| fold(&q.channel) == key);
+        self.queue = kept;
+        for queued in dropped {
+            let why = format!("{} is no longer joined", queued.channel);
+            self.settle(queued.lookup, Err(why));
+        }
         let active = self.active.as_mut().filter(|a| fold(&a.channel) == key)?;
         active.canceled = true;
+        if active.lookup.is_some() {
+            return None;
+        }
         Some(Notice {
             critical: false,
             text: format!(
@@ -132,6 +188,13 @@ impl JoinHistory {
             return (None, notices);
         }
         while let Some(next) = self.queue.pop_front() {
+            if now >= next.deadline && next.lookup.is_some() {
+                self.settle(
+                    next.lookup,
+                    Err("the history lookup timed out while queued".into()),
+                );
+                continue;
+            }
             if now >= next.deadline {
                 self.set(&next.channel, "incomplete: timed out while queued");
                 notices.push(Notice {
@@ -140,12 +203,20 @@ impl JoinHistory {
                 });
                 continue;
             }
-            self.set(&next.channel, "loading");
-            notices.push(Notice {
-                critical: false,
-                text: format!("{}: joined; initial bounded history window (up to {JOIN_PAGE} messages) follows; earlier context may exist", next.channel),
-            });
-            let request = Message::new("CHATHISTORY", ["LATEST", next.channel.as_str(), "*", "20"]);
+            let request = if let Some(msgid) = &next.lookup {
+                let reference = format!("msgid={msgid}");
+                Message::new(
+                    "CHATHISTORY",
+                    ["AROUND", next.channel.as_str(), reference.as_str(), "1"],
+                )
+            } else {
+                self.set(&next.channel, "loading");
+                notices.push(Notice {
+                    critical: false,
+                    text: format!("{}: joined; initial bounded history window (up to {JOIN_PAGE} messages) follows; earlier context may exist", next.channel),
+                });
+                Message::new("CHATHISTORY", ["LATEST", next.channel.as_str(), "*", "20"])
+            };
             self.active = Some(Active {
                 channel: next.channel,
                 deadline: next.deadline,
@@ -155,6 +226,8 @@ impl JoinHistory {
                 complete: true,
                 canceled: false,
                 live: next.live,
+                lookup: next.lookup,
+                found: None,
             });
             return (Some(request), notices);
         }
@@ -164,6 +237,11 @@ impl JoinHistory {
     /// The request could not be queued for writing; nothing was sent.
     pub fn unsent(&mut self) -> Option<Notice> {
         let active = self.active.take()?;
+        if active.lookup.is_some() {
+            let why = "the history lookup was not sent; connection queue unavailable";
+            self.settle(active.lookup, Err(why.into()));
+            return None;
+        }
         self.set(&active.channel, "unavailable: request not sent");
         Some(Notice {
             critical: true,
@@ -189,10 +267,18 @@ impl JoinHistory {
             if let Some(batch) = &active.batch {
                 self.remember(batch);
             }
-            self.set(&active.channel, format!("incomplete: {why}"));
+            if active.lookup.is_some() {
+                self.settle(active.lookup, Err(format!("history lookup stopped: {why}")));
+            } else {
+                self.set(&active.channel, format!("incomplete: {why}"));
+            }
         }
         for queued in std::mem::take(&mut self.queue) {
-            self.set(&queued.channel, "unavailable: history setup stopped");
+            if queued.lookup.is_some() {
+                self.settle(queued.lookup, Err(format!("history lookup stopped: {why}")));
+            } else {
+                self.set(&queued.channel, "unavailable: history setup stopped");
+            }
         }
         Notice {
             critical: true,
@@ -210,6 +296,18 @@ impl JoinHistory {
     }
 
     fn finish(&mut self, active: Active) -> Option<Notice> {
+        if active.lookup.is_some() {
+            let result = if active.canceled {
+                Err(format!("{} is no longer joined", active.channel))
+            } else {
+                match active.found {
+                    Some(message) if active.complete => Ok(message),
+                    _ => Err("the server returned no single matching message".into()),
+                }
+            };
+            self.settle(active.lookup, result);
+            return None;
+        }
         if active.canceled {
             return None;
         }
@@ -285,6 +383,12 @@ impl JoinHistory {
                 );
             }
             let active = self.active.take().expect("correlated request");
+            if active.lookup.is_some() {
+                // An expired message is an explicit history gap, not an empty answer.
+                let why = format!("not retained by the server: {}", m.params.join(" "));
+                self.settle(active.lookup, Err(why));
+                return (Disposition::Consumed, None);
+            }
             if active.canceled {
                 return (Disposition::Consumed, None);
             }
@@ -323,6 +427,25 @@ impl JoinHistory {
         let correlated = matches!(m.command.as_str(), "PRIVMSG" | "NOTICE")
             && m.params.len() == 2
             && fold(&m.params[0]) == fold(&active.channel);
+        if let Some(msgid) = &active.lookup {
+            // Exactly the requested message. Without multiline, its later
+            // fallback lines carry no msgid and continue the same message.
+            match (&mut active.found, m.tags.get("msgid")) {
+                (None, Some(id)) if correlated && id == msgid => {
+                    active.bytes = m.params[1].len();
+                    active.found = Some(m.clone());
+                }
+                (Some(found), None)
+                    if correlated && active.bytes + 1 + m.params[1].len() <= JOIN_BYTES =>
+                {
+                    active.bytes += 1 + m.params[1].len();
+                    found.params[1].push('\n');
+                    found.params[1].push_str(&m.params[1]);
+                }
+                _ => active.complete = false,
+            }
+            return Disposition::Consumed;
+        }
         if correlated {
             active.messages += usize::from(m.tags.contains_key("msgid"));
             active.bytes += m.params[1].len();
@@ -663,5 +786,85 @@ mod tests {
                 .0,
             Disposition::Consumed
         );
+    }
+
+    #[test]
+    fn lookups_are_correlated_single_messages_and_never_replayed() {
+        let now = Instant::now();
+        let mut history = JoinHistory::default();
+        history.lookup("#a", "m1", now).unwrap();
+        // A JOIN page for the same channel still queues behind the lookup.
+        assert!(history.enqueue("#a", now).is_none());
+        let (request, notices) = history.dispatch(now);
+        assert_eq!(request.unwrap().params, ["AROUND", "#a", "msgid=m1", "1"]);
+        assert!(notices.is_empty());
+        assert_eq!(
+            history
+                .observe(&line(":test.airc BATCH +l1 chathistory #a"))
+                .0,
+            Disposition::Consumed
+        );
+        let found = line("@batch=l1;msgid=m1 :Bob!bob@airc PRIVMSG #a :parent");
+        assert_eq!(history.observe(&found).0, Disposition::Consumed);
+        assert!(history.take_lookup().is_none(), "only at batch end");
+        assert_eq!(
+            history.observe(&line(":test.airc BATCH -l1")).0,
+            Disposition::Consumed
+        );
+        let (msgid, found) = history.take_lookup().unwrap();
+        assert_eq!(
+            (msgid.as_str(), found.unwrap().params[1].as_str()),
+            ("m1", "parent")
+        );
+        assert_eq!(history.dispatch(now).0.unwrap().params[0], "LATEST");
+        let (_, notice) =
+            history.observe(&line(":test.airc FAIL CHATHISTORY INVALID_TARGET #a :x"));
+        assert!(notice.is_some_and(|n| n.critical));
+        // A missing message is an explicit error; another msgid is not a match.
+        let mut history = JoinHistory::default();
+        history.lookup("#a", "gone", now).unwrap();
+        history.dispatch(now);
+        let (_, notice) = history.observe(&line(
+            ":test.airc FAIL CHATHISTORY HISTORY_LOST #a :history reference no longer retained",
+        ));
+        assert!(notice.is_none());
+        let (msgid, missing) = history.take_lookup().unwrap();
+        assert_eq!(msgid, "gone");
+        assert!(missing.unwrap_err().contains("not retained by the server"));
+        history.lookup("#a", "m2", now).unwrap();
+        history.dispatch(now);
+        for event in [
+            ":test.airc BATCH +l2 chathistory #a",
+            "@batch=l2;msgid=other :Bob!bob@airc PRIVMSG #a :neighbor",
+            ":test.airc BATCH -l2",
+        ] {
+            assert_eq!(history.observe(&line(event)).0, Disposition::Consumed);
+        }
+        assert!(history.take_lookup().unwrap().1.is_err());
+        // Without multiline, fallback lines after the first carry no msgid and
+        // continue the same message.
+        history.lookup("#a", "m5", now).unwrap();
+        history.dispatch(now);
+        for event in [
+            ":test.airc BATCH +l3 chathistory #a",
+            "@batch=l3;msgid=m5 :Bob!bob@airc PRIVMSG #a :first line",
+            "@batch=l3 :Bob!bob@airc PRIVMSG #a :second line",
+            ":test.airc BATCH -l3",
+        ] {
+            assert_eq!(history.observe(&line(event)).0, Disposition::Consumed);
+        }
+        let (msgid, found) = history.take_lookup().unwrap();
+        assert_eq!(
+            (msgid.as_str(), found.unwrap().params[1].as_str()),
+            ("m5", "first line\nsecond line")
+        );
+        // A timed-out lookup quarantines like any history reply and reports it.
+        history.lookup("#a", "m3", now).unwrap();
+        history.dispatch(now);
+        assert!(history.expire(now + JOIN_DEADLINE).is_some());
+        let (msgid, expired) = history.take_lookup().unwrap();
+        assert_eq!(msgid, "m3");
+        assert!(expired.unwrap_err().contains("timed out"));
+        assert!(history.lookup("#a", "m4", now).is_err());
     }
 }

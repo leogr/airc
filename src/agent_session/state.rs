@@ -3,6 +3,7 @@ use super::{
         self, Classification, Identity, Readiness, Snapshot, SnapshotError, Stamp, WakeMode,
     },
     channels::{Begin, Change, Channels, Request},
+    delivery::{self, Batch, Delivery, Header, Lost, Outcome, prefix, record_reference},
     history::{Disposition, Notice},
 };
 use crate::{
@@ -10,7 +11,7 @@ use crate::{
     multiline::{self, Limits},
     protocol::{Message, fold, valid_channel, valid_nick},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -28,8 +29,8 @@ const READ_BYTES: usize = 1024 * 1024;
 /// Receipts keep this much text for inspection; longer text is matched by digest.
 const RECEIPT_PREVIEW: usize = 512;
 pub(super) const SEND_TAG: &str = "+airc-send";
-/// Saved-state version written by this release; version 1 is read-compatible.
-const VERSION: u8 = 2;
+/// Saved-state version written by this release; versions 1 and 2 are read-compatible.
+const VERSION: u8 = 3;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,9 +56,15 @@ pub(super) struct State {
     /// followed set is never mistaken for legacy configured channels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     channels: Option<Channels>,
+    /// The single delivery consumer's cursor and pending batch (version 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<Delivery>,
     /// Start of this worker's monotonic clock; restored events have no time.
     #[serde(skip)]
     clock: Option<Instant>,
+    /// In memory only: the current consumer found nothing relevant up to here.
+    #[serde(skip)]
+    scanned: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -150,14 +157,37 @@ impl State {
             clock: None,
             status: "not connected".into(),
             channels: Some(Channels::seeded(&config.channels)?),
+            delivery: None,
+            scanned: 0,
         })
     }
 
     pub fn validate(&self) -> Result<()> {
         match (self.version, &self.channels) {
             (1, None) => {}
-            (VERSION, Some(channels)) => channels.validate()?,
+            (2 | VERSION, Some(channels)) => channels.validate()?,
             _ => anyhow::bail!("unsupported or malformed session state version"),
+        }
+        ensure!(
+            self.version == VERSION || self.delivery.is_none(),
+            "delivery state requires session state version {VERSION}"
+        );
+        if let Some(delivery) = &self.delivery {
+            ensure!(
+                delivery.cursor <= self.sequence
+                    && delivery.pending.as_ref().is_none_or(|batch| {
+                        delivery::validate_id(&batch.id).is_ok()
+                            && batch.after == delivery.cursor
+                            && batch.after < batch.through
+                            && batch.through <= self.sequence
+                            && batch.header.len() + batch.records.len() <= delivery::MAX_BYTES
+                    })
+                    && delivery
+                        .last
+                        .as_ref()
+                        .is_none_or(|last| delivery::validate_id(&last.id).is_ok()),
+                "invalid delivery state"
+            );
         }
         ensure!(
             self.events.len() <= RETAIN
@@ -204,7 +234,20 @@ impl State {
         });
         let mut bytes: usize = self.events.iter().map(|e| e.text.len()).sum();
         while self.events.len() > RETAIN || bytes > RETAIN_BYTES {
-            bytes -= self.events.pop_front().unwrap().text.len();
+            let evicted = self.events.pop_front().unwrap();
+            bytes -= evicted.text.len();
+            // A pending batch already holds its own events; only later ones are lost.
+            if let Some(delivery) = &mut self.delivery
+                && evicted.sequence
+                    > delivery
+                        .pending
+                        .as_ref()
+                        .map_or(delivery.cursor, |batch| batch.through)
+            {
+                delivery
+                    .lost
+                    .record(evicted.class.unwrap_or(Classification::Critical));
+            }
         }
     }
 
@@ -315,55 +358,9 @@ impl State {
             // Locally initiated sends have a compact receipt; retain other own
             // messages (e.g. an earlier JSONL client) as ordinary conversation.
             if !duplicate && confirmed.is_none() {
-                let reference = id
-                    .map(|id| self.reference(id))
-                    .unwrap_or("live-only".into());
-                let nick = message
-                    .prefix
-                    .as_deref()
-                    .unwrap_or("server")
-                    .split('!')
-                    .next()
-                    .unwrap_or("?");
-                let account = message
-                    .tags
-                    .get("account")
-                    .map(String::as_str)
-                    .unwrap_or("unverified");
-                let reply = message
-                    .tags
-                    .get("+reply")
-                    .map(|id| {
-                        let reference = self
-                            .references
-                            .iter()
-                            .find(|r| r.msgid == *id)
-                            .map(|r| format!("@{}", r.number))
-                            .unwrap_or_else(|| {
-                                let bounded: String = id.chars().take(128).collect();
-                                format!(
-                                    "msgid:{}{}",
-                                    safe(&bounded),
-                                    if bounded.len() < id.len() {
-                                        "…[truncated]"
-                                    } else {
-                                        ""
-                                    }
-                                )
-                            });
-                        format!(" reply={reference}")
-                    })
-                    .unwrap_or_default();
-                let header = format!(
-                    "{}{} {} {}({}){}{}: ",
-                    if history { "history " } else { "" },
-                    reference,
-                    safe(target),
-                    safe(nick),
-                    safe(account),
-                    reply,
-                    artifact_metadata(message),
-                );
+                let (reference, header) =
+                    self.header(message, if history { "history " } else { "" });
+                let (nick, account) = sender(message);
                 let reply_to_own = message
                     .tags
                     .get("+reply")
@@ -433,6 +430,87 @@ impl State {
         confirmed
     }
 
+    /// Allocate a PRIVMSG/NOTICE's local reference and render its record header.
+    fn header(&mut self, message: &Message, label: &str) -> (String, String) {
+        let reference = message
+            .tags
+            .get("msgid")
+            .map(|id| self.reference(id))
+            .unwrap_or("live-only".into());
+        let (nick, account) = sender(message);
+        let reply = message
+            .tags
+            .get("+reply")
+            .map(|id| {
+                let reference = self
+                    .references
+                    .iter()
+                    .find(|r| r.msgid == *id)
+                    .map(|r| format!("@{}", r.number))
+                    .unwrap_or_else(|| {
+                        let bounded: String = id.chars().take(128).collect();
+                        format!(
+                            "msgid:{}{}",
+                            safe(&bounded),
+                            if bounded.len() < id.len() {
+                                "…[truncated]"
+                            } else {
+                                ""
+                            }
+                        )
+                    });
+                format!(" reply={reference}")
+            })
+            .unwrap_or_default();
+        let header = format!(
+            "{label}{} {} {}({}){}{}: ",
+            reference,
+            safe(&message.params[0]),
+            safe(nick),
+            safe(account),
+            reply,
+            artifact_metadata(message),
+        );
+        (reference, header)
+    }
+
+    /// The retained record whose header starts with this local `@N`.
+    pub fn retained_record(&self, reference: &str) -> Option<&str> {
+        self.events
+            .iter()
+            .rev()
+            .map(|e| e.text.as_str())
+            .find(|text| record_reference(text) == Some(reference))
+    }
+
+    /// The local `@N` already assigned to a server msgid.
+    pub fn local_reference(&self, msgid: &str) -> Option<String> {
+        self.references
+            .iter()
+            .find(|r| r.msgid == msgid)
+            .map(|r| format!("@{}", r.number))
+    }
+
+    /// Render a looked-up message for `show` only; it is never recorded.
+    pub fn render_context(&mut self, message: &Message) -> Option<String> {
+        if !matches!(message.command.as_str(), "PRIVMSG" | "NOTICE") || message.params.len() != 2 {
+            return None;
+        }
+        let (_, header) = self.header(message, "");
+        Some(framed(header, &message.params[1]))
+    }
+
+    pub fn begin_lookup(&mut self, channel: &str, msgid: &str) -> Result<(), String> {
+        match self.channels.as_mut() {
+            Some(channels) => channels.live.history.lookup(channel, msgid, Instant::now()),
+            None => Err("this session state has no channel controls".into()),
+        }
+    }
+
+    pub fn take_lookup(&mut self) -> Option<(String, Result<Message, String>)> {
+        self.channels.as_mut()?.live.history.take_lookup()
+    }
+
     pub fn has_unread(&self) -> bool {
         self.sequence > self.cursor
     }
@@ -440,6 +518,15 @@ impl State {
     /// Whether a waiter in `mode` should wake now, without consuming anything.
     /// `deadline` is that waiter's own deadline on this worker's clock.
     pub fn readiness(&self, mode: WakeMode, deadline: Instant) -> Result<Readiness, SnapshotError> {
+        self.readiness_after(self.cursor, mode, deadline)
+    }
+
+    fn readiness_after(
+        &self,
+        cursor: u64,
+        mode: WakeMode,
+        deadline: Instant,
+    ) -> Result<Readiness, SnapshotError> {
         let start = self.clock.unwrap_or_else(Instant::now);
         let stamps = self.events.iter().map(|e| Stamp {
             sequence: e.sequence,
@@ -450,7 +537,7 @@ impl State {
         attention::readiness(
             mode,
             Snapshot {
-                cursor: self.cursor,
+                cursor,
                 sequence: self.sequence,
                 events: stamps,
                 capacity: RETAIN,
@@ -496,6 +583,214 @@ impl State {
         }
         self.last_read = text.clone();
         text
+    }
+
+    /// Register a fresh delivery consumer. The first one starts at the read
+    /// cursor, so history already read is not delivered; events evicted above
+    /// that cursor make every mode report a gap, conservatively.
+    pub fn begin_delivery(&mut self) {
+        self.scanned = 0;
+        if self.delivery.is_none() {
+            let evicted = self
+                .events
+                .front()
+                .map_or(self.sequence > self.cursor, |e| {
+                    e.sequence > self.cursor + 1
+                });
+            self.delivery = Some(Delivery {
+                cursor: self.cursor,
+                lost: if evicted {
+                    Lost::everything()
+                } else {
+                    Lost::default()
+                },
+                pending: None,
+                last: None,
+            });
+        }
+    }
+
+    pub fn pending_delivery(&self) -> Option<&Batch> {
+        self.delivery.as_ref()?.pending.as_ref()
+    }
+
+    /// Readiness above the delivery cursor (or the in-memory scan floor); a lost
+    /// relevant event is ready at once. Reads never affect it.
+    pub fn delivery_readiness(
+        &self,
+        mode: WakeMode,
+        deadline: Instant,
+    ) -> Result<Readiness, SnapshotError> {
+        let delivery = self
+            .delivery
+            .as_ref()
+            .map_or((self.cursor, Lost::default()), |d| (d.cursor, d.lost));
+        if delivery.1.any(mode) {
+            return Ok(Readiness::Ready);
+        }
+        self.readiness_after(delivery.0.max(self.scanned), mode, deadline)
+    }
+
+    /// An undelivered critical or lost relevant event bypasses a minimum interval.
+    pub fn delivery_urgent(&self, mode: WakeMode) -> bool {
+        self.delivery.as_ref().is_some_and(|d| {
+            d.lost.any(mode)
+                || self.events.iter().any(|e| {
+                    e.sequence > d.cursor
+                        && e.class.unwrap_or(Classification::Critical) == Classification::Critical
+                })
+        })
+    }
+
+    /// Make and keep the next pending batch: complete relevant records after the
+    /// delivery cursor within `max_bytes`, header included. Without a relevant
+    /// record or gap, only the in-memory scan floor advances and nothing is made.
+    pub fn prepare_delivery(
+        &mut self,
+        session: &str,
+        mode: WakeMode,
+        max_bytes: usize,
+    ) -> Option<(String, String)> {
+        let delivery = self.delivery.as_ref()?;
+        if delivery.pending.is_some() {
+            return None;
+        }
+        let (after, gap) = (delivery.cursor, delivery.lost.any(mode));
+        let id = uuid::Uuid::new_v4().to_string();
+        let (account, nick) = (safe(&self.account), safe(&self.nick));
+        let header = Header {
+            id: &id,
+            session,
+            account: &account,
+            nick: &nick,
+            mode,
+            events: 0,
+            context: 0,
+            bytes: 0,
+            more: false,
+            gap,
+        };
+        let budget = max_bytes.saturating_sub(header.bound());
+        let mut records = String::new();
+        if gap {
+            records.push_str("! GAP: undelivered events relevant to this consumer were evicted from the 512-event buffer; context is incomplete.\n");
+        }
+        let (mut events, mut context, mut more, mut through) = (0, 0, false, after);
+        for event in self.events.iter().filter(|e| e.sequence > after) {
+            let class = event.class.unwrap_or(Classification::Critical);
+            if !class.relevant(mode) {
+                if matches!(class, Classification::Message { .. }) {
+                    context += 1;
+                }
+                through = event.sequence;
+                continue;
+            }
+            if records.len() + event.text.len() < budget {
+                records.push_str(&event.text);
+                records.push('\n');
+            } else if events > 0 {
+                // Complete records only; the rest follows in the next batch.
+                more = true;
+                break;
+            } else {
+                // One oversized record: an explicit prefix; the original stays retained.
+                let hint = record_reference(&event.text).map_or_else(
+                    || "it remains readable with airc read until evicted".to_string(),
+                    |reference| format!("airc show {session} {reference} prints all of it"),
+                );
+                let marker = |omitted: usize| {
+                    format!(
+                        "\n! record truncated: {omitted} of {} bytes not delivered; {hint}\n",
+                        event.text.len()
+                    )
+                };
+                let room = budget.saturating_sub(records.len() + marker(event.text.len()).len());
+                let kept = prefix(&event.text, room);
+                records.push_str(kept);
+                records.push_str(&marker(event.text.len() - kept.len()));
+            }
+            events += 1;
+            through = event.sequence;
+        }
+        if events == 0 && !gap {
+            self.scanned = self.scanned.max(through);
+            return None;
+        }
+        let header = Header {
+            events,
+            context,
+            bytes: records.len(),
+            more,
+            ..header
+        }
+        .open();
+        let delivery = self.delivery.as_mut()?;
+        let batch = Batch {
+            lost: std::mem::take(&mut delivery.lost),
+            id: id.clone(),
+            after,
+            // A gap-only batch covers everything scanned or evicted so far.
+            through: if events == 0 { self.sequence } else { through },
+            created: now(),
+            header,
+            records,
+        };
+        let text = batch.render(false);
+        delivery.pending = Some(batch);
+        Some((id, text))
+    }
+
+    /// Accept (the sink took it, not proof of processing) or drop the pending
+    /// batch named by its exact ID, moving only the delivery cursor past it.
+    pub fn finish_delivery(&mut self, id: &str, kind: &'static str) -> Result<String> {
+        let delivery = self.delivery.as_mut().context("no delivery state")?;
+        let Some(batch) = delivery.pending.take_if(|batch| batch.id == id) else {
+            anyhow::bail!(match &delivery.pending {
+                Some(pending) => format!("delivery {id} is not pending; {} is", pending.id),
+                None => format!("no pending delivery {id}"),
+            });
+        };
+        // The batch reported its own losses; any recorded since are above it.
+        delivery.cursor = batch.through;
+        let at = now();
+        let text = format!("{kind} {id} at {at}");
+        delivery.last = Some(Outcome {
+            id: id.into(),
+            kind: kind.into(),
+            at,
+        });
+        Ok(text)
+    }
+
+    /// Forget a batch nobody received: its caller left before any reply byte.
+    pub fn revert_delivery(&mut self, id: &str) {
+        if let Some(delivery) = &mut self.delivery
+            && let Some(batch) = delivery.pending.take_if(|batch| batch.id == id)
+        {
+            delivery.lost.merge(batch.lost);
+        }
+    }
+
+    pub fn describe_delivery(&self) -> String {
+        let Some(delivery) = &self.delivery else {
+            return "delivery: unused\n".into();
+        };
+        let pending = delivery.pending.as_ref().map_or("none".into(), |batch| {
+            format!(
+                "{} since={} events={}..{}",
+                batch.id,
+                batch.created,
+                batch.after + 1,
+                batch.through
+            )
+        });
+        let last = delivery.last.as_ref().map_or("none".into(), |outcome| {
+            format!("{} {}={}", outcome.id, outcome.kind, outcome.at)
+        });
+        format!(
+            "delivery: cursor={} pending={pending} last={last}\n",
+            delivery.cursor
+        )
     }
 
     /// Frames for one send: a single PRIVMSG, or one multiline batch when the
@@ -584,8 +879,8 @@ impl State {
     pub fn upgrade(&mut self, config: &ClientConfig) -> Result<()> {
         if self.version == 1 {
             self.channels = Some(Channels::seeded(&config.channels)?);
-            self.version = VERSION;
         }
+        self.version = VERSION;
         if let Some(notice) = self
             .channels_mut()
             .interrupt("the previous worker ended before confirmation")
@@ -760,11 +1055,42 @@ impl State {
                 safe(id)
             ));
         }
+        text.push_str(&self.describe_delivery());
         if !running {
             text.push_str("Reconnect explicitly: airc connect SESSION --config FILE. Nothing will be resent.\n");
         }
         text
     }
+}
+
+/// The channel and `reply=` value in a rendered record header, if present.
+pub(super) fn record_links(text: &str) -> (Option<&str>, Option<&str>) {
+    let text = text.strip_prefix("history ").unwrap_or(text);
+    let line = text.split('\n').next().unwrap_or("");
+    let head = line.split_once(": ").map_or(line, |(head, _)| head);
+    let channel = head.split(' ').nth(1);
+    let reply = head.split(' ').find_map(|word| word.strip_prefix("reply="));
+    (channel, reply)
+}
+
+fn sender(message: &Message) -> (&str, &str) {
+    let nick = message
+        .prefix
+        .as_deref()
+        .unwrap_or("server")
+        .split('!')
+        .next()
+        .unwrap_or("?");
+    let account = message
+        .tags
+        .get("account")
+        .map(String::as_str)
+        .unwrap_or("unverified");
+    (nick, account)
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 pub(super) fn identity(config: &ClientConfig) -> Result<String> {
@@ -1088,5 +1414,291 @@ mod tests {
         );
         assert!(output.len() < raw);
         assert_eq!(output.lines().count(), 20);
+    }
+
+    fn delivering() -> State {
+        let mut s = state();
+        s.begin_epoch();
+        s
+    }
+
+    fn header_of(text: &str) -> &str {
+        text.lines().next().unwrap()
+    }
+
+    #[test]
+    fn delivery_cursor_is_separate_from_reads_and_mentions_count_context() {
+        let mut s = delivering();
+        s.ingest(&chat("hello room", "m1"), false);
+        s.read(50); // Already read before any consumer: not delivered later.
+        s.begin_delivery();
+        s.ingest(&chat("chatter", "m2"), false);
+        s.ingest(&chat("@Alice please review", "m3"), false);
+        s.ingest(&chat("more chatter", "m4"), false);
+        // A manual read consumes the read cursor but steals nothing from delivery.
+        assert!(s.read(50).contains("please review"));
+        let (id, text) = s
+            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .unwrap();
+        let header = header_of(&text);
+        assert!(header.starts_with(&format!("[airc delivery id={id} session=trial account=alice nick=Alice wake=mentions events=1 context=2 bytes=")));
+        assert!(header.ends_with(" more=no gap=no retry=no]"), "{header}");
+        assert!(
+            text.contains("@Alice please review")
+                && !text.contains("chatter")
+                && !text.contains("hello")
+        );
+        assert!(text.len() <= 8192);
+        // Pending blocks another batch; accepting moves only the delivery cursor.
+        assert!(
+            s.prepare_delivery("trial", WakeMode::Mentions, 8192)
+                .is_none()
+        );
+        let read_cursor = s.cursor;
+        assert!(
+            s.finish_delivery(&id, "accepted")
+                .unwrap()
+                .starts_with(&format!("accepted {id} at "))
+        );
+        assert_eq!(
+            (s.cursor, s.delivery.as_ref().unwrap().cursor),
+            (read_cursor, 4)
+        );
+        assert!(
+            s.describe_delivery()
+                .contains(&format!("last={id} accepted="))
+        );
+        assert_eq!(s.read(50), "No new events.\n");
+    }
+
+    #[test]
+    fn irrelevant_events_move_only_the_in_memory_scan_floor() {
+        let mut s = delivering();
+        s.begin_delivery();
+        for n in 0..3 {
+            s.ingest(&chat(&format!("chatter {n}"), &format!("c{n}")), false);
+        }
+        assert!(
+            s.prepare_delivery("trial", WakeMode::Mentions, 8192)
+                .is_none()
+        );
+        assert_eq!((s.delivery.as_ref().unwrap().cursor, s.scanned), (0, 3));
+        let far = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            s.delivery_readiness(WakeMode::Mentions, far),
+            Ok(Readiness::Pending)
+        );
+        // Messages mode starts from the durable cursor again, with all three.
+        s.begin_delivery();
+        let (_, text) = s
+            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .unwrap();
+        assert!(header_of(&text).contains(" events=3 context=0 "));
+    }
+
+    #[test]
+    fn batches_hold_complete_records_and_cut_one_oversized_record_explicitly() {
+        let mut s = delivering();
+        s.begin_delivery();
+        for n in 0..4 {
+            s.ingest(
+                &chat(&format!("{n} {}", "x".repeat(300)), &format!("m{n}")),
+                false,
+            );
+        }
+        let (first, text) = s
+            .prepare_delivery("trial", WakeMode::Messages, 1024)
+            .unwrap();
+        assert!(
+            text.len() <= 1024 && header_of(&text).contains(" more=yes "),
+            "{text}"
+        );
+        let records: Vec<_> = text.lines().skip(1).collect();
+        assert!(!records.is_empty() && records.iter().all(|r| r.ends_with(&"x".repeat(300))));
+        s.finish_delivery(&first, "accepted").unwrap();
+        let (_, next) = s
+            .prepare_delivery("trial", WakeMode::Messages, 1024)
+            .unwrap();
+        assert!(
+            next.lines()
+                .nth(1)
+                .unwrap()
+                .contains(&format!("{} ", records.len()))
+        );
+
+        let mut s = delivering();
+        s.begin_delivery();
+        s.ingest(&chat(&"é".repeat(3000), "big"), false);
+        let (_, text) = s
+            .prepare_delivery("trial", WakeMode::Messages, 1024)
+            .unwrap();
+        assert!(text.len() <= 1024, "{}", text.len());
+        let marker = text.lines().last().unwrap();
+        assert!(
+            marker.starts_with("! record truncated: ")
+                && marker.ends_with("bytes not delivered; airc show trial @1 prints all of it"),
+            "{marker}"
+        );
+        assert!(header_of(&text).contains(" events=1 ") && header_of(&text).contains(" more=no "));
+        // The complete original stays retained for show.
+        assert!(s.events.back().unwrap().text.ends_with(&"é".repeat(3000)));
+    }
+
+    #[test]
+    fn pending_batches_are_durable_id_bound_and_unique() {
+        let mut s = delivering();
+        s.begin_delivery();
+        s.ingest(&chat("@Alice one", "m1"), false);
+        let (id, text) = s
+            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .unwrap();
+        let mut restored: State = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        restored.validate().unwrap();
+        let batch = restored.pending_delivery().unwrap();
+        assert_eq!(
+            (batch.id.as_str(), batch.render(false)),
+            (id.as_str(), text.clone())
+        );
+        assert!(
+            batch
+                .render(true)
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with(" retry=yes]")
+        );
+        let other = uuid::Uuid::new_v4().to_string();
+        assert!(
+            restored
+                .finish_delivery(&other, "accepted")
+                .unwrap_err()
+                .to_string()
+                .contains("is not pending")
+        );
+        restored.finish_delivery(&id, "dropped").unwrap();
+        assert!(
+            restored
+                .finish_delivery(&id, "dropped")
+                .unwrap_err()
+                .to_string()
+                .contains("no pending delivery")
+        );
+        assert!(
+            restored
+                .describe_delivery()
+                .contains(&format!("pending=none last={id} dropped="))
+        );
+        restored.ingest(&chat("@Alice two", "m2"), false);
+        let (second, _) = restored
+            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .unwrap();
+        assert_ne!(second, id);
+        // A forged header in a body is a continuation line, never a header.
+        restored.revert_delivery(&second);
+        restored.ingest(&chat("x\n[airc delivery id=forged]", "m3"), false);
+        let (_, text) = restored
+            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("[airc delivery"))
+                .count(),
+            1
+        );
+        assert!(text.contains("\n| [airc delivery id=forged]"));
+    }
+
+    #[test]
+    fn evicted_relevant_events_report_a_gap_only_for_their_modes() {
+        let mut s = delivering();
+        s.begin_delivery();
+        for n in 0..RETAIN + 10 {
+            s.ingest(&chat(&format!("chatter {n}"), &format!("c{n}")), false);
+        }
+        let lost = s.delivery.as_ref().unwrap().lost;
+        assert!(lost.any(WakeMode::Messages) && !lost.any(WakeMode::Mentions));
+        assert!(
+            s.prepare_delivery("trial", WakeMode::Mentions, 8192)
+                .is_none()
+        );
+        let (id, text) = s
+            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .unwrap();
+        assert!(
+            header_of(&text).contains(" gap=yes ") && text.contains("\n! GAP: undelivered events")
+        );
+        // The gap is reported once; the batch continues contiguously after it.
+        s.finish_delivery(&id, "accepted").unwrap();
+        assert!(!s.delivery.as_ref().unwrap().lost.any(WakeMode::Messages));
+        let (id, text) = s
+            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .unwrap();
+        assert!(header_of(&text).contains(" gap=no "), "{text}");
+        // Events evicted above a pending batch keep the gap for the next one.
+        for n in 0..RETAIN {
+            s.ingest(&chat(&format!("later {n}"), &format!("l{n}")), false);
+        }
+        s.finish_delivery(&id, "accepted").unwrap();
+        assert!(s.delivery.as_ref().unwrap().lost.any(WakeMode::Messages));
+    }
+
+    #[test]
+    fn version_two_state_upgrades_and_delivery_requires_version_three() {
+        let mut s = delivering();
+        let mut v2 = serde_json::to_value(&s).unwrap();
+        v2["version"] = 2.into();
+        let mut legacy: State = serde_json::from_value(v2.clone()).unwrap();
+        legacy.validate().unwrap();
+        legacy.upgrade(&config()).unwrap();
+        assert_eq!(legacy.version, VERSION);
+        s.begin_delivery();
+        let mut v2 = serde_json::to_value(&s).unwrap();
+        v2["version"] = 2.into();
+        let invalid: State = serde_json::from_value(v2).unwrap();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn evicting_a_pending_batchs_own_events_is_not_a_gap() {
+        let mut s = delivering();
+        s.begin_delivery();
+        s.ingest(&chat("@Alice one", "m1"), false);
+        let (id, _) = s
+            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .unwrap();
+        // A burst evicts the pending batch's own mention and later chatter.
+        for n in 0..RETAIN + 5 {
+            s.ingest(&chat(&format!("chatter {n}"), &format!("c{n}")), false);
+        }
+        let lost = s.delivery.as_ref().unwrap().lost;
+        assert!(!lost.any(WakeMode::Mentions) && lost.any(WakeMode::Messages));
+        s.finish_delivery(&id, "accepted").unwrap();
+        s.ingest(&chat("@Alice two", "m2"), false);
+        let (id, text) = s
+            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .unwrap();
+        assert!(header_of(&text).contains(" gap=no "), "{text}");
+        // A batch reverted undelivered restores the losses it carried.
+        s.revert_delivery(&id);
+        let (_, text) = s
+            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .unwrap();
+        assert!(header_of(&text).contains(" gap=yes "), "{text}");
+    }
+
+    #[test]
+    fn record_links_read_only_the_rendered_header() {
+        assert_eq!(
+            record_links("@5 #work Bob(bob) reply=@4: text reply=@9"),
+            (Some("#work"), Some("@4"))
+        );
+        assert_eq!(
+            record_links("history @5 #work Bob(bob) reply=msgid:abc: x"),
+            (Some("#work"), Some("msgid:abc"))
+        );
+        assert_eq!(
+            record_links("@5 #work Bob(bob): a\n| reply=@1"),
+            (Some("#work"), None)
+        );
     }
 }

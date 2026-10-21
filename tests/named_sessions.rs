@@ -1084,6 +1084,10 @@ async fn lost_away_ack_is_unconfirmed_and_reconnect_never_replays_the_claim() {
         );
         assert_eq!(next(&mut human, "AWAY").await.params, ["explicit claim"]);
         next(&mut human, "QUIT").await;
+        // The server's QUIT only proves the IRC connection closed. Reconnect
+        // once the old worker has really exited: status reports `stopped` only
+        // when no worker answers the socket and the owner lock is free.
+        eventually(|| f.ok(&["status", "trial"]), |s| s.starts_with("stopped;")).await;
         f.connect(&server).await;
         next(&mut human, "JOIN").await;
         human
@@ -1588,5 +1592,437 @@ async fn delayed_join_setup_refuses_topic_queries_and_keeps_the_newer_topic() {
         "{status}"
     );
     f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+fn text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Poll a fresh view until `ready`; reads, statuses and files are side-effect free.
+async fn eventually<F, Fut>(mut probe: F, ready: impl Fn(&str) -> bool) -> String
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = String>,
+{
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let seen = probe().await;
+            if ready(&seen) {
+                break seen;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("condition not reached")
+}
+
+fn delivery_id(batch: &str) -> String {
+    batch
+        .lines()
+        .next()
+        .and_then(|header| header.strip_prefix("[airc delivery id="))
+        .and_then(|rest| rest.split(' ').next())
+        .expect("delivery header")
+        .to_string()
+}
+
+#[tokio::test]
+async fn wait_deliver_prints_only_mentions_and_manual_reads_never_steal() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let idle = f
+        .cli(&["wait", "trial", "--deliver", "--timeout", "0"])
+        .await;
+    assert!(
+        !idle.status.success() && text(&idle).contains("wait timed out"),
+        "{}",
+        text(&idle)
+    );
+    send(&mut human, "routine chatter").await;
+    send(&mut human, "@alice please review").await;
+    // A manual read takes the read cursor only.
+    let mut seen = String::new();
+    timeout(Duration::from_secs(10), async {
+        while !seen.contains("please review") {
+            seen.push_str(&f.ok(&["read", "trial", "--wait", "2"]).await);
+        }
+    })
+    .await
+    .unwrap();
+    let delivered = f
+        .ok(&[
+            "wait",
+            "trial",
+            "--deliver",
+            "--wake",
+            "mentions",
+            "--timeout",
+            "8",
+        ])
+        .await;
+    let header = delivered.lines().next().unwrap();
+    assert!(
+        header.starts_with("[airc delivery id=")
+            && header.contains(
+                " session=trial account=alice nick=alice wake=mentions events=1 context=1 "
+            )
+            && header.ends_with(" more=no gap=no retry=no]"),
+        "{delivered}"
+    );
+    assert!(delivered.contains("human(human): @alice please review"));
+    assert!(!delivered.contains("routine chatter"));
+    let status = f.ok(&["deliveries", "trial"]).await;
+    assert!(
+        status.contains("pending=none")
+            && status.contains(&format!("last={} accepted=", delivery_id(&delivered)))
+            && status.contains("delivery consumer: none"),
+        "{status}"
+    );
+    // Accepted batches never come back; plain wait and read are unchanged.
+    let again = f
+        .cli(&[
+            "wait",
+            "trial",
+            "--deliver",
+            "--wake",
+            "mentions",
+            "--timeout",
+            "0",
+        ])
+        .await;
+    assert!(text(&again).contains("wait timed out"), "{}", text(&again));
+    assert!(f.ok(&["read", "trial"]).await.contains("No new events"));
+    assert!(
+        f.ok(&["status", "trial"])
+            .await
+            .contains("delivery: cursor=")
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_sinks_leave_one_pending_batch_until_explicit_id_bound_recovery() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("first.batch");
+    let failing = |path: &std::path::Path| {
+        vec![
+            "subscribe".to_string(),
+            "trial".into(),
+            "--wake".into(),
+            "mentions".into(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "cat > \"$0\"; echo boom >&2; exit 7".into(),
+            path.to_str().unwrap().into(),
+        ]
+    };
+    // Register the consumer before the mention so the batch is certain to exist.
+    let args = failing(&out);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let subscriber = f.cli(&argv);
+    let mention = async {
+        eventually(
+            || f.ok(&["status", "trial"]),
+            |s| s.contains("delivery consumer: subscribe"),
+        )
+        .await;
+        send(&mut human, "@alice first").await;
+    };
+    let (failed, ()) = tokio::join!(subscriber, mention);
+    let batch = std::fs::read_to_string(&out).unwrap();
+    let id = delivery_id(&batch);
+    let failed = text(&failed);
+    assert!(
+        failed.contains(&format!(
+            "delivery {id} not accepted: adapter exited with exit status: 7; adapter stderr: boom"
+        )) && failed.contains(&format!("--retry-pending {id}"))
+            && failed.contains("Nothing was replayed."),
+        "{failed}"
+    );
+    // A worker restart keeps it pending; a restart never replays it, and the
+    // adapter is never invoked.
+    f.ok(&["disconnect", "trial"]).await;
+    f.connect(&server).await;
+    assert!(
+        f.ok(&["status", "trial"])
+            .await
+            .contains(&format!("pending={id} since="))
+    );
+    let unused = f.dir.path().join("unused.batch");
+    let args = failing(&unused);
+    let refused = f
+        .cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused).contains(&format!("delivery {id} pending since")),
+        "{}",
+        text(&refused)
+    );
+    assert!(!unused.exists());
+    assert_eq!(f.ok(&["deliveries", "trial", "--show", &id]).await, batch);
+    // The operator-authorized retry redelivers that exact batch once, flagged.
+    let retried = f
+        .ok(&[
+            "wait",
+            "trial",
+            "--deliver",
+            "--retry-pending",
+            &id,
+            "--timeout",
+            "0",
+        ])
+        .await;
+    assert_eq!(retried, batch.replacen(" retry=no]", " retry=yes]", 1));
+    assert!(
+        f.ok(&["deliveries", "trial"])
+            .await
+            .contains(&format!("last={id} accepted="))
+    );
+    // Drop is ID-bound as well; a stale or unknown ID changes nothing.
+    let args = failing(&out);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let subscriber = f.cli(&argv);
+    let mention = async {
+        eventually(
+            || f.ok(&["status", "trial"]),
+            |s| s.contains("delivery consumer: subscribe"),
+        )
+        .await;
+        send(&mut human, "@alice second").await;
+    };
+    tokio::join!(subscriber, mention);
+    let second = delivery_id(&std::fs::read_to_string(&out).unwrap());
+    assert_ne!(second, id);
+    let stale = f.cli(&["deliveries", "trial", "--drop", &id]).await;
+    assert!(
+        !stale.status.success() && text(&stale).contains("is not pending"),
+        "{}",
+        text(&stale)
+    );
+    assert!(
+        f.ok(&["deliveries", "trial", "--drop", &second])
+            .await
+            .contains(&format!("dropped {second}"))
+    );
+    let unknown = f
+        .cli(&["deliveries", "trial", "--mark-accepted", &second])
+        .await;
+    assert!(!unknown.status.success() && text(&unknown).contains("no pending delivery"));
+    // Dropped events stay readable.
+    assert!(f.ok(&["read", "trial"]).await.contains("@alice second"));
+    // An operator who verified receipt marks that exact batch accepted.
+    let args = failing(&out);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let subscriber = f.cli(&argv);
+    let mention = async {
+        eventually(
+            || f.ok(&["status", "trial"]),
+            |s| s.contains("delivery consumer: subscribe"),
+        )
+        .await;
+        send(&mut human, "@alice third").await;
+    };
+    tokio::join!(subscriber, mention);
+    let third = delivery_id(&std::fs::read_to_string(&out).unwrap());
+    assert!(
+        f.ok(&["deliveries", "trial", "--mark-accepted", &third])
+            .await
+            .contains(&format!("accepted {third} at "))
+    );
+    let summary = f.ok(&["deliveries", "trial"]).await;
+    assert!(
+        summary.contains(&format!("pending=none last={third} accepted=")),
+        "{summary}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn show_prints_reply_ancestors_without_consuming_and_reports_history_gaps() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    let root = send(&mut human, "root question").await;
+    let mut reply = Message::new("PRIVMSG", ["#work", "first answer"]);
+    reply
+        .tags
+        .insert("+reply".into(), root.tags["msgid"].clone());
+    human.outbound.send(vec![reply]).await.unwrap();
+    let child = next(&mut human, "PRIVMSG").await;
+    let mut nested = Message::new("PRIVMSG", ["#work", "follow-up"]);
+    nested
+        .tags
+        .insert("+reply".into(), child.tags["msgid"].clone());
+    human.outbound.send(vec![nested]).await.unwrap();
+    next(&mut human, "PRIVMSG").await;
+    f.connect(&server).await;
+    let unread = f.ok(&["status", "trial"]).await;
+    let shown = f.ok(&["show", "trial", "@3", "--chain", "8"]).await;
+    assert_eq!(
+        shown.lines().collect::<Vec<_>>(),
+        [
+            "context @1 #work human(human): root question",
+            "context @2 #work human(human) reply=@1: first answer",
+            "context @3 #work human(human) reply=@2: follow-up",
+        ],
+        "{shown}"
+    );
+    let parent = f.ok(&["show", "trial", "@3", "--parent"]).await;
+    assert_eq!(parent.lines().count(), 2, "{parent}");
+    assert!(
+        f.ok(&["show", "trial", "@2"])
+            .await
+            .starts_with("context @2 ")
+    );
+    // Nothing was consumed: status and the unread history are unchanged.
+    assert_eq!(f.ok(&["status", "trial"]).await, unread);
+    assert!(
+        f.ok(&["read", "trial"])
+            .await
+            .contains("history @3 #work human(human) reply=@2: follow-up")
+    );
+    // A msgid the server no longer retains is an explicit gap, never silence.
+    let missing = f
+        .cli(&["show", "trial", "msgid:not-retained", "--channel", "#work"])
+        .await;
+    assert!(!missing.status.success());
+    assert!(
+        text(&missing).contains("not retained by the server"),
+        "{}",
+        text(&missing)
+    );
+    let unknown = f.cli(&["show", "trial", "@99"]).await;
+    assert!(
+        text(&unknown).contains("unknown to this session"),
+        "{}",
+        text(&unknown)
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_slot() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    let mut subscriber = tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+        .arg("--state-dir")
+        .arg(&f.root)
+        .args(["subscribe", "trial", "--wake", "mentions", "--", "sh", "-c"])
+        .arg("cat >> \"$0\"; echo \"$AIRC_DELIVERY_ID $AIRC_DELIVERY_RETRY $AIRC_SESSION $AIRC_SUBSCRIBER_PID\" >> \"$0.env\"")
+        .arg(&out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = subscriber.id().unwrap();
+    let status = eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: subscribe"),
+    )
+    .await;
+    assert!(status.contains(&format!("pid={pid} ")), "{status}");
+    // A second consumer and every recovery mutation are refused while it runs.
+    let second = f
+        .cli(&["wait", "trial", "--deliver", "--timeout", "0"])
+        .await;
+    assert!(
+        text(&second).contains("delivery consumer active since"),
+        "{}",
+        text(&second)
+    );
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    for action in ["--drop", "--mark-accepted"] {
+        let refused = f.cli(&["deliveries", "trial", action, unknown]).await;
+        assert!(
+            text(&refused).contains("recovery is refused while it runs"),
+            "{}",
+            text(&refused)
+        );
+    }
+    let read =
+        |path: std::path::PathBuf| async move { std::fs::read_to_string(path).unwrap_or_default() };
+    send(&mut human, "@alice one").await;
+    eventually(|| read(out.clone()), |s| s.contains("@alice one")).await;
+    send(&mut human, "@alice two").await;
+    let batches = eventually(|| read(out.clone()), |s| s.contains("@alice two")).await;
+    let headers: Vec<_> = batches
+        .lines()
+        .filter(|l| l.starts_with("[airc delivery"))
+        .collect();
+    assert_eq!(headers.len(), 2, "{batches}");
+    let env = eventually(
+        || read(out.with_extension("env")),
+        |s| s.lines().count() == 2,
+    )
+    .await;
+    for (line, header) in env.lines().zip(&headers) {
+        assert_eq!(line, format!("{} 0 trial {pid}", delivery_id(header)));
+    }
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains("pending=none") && s.contains(" accepted="),
+    )
+    .await;
+    // Killing the consumer releases the slot at once; no timer is involved.
+    subscriber.kill().await.unwrap();
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: none"),
+    )
+    .await;
+    let idle = f
+        .cli(&[
+            "wait",
+            "trial",
+            "--deliver",
+            "--wake",
+            "mentions",
+            "--timeout",
+            "0",
+        ])
+        .await;
+    assert!(text(&idle).contains("wait timed out"), "{}", text(&idle));
+    // A disconnect ends a subscriber visibly and accepts nothing.
+    let lingering = tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+        .arg("--state-dir")
+        .arg(&f.root)
+        .args(["subscribe", "trial", "--", "-"])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let disconnect = async {
+        eventually(
+            || f.ok(&["status", "trial"]),
+            |s| s.contains("delivery consumer: subscribe"),
+        )
+        .await;
+        f.ok(&["disconnect", "trial"]).await;
+    };
+    let (ended, ()) = tokio::join!(lingering, disconnect);
+    let ended = ended.unwrap();
+    assert!(
+        !ended.status.success() && text(&ended).contains("explicitly disconnected"),
+        "{}",
+        text(&ended)
+    );
     server.shutdown().await.unwrap();
 }

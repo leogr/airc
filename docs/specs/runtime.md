@@ -54,6 +54,10 @@ before network output and its outcome before the reply. Partial startup stays
 connected when channels are refused. [6](#source-6)
 
 [FACT] Named readiness waits do not consume events or replace read replay.
+Delivery uses a separate durable cursor and one connection-bound consumer:
+batches are pending before any sink sees them, are accepted only on sink
+success, and are never replayed without an explicit ID. Context lookups have no
+cursor or replay side effects. [8](#source-8)
 They renew bounded idle requests and stop on errors/disconnects. Agent turn
 scheduling remains the harness's responsibility. Status exposes only the worker's
 current registration; optional private handle bookkeeping never proves a wake.
@@ -70,3 +74,4 @@ current registration; optional private handle bookkeeping never proves a wake.
 6. <a id="source-6"></a> [Named channel controls](../digests/named-channels.md).
 
 7. <a id="source-7"></a> [Monitor evidence](../digests/monitor.md).
+8. <a id="source-8"></a> [Named delivery](../digests/delivery.md).

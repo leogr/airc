@@ -1,6 +1,7 @@
 //! Named, explicitly started local IRC clients. IPC never carries credentials.
 mod attention;
 mod channels;
+mod delivery;
 mod history;
 mod state;
 mod storage;
@@ -48,6 +49,14 @@ pub enum Wake {
     /// Explicit @nick/@account or leading/group addresses, direct messages, replies to this
     /// session's messages, @all/@here, and local problems.
     Mentions,
+}
+
+/// Which command holds the delivery consumer connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerKind {
+    Wait,
+    Subscribe,
 }
 
 impl Wake {
@@ -105,6 +114,42 @@ pub enum Operation {
         )]
         text: Option<String>,
     },
+    /// Register this connection as the single delivery consumer. Its later
+    /// deliver/accept requests use the same connection; closing it releases.
+    Consume {
+        kind: ConsumerKind,
+        /// The exact pending ID the operator authorized for one redelivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<String>,
+    },
+    Deliver {
+        wait: u64,
+        wake: Wake,
+        max_bytes: usize,
+        #[serde(default)]
+        min_interval: u64,
+    },
+    /// The consumer's sink accepted this batch; from another connection, an
+    /// operator's mark-accepted, refused while a consumer is registered.
+    Accept {
+        id: String,
+    },
+    /// Skip the pending batch without claiming delivery; refused while a consumer runs.
+    DropPending {
+        id: String,
+    },
+    Deliveries {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show: Option<String>,
+    },
+    /// Print one record and up to `depth` reply ancestors, from the local ring
+    /// first and then bounded server history. No cursor or transcript change.
+    Show {
+        reference: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
+        depth: u8,
+    },
 }
 
 impl Operation {
@@ -154,6 +199,9 @@ pub struct Response {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ready: Option<bool>,
+    /// The pending batch ID carried by a delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<String>,
 }
 impl Response {
     fn ok(text: impl Into<String>) -> Self {
@@ -162,6 +210,7 @@ impl Response {
             text: text.into(),
             version: VERSION,
             ready: None,
+            delivery: None,
         }
     }
     fn error(text: impl Into<String>) -> Self {
@@ -170,6 +219,14 @@ impl Response {
             text: format!("! {}\n", safe(&text.into())),
             version: VERSION,
             ready: None,
+            delivery: None,
+        }
+    }
+    fn delivered(id: String, text: String) -> Self {
+        Self {
+            ready: Some(true),
+            delivery: Some(id),
+            ..Self::ok(text)
         }
     }
     fn readiness(ready: bool) -> Self {
@@ -181,8 +238,15 @@ impl Response {
 }
 
 struct Call {
+    /// The local connection; a consumer's later requests share it.
+    conn: u64,
+    pid: Option<i32>,
     operation: Operation,
     reply: oneshot::Sender<Response>,
+}
+enum Inbound {
+    Call(Call),
+    Closed(u64),
 }
 struct WaitingRead {
     until: Instant,
@@ -214,6 +278,170 @@ fn waiter_status(waiter: Option<&WaitingNotice>) -> String {
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     )
+}
+
+struct Consumer {
+    conn: u64,
+    kind: ConsumerKind,
+    pid: Option<i32>,
+    since: chrono::DateTime<chrono::Utc>,
+    last_request: chrono::DateTime<chrono::Utc>,
+    retry: Option<String>,
+    accepted_at: Option<Instant>,
+}
+fn consumer_status(consumer: Option<&Consumer>) -> String {
+    let utc =
+        |t: &chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    match consumer {
+        None => "delivery consumer: none\n".into(),
+        Some(c) => format!(
+            "delivery consumer: {} pid={} since={} last_request={}\n",
+            match c.kind {
+                ConsumerKind::Wait => "wait",
+                ConsumerKind::Subscribe => "subscribe",
+            },
+            c.pid.map_or("unknown".into(), |pid| pid.to_string()),
+            utc(&c.since),
+            utc(&c.last_request)
+        ),
+    }
+}
+fn pending_refusal(session: &str, id: &str, since: &str) -> String {
+    format!(
+        "delivery {id} pending since {since} (outcome uncertain); {}",
+        recovery(session, id)
+    )
+}
+fn recovery(session: &str, id: &str) -> String {
+    format!(
+        "inspect it with airc deliveries {session} --show {id}, then rerun with --retry-pending {id}, or run airc deliveries {session} --mark-accepted {id} | --drop {id}. Nothing was replayed."
+    )
+}
+/// Bytes of `show` output before the chain stops (one record always fits).
+const SHOW_BYTES: usize = 1024 * 1024;
+const SHOW_DEPTH: u8 = 8;
+const SHOW_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// A `show` walk over reply ancestors; newest record first until printed.
+struct ShowWalk {
+    remaining: u8,
+    records: Vec<String>,
+    bytes: usize,
+    note: Option<String>,
+}
+
+enum ShowStep {
+    Done(Response),
+    Fetch { channel: String, msgid: String },
+}
+
+impl ShowWalk {
+    /// Resolve references locally until done or one server fetch is needed.
+    fn advance(
+        &mut self,
+        state: &mut State,
+        mut next: Option<(String, Option<String>)>,
+    ) -> ShowStep {
+        while let Some((reference, channel)) = next.take() {
+            let (local, msgid) = if reference.starts_with('@') {
+                (
+                    state.retained_record(&reference).map(str::to_owned),
+                    state.resolve_reference(&reference).ok(),
+                )
+            } else {
+                let msgid = reference.strip_prefix("msgid:").unwrap_or(&reference);
+                if msgid.ends_with("…[truncated]") {
+                    self.note = Some(format!(
+                        "{reference}: the reply ID was truncated in the record and cannot be fetched"
+                    ));
+                    break;
+                }
+                let local = state
+                    .local_reference(msgid)
+                    .and_then(|r| state.retained_record(&r).map(str::to_owned));
+                (local, Some(msgid.to_string()))
+            };
+            match (local, msgid, channel) {
+                (Some(text), ..) => next = self.push(text),
+                (None, Some(msgid), Some(channel)) if crate::protocol::valid_channel(&channel) => {
+                    return ShowStep::Fetch { channel, msgid };
+                }
+                (None, Some(_), Some(target)) => {
+                    self.note = Some(format!(
+                        "{reference} is no longer retained locally and was a private message to {target}; private messages have no server history"
+                    ));
+                }
+                (None, Some(_), None) => {
+                    self.note = Some(format!(
+                        "{reference} is no longer retained locally; give --channel to fetch it from server history"
+                    ));
+                }
+                (None, None, _) => {
+                    self.note = Some(format!(
+                        "{reference} is unknown to this session; its reference expired"
+                    ));
+                }
+            }
+        }
+        ShowStep::Done(self.finish())
+    }
+
+    /// Keep one record; return its parent while ancestors are still wanted.
+    fn push(&mut self, text: String) -> Option<(String, Option<String>)> {
+        let text = text.strip_prefix("history ").unwrap_or(&text).to_string();
+        if !self.records.is_empty() && self.bytes + text.len() > SHOW_BYTES {
+            self.note = Some(format!(
+                "the chain stopped at the {SHOW_BYTES}-byte output bound"
+            ));
+            return None;
+        }
+        let (channel, reply) = state::record_links(&text);
+        let parent = (self.remaining > 0)
+            .then(|| reply.map(|r| (r.to_string(), channel.map(str::to_string))))
+            .flatten();
+        self.remaining = self.remaining.saturating_sub(1);
+        self.bytes += text.len();
+        self.records.push(text);
+        parent
+    }
+
+    fn finish(&mut self) -> Response {
+        let note = self.note.take();
+        if self.records.is_empty() {
+            return Response::error(note.unwrap_or_else(|| "nothing to show".into()));
+        }
+        let mut text = String::new();
+        for record in self.records.iter().rev() {
+            text.push_str("context ");
+            text.push_str(record);
+            text.push('\n');
+        }
+        if let Some(note) = note {
+            text.push_str(&format!("! {}\n", safe(&note)));
+        }
+        Response::ok(text)
+    }
+}
+
+struct WaitingShow {
+    until: Instant,
+    msgid: String,
+    walk: ShowWalk,
+    reply: oneshot::Sender<Response>,
+}
+
+/// The waiting show that requested exactly this msgid, if any.
+fn claim_lookup(showing: &mut Option<WaitingShow>, msgid: &str) -> Option<WaitingShow> {
+    showing.take_if(|pending| pending.msgid == msgid)
+}
+
+struct WaitingDelivery {
+    conn: u64,
+    until: Instant,
+    wake: Wake,
+    max_bytes: usize,
+    min_interval: Duration,
+    reply: oneshot::Sender<Response>,
 }
 
 struct WaitingSend {
@@ -327,6 +555,9 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
                     state.describe(false)
                 )),
                 (Operation::Read { again: true, .. }, Some(state)) => Response::ok(state.last_read),
+                (Operation::Deliveries { show }, Some(state)) => {
+                    deliveries(&state, None, show.as_deref())
+                }
                 (Operation::Disconnect, _) => Response::ok("Already stopped.\n"),
                 _ => Response::error(format!(
                     "session {name} is stopped; run airc connect {name} --config FILE. No request was sent."
@@ -341,7 +572,7 @@ pub async fn call(root: &Path, name: &str, operation: Operation) -> Result<Respo
     );
     let wait = match &operation {
         Operation::Read { wait, .. } | Operation::Wait { wait, .. } => *wait + 5,
-        Operation::Send { .. } => 60,
+        Operation::Send { .. } | Operation::Show { .. } => 60,
         Operation::Away { .. } | Operation::Back => 20,
         Operation::Join { .. } | Operation::Part { .. } | Operation::Topic { .. } => 20,
         _ => 5,
@@ -451,6 +682,290 @@ pub async fn wait(root: &Path, name: &str, seconds: Option<u64>, wake: Wake) -> 
     }
 }
 
+/// Settings shared by `wait --deliver` and `subscribe`.
+pub struct DeliverOptions {
+    pub wake: Wake,
+    pub max_bytes: usize,
+    pub min_interval: u64,
+    /// `wait --deliver` only: stop idling after this many seconds.
+    pub timeout: Option<u64>,
+    /// The exact pending ID authorized for one redelivery.
+    pub retry: Option<String>,
+    pub sink_timeout: u64,
+}
+
+pub enum Sink {
+    /// Print each batch and flush before accepting; `once` is `wait --deliver`.
+    Stdout { once: bool },
+    /// Run this argv (no shell) per batch with the batch on stdin.
+    Exec(Vec<String>),
+}
+
+/// Bytes of a failing adapter's stderr kept for the diagnostic.
+const SINK_STDERR: usize = 4096;
+/// How long stderr may stay open after the adapter itself exited.
+const SINK_STDERR_GRACE: Duration = Duration::from_millis(200);
+pub const DEFAULT_MAX_BYTES: usize = delivery::DEFAULT_BYTES;
+
+/// Hold the session's single delivery consumer connection, hand each batch to
+/// the sink and accept it only after the sink took it. A sink failure leaves the
+/// batch pending (uncertain) and ends the command; nothing is ever retried.
+pub async fn deliver(
+    root: &Path,
+    name: &str,
+    options: DeliverOptions,
+    sink: Sink,
+) -> Result<Response> {
+    let request = |wait| Operation::Deliver {
+        wait,
+        wake: options.wake,
+        max_bytes: options.max_bytes,
+        min_interval: options.min_interval,
+    };
+    validate(&request(0))?;
+    ensure!(
+        (1..=3600).contains(&options.sink_timeout),
+        "--sink-timeout requires 1–3600 seconds"
+    );
+    if let Sink::Exec(argv) = &sink {
+        ensure!(
+            !argv.is_empty(),
+            "give an adapter command after --, or - for stdout"
+        );
+    }
+    let kind = match sink {
+        Sink::Stdout { once: true } => ConsumerKind::Wait,
+        _ => ConsumerKind::Subscribe,
+    };
+    let store = Storage::open(root, name)?;
+    let stream = match UnixStream::connect(store.socket()).await {
+        Ok(stream) => stream,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(Response::error(format!(
+                "session {name} is stopped; run airc connect {name} --config FILE. Nothing was delivered."
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        stream.peer_cred()?.uid() == store.uid,
+        "session socket owner mismatch"
+    );
+    let mut stream = BufReader::new(stream);
+    let registered = exchange(
+        &mut stream,
+        Operation::Consume {
+            kind,
+            retry: options.retry.clone(),
+        },
+        10,
+    )
+    .await?;
+    if !registered.ok {
+        return Ok(registered);
+    }
+    let deadline = options
+        .timeout
+        .map(|value| {
+            Instant::now()
+                .checked_add(Duration::from_secs(value))
+                .context("wait timeout is too large")
+        })
+        .transpose()?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let stopped = || {
+        Response::error(format!(
+            "stopped by signal; inspect airc deliveries {name} for a pending batch. Nothing was retried."
+        ))
+    };
+    loop {
+        let remaining = deadline.map(|end| end.saturating_duration_since(Instant::now()));
+        let interval = remaining.map_or(60, |left| {
+            left.as_secs()
+                .saturating_add(u64::from(left.subsec_nanos() != 0))
+                .min(60)
+        });
+        let response = tokio::select! {
+            response = exchange(&mut stream, request(interval), interval + 5) => response,
+            _ = terminate.recv() => return Ok(stopped()),
+            _ = interrupt.recv() => return Ok(stopped()),
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(Response::error(format!(
+                    "{e:#}; a batch may be pending; inspect airc deliveries {name}. Nothing was retried."
+                )));
+            }
+        };
+        if !response.ok {
+            return Ok(response);
+        }
+        let Some(id) = response.delivery.clone() else {
+            match response.ready {
+                Some(false) if deadline.is_some_and(|end| Instant::now() >= end) => {
+                    return Ok(Response::error("wait timed out; no events consumed"));
+                }
+                Some(false) => continue,
+                _ => bail!("session omitted delivery readiness; no request was retried"),
+            }
+        };
+        let retry = options.retry.as_deref() == Some(id.as_str());
+        let handed = match &sink {
+            Sink::Stdout { .. } => write_stdout(&response.text),
+            Sink::Exec(argv) => tokio::select! {
+                result = run_sink(argv, name, &id, retry, &response.text, options.sink_timeout) => result,
+                _ = terminate.recv() => Err(anyhow::anyhow!("stopped by signal; the adapter was killed")),
+                _ = interrupt.recv() => Err(anyhow::anyhow!("stopped by signal; the adapter was killed")),
+            },
+        };
+        if let Err(e) = handed {
+            return Ok(Response::error(format!(
+                "delivery {id} not accepted: {e:#}; {}",
+                recovery(name, &id)
+            )));
+        }
+        let accepted = match exchange(&mut stream, Operation::Accept { id: id.clone() }, 10).await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                return Ok(Response::error(format!(
+                    "{e:#}; acceptance of {id} is unconfirmed; inspect airc deliveries {name}. Nothing was retried."
+                )));
+            }
+        };
+        if !accepted.ok || matches!(sink, Sink::Stdout { once: true }) {
+            return Ok(if accepted.ok {
+                Response::ok("")
+            } else {
+                accepted
+            });
+        }
+    }
+}
+
+/// One request/reply on a held consumer connection.
+async fn exchange(
+    stream: &mut BufReader<UnixStream>,
+    operation: Operation,
+    seconds: u64,
+) -> Result<Response> {
+    let request = Request {
+        version: VERSION,
+        operation,
+    };
+    timeout(Duration::from_secs(seconds), async {
+        write_json(stream.get_mut(), &request).await?;
+        let line = read_line(stream, MAX_RESPONSE)
+            .await?
+            .context("session closed before replying")?;
+        let response: Response = serde_json::from_str(&line)?;
+        ensure!(response.version == VERSION, "session IPC version mismatch");
+        Ok(response)
+    })
+    .await
+    .context("session did not reply in time")?
+}
+
+fn write_stdout(text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Run one adapter: argv without a shell, the batch on stdin, then EOF. Exit 0
+/// in time means the sink accepted it. The direct child is killed on timeout or
+/// when this future is dropped; anything it started itself is its own concern.
+async fn run_sink(
+    argv: &[String],
+    session: &str,
+    id: &str,
+    retry: bool,
+    text: &str,
+    limit: u64,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let (program, args) = argv.split_first().context("adapter command is empty")?;
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .env("AIRC_SESSION", session)
+        .env("AIRC_DELIVERY_ID", id)
+        .env("AIRC_DELIVERY_RETRY", if retry { "1" } else { "0" })
+        .env("AIRC_SUBSCRIBER_PID", std::process::id().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("adapter {} did not start", safe(program)))?;
+    let mut stdin = child.stdin.take().context("adapter stdin unavailable")?;
+    let mut stderr = child.stderr.take().context("adapter stderr unavailable")?;
+    let run = async {
+        // Drain stderr concurrently so a chatty adapter cannot block on it.
+        let mut captured = Vec::new();
+        let (written, status) = {
+            let errors = async {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            captured.extend_from_slice(&chunk[..n]);
+                            let excess = captured.len().saturating_sub(SINK_STDERR);
+                            captured.drain(..excess);
+                        }
+                    }
+                }
+            };
+            let finished = async {
+                let written = stdin.write_all(text.as_bytes()).await;
+                drop(stdin);
+                (written, child.wait().await)
+            };
+            tokio::pin!(errors, finished);
+            let mut drained = false;
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut finished => break outcome,
+                    () = &mut errors, if !drained => drained = true,
+                }
+            };
+            // A process the adapter left behind may hold stderr open; its exit
+            // status, not that pipe's EOF, decides the outcome.
+            if !drained {
+                let _ = timeout(SINK_STDERR_GRACE, &mut errors).await;
+            }
+            outcome
+        };
+        let status = status?;
+        // Response::error escapes control bytes once, at the boundary.
+        let tail = String::from_utf8_lossy(&captured).trim_end().to_string();
+        let detail = if tail.is_empty() {
+            String::new()
+        } else {
+            format!("; adapter stderr: {tail}")
+        };
+        ensure!(status.success(), "adapter exited with {status}{detail}");
+        written.with_context(|| format!("adapter did not read the whole batch{detail}"))?;
+        Ok(())
+    };
+    match timeout(Duration::from_secs(limit), run).await {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = child.start_kill();
+            bail!("adapter exceeded {limit} s and was killed")
+        }
+    }
+}
+
 fn validate(operation: &Operation) -> Result<()> {
     if let Operation::Away { reason } = operation {
         client::away_message(Some(reason))?;
@@ -475,7 +990,66 @@ fn validate(operation: &Operation) -> Result<()> {
     if let Some(request) = operation.control() {
         request.validate()?;
     }
+    if let Operation::Deliver {
+        wait,
+        max_bytes,
+        min_interval,
+        ..
+    } = operation
+    {
+        ensure!(
+            *wait <= 60
+                && (delivery::MIN_BYTES..=delivery::MAX_BYTES).contains(max_bytes)
+                && *min_interval <= 3600,
+            "delivery requires --max-bytes {}–{} and --min-interval 0–3600",
+            delivery::MIN_BYTES,
+            delivery::MAX_BYTES
+        );
+    }
+    if let Operation::Show {
+        reference,
+        channel,
+        depth,
+    } = operation
+    {
+        ensure!(
+            !reference.is_empty()
+                && reference.len() <= 160
+                && !reference
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control())
+                && *depth <= SHOW_DEPTH
+                && channel
+                    .as_deref()
+                    .is_none_or(crate::protocol::valid_channel),
+            "show needs @N or a msgid, an optional valid --channel and --chain 1–{SHOW_DEPTH}"
+        );
+    }
+    match operation {
+        Operation::Accept { id }
+        | Operation::DropPending { id }
+        | Operation::Consume {
+            retry: Some(id), ..
+        }
+        | Operation::Deliveries { show: Some(id) } => delivery::validate_id(id)?,
+        _ => {}
+    }
     Ok(())
+}
+
+/// The delivery summary, or one pending batch's text for inspection only.
+fn deliveries(state: &State, consumer: Option<&Consumer>, show: Option<&str>) -> Response {
+    match show {
+        None => Response::ok(format!(
+            "{}{}",
+            state.describe_delivery(),
+            consumer_status(consumer)
+        )),
+        Some(id) => match state.pending_delivery() {
+            Some(batch) if batch.id == id => Response::ok(batch.render(false)),
+            _ => Response::error(format!("no pending delivery {id}")),
+        },
+    }
 }
 
 /// Internal worker entry point. Its stdout is only a bounded startup response.
@@ -532,7 +1106,7 @@ pub async fn worker(root: &Path, name: &str, config: &Path) -> Result<()> {
         )),
     )
     .await?;
-    let result = serve(&store, &mut state, &mut connection, listener).await;
+    let result = serve(name, &store, &mut state, &mut connection, listener).await;
     drop(connection);
     if let Err(e) = &result {
         state.status = format!("stopped: {e:#}; pending sends may be uncertain");
@@ -544,15 +1118,20 @@ pub async fn worker(root: &Path, name: &str, config: &Path) -> Result<()> {
 }
 
 async fn serve(
+    session: &str,
     store: &Storage,
     state: &mut State,
     connection: &mut client::Connection,
     listener: UnixListener,
 ) -> Result<()> {
-    let (requests, mut request_rx) = mpsc::channel::<Call>(16);
+    let (requests, mut request_rx) = mpsc::channel::<Inbound>(16);
     let mut clients = JoinSet::new();
+    let mut next_conn = 0u64;
     let mut reader: Option<WaitingRead> = None;
     let mut waiter: Option<WaitingNotice> = None;
+    let mut consumer: Option<Consumer> = None;
+    let mut delivering: Option<WaitingDelivery> = None;
+    let mut showing: Option<WaitingShow> = None;
     let mut sender: Option<WaitingSend> = None;
     let mut availability: Option<WaitingAvailability> = None;
     let mut control: Option<WaitingControl> = None;
@@ -567,7 +1146,9 @@ async fn serve(
                 let (stream, _) = accepted?;
                 if stream.peer_cred()?.uid() == store.uid {
                     let tx = requests.clone();
-                    clients.spawn(async move { let _ = handle(stream, tx).await; });
+                    next_conn += 1;
+                    let conn = next_conn;
+                    clients.spawn(async move { let _ = handle(stream, tx, conn).await; });
                 }
             }
             Some(_) = clients.join_next(), if !clients.is_empty() => {},
@@ -620,8 +1201,122 @@ async fn serve(
                     store.save(state)?;
                 }
             }
-            Some(call) = request_rx.recv() => {
+            Some(inbound) = request_rx.recv() => {
+                let call = match inbound {
+                    Inbound::Closed(conn) => {
+                        // EOF or death of the consumer process releases its lease.
+                        if consumer.as_ref().is_some_and(|c| c.conn == conn) {
+                            consumer = None;
+                        }
+                        if delivering.as_ref().is_some_and(|d| d.conn == conn) {
+                            delivering = None;
+                        }
+                        continue;
+                    }
+                    Inbound::Call(call) => call,
+                };
+                let now = chrono::Utc::now();
+                if let Some(c) = consumer.as_mut().filter(|c| c.conn == call.conn) {
+                    c.last_request = now;
+                }
                 match call.operation {
+                    Operation::Consume { kind, retry } => {
+                        let refusal = if let Some(active) = &consumer {
+                            Some(format!("delivery consumer active since {} (pid {}); stop it first. Nothing was replayed.",
+                                active.since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                active.pid.map_or("unknown".into(), |pid| pid.to_string())))
+                        } else {
+                            state.begin_delivery();
+                            match (state.pending_delivery(), retry.as_deref()) {
+                                (Some(batch), Some(retry)) if batch.id == retry => None,
+                                (Some(batch), _) => Some(pending_refusal(session, &batch.id, &batch.created)),
+                                (None, Some(retry)) => Some(format!("no pending delivery {retry}; nothing was replayed")),
+                                (None, None) => None,
+                            }
+                        };
+                        if let Some(text) = refusal {
+                            let _ = call.reply.send(Response::error(text));
+                        } else {
+                            store.save(state)?; // A first consumer's starting cursor is durable.
+                            consumer = Some(Consumer { conn: call.conn, kind, pid: call.pid, since: now, last_request: now, retry, accepted_at: None });
+                            let _ = call.reply.send(Response::ok("delivery consumer registered\n"));
+                        }
+                    }
+                    Operation::Deliver { wait, wake, max_bytes, min_interval } => {
+                        let Some(active) = consumer.as_mut().filter(|c| c.conn == call.conn) else {
+                            let _ = call.reply.send(Response::error("deliver requires this connection's consumer registration"));
+                            continue;
+                        };
+                        match state.pending_delivery() {
+                            Some(batch) if active.retry.as_deref() == Some(batch.id.as_str()) => {
+                                // The single redelivery the operator authorized by ID.
+                                active.retry = None;
+                                let _ = call.reply.send(Response::delivered(batch.id.clone(), batch.render(true)));
+                            }
+                            Some(batch) => {
+                                let _ = call.reply.send(Response::error(format!("delivery {} awaits acceptance; nothing was replayed", batch.id)));
+                            }
+                            None => {
+                                delivering = Some(WaitingDelivery {
+                                    conn: call.conn,
+                                    until: Instant::now() + Duration::from_secs(wait),
+                                    wake,
+                                    max_bytes,
+                                    min_interval: Duration::from_secs(min_interval),
+                                    reply: call.reply,
+                                });
+                            }
+                        }
+                    }
+                    Operation::Accept { id } => {
+                        let own = consumer.as_ref().is_some_and(|c| c.conn == call.conn);
+                        if consumer.is_some() && !own {
+                            let _ = call.reply.send(Response::error("a delivery consumer is registered; recovery is refused while it runs. Nothing was changed."));
+                            continue;
+                        }
+                        let response = match state.finish_delivery(&id, "accepted") {
+                            Ok(text) => {
+                                store.save(state)?;
+                                if let Some(c) = consumer.as_mut() {
+                                    c.accepted_at = Some(Instant::now());
+                                }
+                                Response::ok(format!("{text}\n"))
+                            }
+                            Err(e) => Response::error(format!("{e:#}; nothing was changed")),
+                        };
+                        let _ = call.reply.send(response);
+                    }
+                    Operation::DropPending { id } => {
+                        let response = if consumer.is_some() {
+                            Response::error("a delivery consumer is registered; recovery is refused while it runs. Nothing was changed.")
+                        } else {
+                            match state.finish_delivery(&id, "dropped") {
+                                Ok(text) => { store.save(state)?; Response::ok(format!("{text}; its events remain readable\n")) }
+                                Err(e) => Response::error(format!("{e:#}; nothing was changed")),
+                            }
+                        };
+                        let _ = call.reply.send(response);
+                    }
+                    Operation::Deliveries { show } => {
+                        let _ = call.reply.send(deliveries(state, consumer.as_ref(), show.as_deref()));
+                    }
+                    Operation::Show { reference, channel, depth } => {
+                        if showing.is_some() {
+                            let _ = call.reply.send(Response::error("another show is fetching history; retry after it finishes"));
+                            continue;
+                        }
+                        let mut walk = ShowWalk { remaining: depth, records: Vec::new(), bytes: 0, note: None };
+                        match walk.advance(state, Some((reference, channel))) {
+                            ShowStep::Done(response) => { let _ = call.reply.send(response); }
+                            ShowStep::Fetch { channel, msgid } => match state.begin_lookup(&channel, &msgid) {
+                                Ok(()) => showing = Some(WaitingShow { until: Instant::now() + SHOW_TIMEOUT, msgid, walk, reply: call.reply }),
+                                Err(e) => {
+                                    walk.note = Some(format!("msgid:{msgid}: {e}"));
+                                    let _ = call.reply.send(walk.finish());
+                                }
+                            },
+                        }
+                    }
                     Operation::Wait { wait, wake } => {
                         if waiter.as_ref().is_some_and(|w| !w.reply.is_closed()) {
                             let _ = call.reply.send(Response::error("another waiter is active; keep one waiter per session"));
@@ -629,7 +1324,7 @@ async fn serve(
                             waiter = Some(WaitingNotice { armed_at: chrono::Utc::now(), until: Instant::now() + Duration::from_secs(wait), wake, reply: call.reply });
                         }
                     }
-                    Operation::Status => { let _ = call.reply.send(Response::ok(format!("{}{}", state.describe(true), waiter_status(waiter.as_ref())))); }
+                    Operation::Status => { let _ = call.reply.send(Response::ok(format!("{}{}{}", state.describe(true), waiter_status(waiter.as_ref()), consumer_status(consumer.as_ref())))); }
                     Operation::Disconnect => {
                         state.status = "explicitly disconnected".into();
                         store.save(state)?;
@@ -743,6 +1438,94 @@ async fn serve(
                 let _ = waiter.take().unwrap().reply.send(response);
             }
         }
+        if let Some((msgid, found)) = state.take_lookup() {
+            // Only the show that asked for this msgid takes it; a result left by
+            // an interrupted or timed-out show is discarded.
+            if let Some(mut pending) = claim_lookup(&mut showing, &msgid) {
+                let next = match found {
+                    Ok(message) => match state.render_context(&message) {
+                        Some(text) => pending.walk.push(text),
+                        None => {
+                            pending.walk.note = Some(format!(
+                                "msgid:{}: the server returned no message record",
+                                pending.msgid
+                            ));
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        pending.walk.note = Some(format!("msgid:{}: {e}", pending.msgid));
+                        None
+                    }
+                };
+                match pending.walk.advance(state, next) {
+                    ShowStep::Done(response) => {
+                        let _ = pending.reply.send(response);
+                    }
+                    ShowStep::Fetch { channel, msgid } => {
+                        match state.begin_lookup(&channel, &msgid) {
+                            Ok(()) => showing = Some(WaitingShow { msgid, ..pending }),
+                            Err(e) => {
+                                pending.walk.note = Some(format!("msgid:{msgid}: {e}"));
+                                let _ = pending.reply.send(pending.walk.finish());
+                            }
+                        }
+                    }
+                }
+            }
+            store.save(state)?; // References may have been assigned.
+        }
+        if showing
+            .as_ref()
+            .is_some_and(|s| s.reply.is_closed() || Instant::now() >= s.until)
+        {
+            let mut pending = showing.take().unwrap();
+            pending.walk.note = Some(format!(
+                "msgid:{}: the history lookup did not finish in time",
+                pending.msgid
+            ));
+            let _ = pending.reply.send(pending.walk.finish());
+        }
+        if delivering.as_ref().is_some_and(|d| d.reply.is_closed()) {
+            delivering = None;
+        }
+        if let Some(d) = &delivering {
+            let mode = d.wake.mode();
+            let decision = match state.delivery_readiness(mode, d.until.into_std()) {
+                Ok(attention::Readiness::Ready) => {
+                    let early = consumer
+                        .as_ref()
+                        .and_then(|c| c.accepted_at)
+                        .is_some_and(|at| at.elapsed() < d.min_interval)
+                        && !state.delivery_urgent(mode);
+                    if early {
+                        (Instant::now() >= d.until).then(|| Response::readiness(false))
+                    } else if let Some((id, text)) =
+                        state.prepare_delivery(session, mode, d.max_bytes)
+                    {
+                        store.save(state)?; // Pending is durable BEFORE anyone can see it.
+                        Some(Response::delivered(id, text))
+                    } else {
+                        None // Only irrelevant events: the in-memory scan floor moved.
+                    }
+                }
+                Ok(attention::Readiness::TimedOut) => Some(Response::readiness(false)),
+                Ok(attention::Readiness::Pending) => None,
+                Err(e) => Some(Response::error(format!(
+                    "delivery wait failed: {e}; inspect status"
+                ))),
+            };
+            if let Some(response) = decision {
+                let id = response.delivery.clone();
+                if delivering.take().unwrap().reply.send(response).is_err()
+                    && let Some(id) = id
+                {
+                    // The caller left before any byte was written: certainly undelivered.
+                    state.revert_delivery(&id);
+                    store.save(state)?;
+                }
+            }
+        }
         if availability
             .as_ref()
             .is_some_and(|pending| Instant::now() >= pending.until)
@@ -797,6 +1580,12 @@ async fn serve(
     if let Some(waiting) = waiter {
         let _ = waiting.reply.send(Response::error(state.status.clone()));
     }
+    if let Some(waiting) = delivering {
+        let _ = waiting.reply.send(Response::error(state.status.clone()));
+    }
+    if let Some(waiting) = showing {
+        let _ = waiting.reply.send(Response::error(state.status.clone()));
+    }
     // Every local socket has a bounded writer; allow replies to flush on quit.
     drop(request_rx);
     let _ = timeout(Duration::from_secs(2), async {
@@ -806,43 +1595,85 @@ async fn serve(
     Ok(())
 }
 
-async fn handle(stream: UnixStream, tx: mpsc::Sender<Call>) -> Result<()> {
+/// One request per connection, except that a successful `consume` keeps the
+/// connection as the delivery consumer's for its later requests. Closing it,
+/// including by process death, releases the lease.
+async fn handle(stream: UnixStream, tx: mpsc::Sender<Inbound>, conn: u64) -> Result<()> {
+    let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
     let mut stream = BufReader::new(stream);
-    let line = timeout(Duration::from_secs(5), read_line(&mut stream, MAX_REQUEST))
-        .await??
-        .context("empty request")?;
-    let parsed = (|| {
-        let request: Request = serde_json::from_str(&line)?;
-        ensure!(
-            request.version == VERSION,
-            "session IPC version mismatch; disconnect with the original binary before upgrading"
-        );
-        validate(&request.operation)?;
-        Ok::<_, anyhow::Error>(request)
-    })();
-    let response = match parsed {
-        Err(e) => Response::error(format!("invalid request: {e:#}")),
-        Ok(request) => {
-            let (reply, received) = oneshot::channel();
-            tx.send(Call {
-                operation: request.operation,
-                reply,
-            })
-            .await?;
-            // Client EOF while waiting cancels its pending read, not a send that
-            // may already have reached the server. No transport retries.
-            tokio::select! {
-                response = received => response.context("worker stopped before replying")?,
-                _ = read_line(&mut stream, 1) => { bail!("caller disconnected"); }
+    let mut consuming = false;
+    let result = async {
+        loop {
+            let line = if consuming {
+                // A consumer may be idle for its sink's whole run.
+                match read_line(&mut stream, MAX_REQUEST).await? {
+                    Some(line) => line,
+                    None => return Ok(()),
+                }
+            } else {
+                timeout(Duration::from_secs(5), read_line(&mut stream, MAX_REQUEST))
+                    .await??
+                    .context("empty request")?
+            };
+            let parsed = (|| {
+                let request: Request = serde_json::from_str(&line)?;
+                ensure!(
+                    request.version == VERSION,
+                    "session IPC version mismatch; disconnect with the original binary before upgrading"
+                );
+                validate(&request.operation)?;
+                ensure!(
+                    !consuming
+                        || matches!(
+                            request.operation,
+                            Operation::Deliver { .. } | Operation::Accept { .. }
+                        ),
+                    "a consumer connection only delivers and accepts"
+                );
+                Ok::<_, anyhow::Error>(request)
+            })();
+            let consume = matches!(
+                parsed,
+                Ok(Request {
+                    operation: Operation::Consume { .. },
+                    ..
+                })
+            );
+            let response = match parsed {
+                Err(e) => Response::error(format!("invalid request: {e:#}")),
+                Ok(request) => {
+                    let (reply, received) = oneshot::channel();
+                    tx.send(Inbound::Call(Call {
+                        conn,
+                        pid,
+                        operation: request.operation,
+                        reply,
+                    }))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("worker stopped"))?;
+                    // Client EOF while waiting cancels its pending read, not a send that
+                    // may already have reached the server. No transport retries.
+                    tokio::select! {
+                        response = received => response.context("worker stopped before replying")?,
+                        _ = read_line(&mut stream, 1) => { bail!("caller disconnected"); }
+                    }
+                }
+            };
+            let ok = response.ok;
+            timeout(
+                Duration::from_secs(2),
+                write_json(stream.get_mut(), &response),
+            )
+            .await??;
+            if !consuming && !(consume && ok) {
+                return Ok(());
             }
+            consuming = true;
         }
-    };
-    timeout(
-        Duration::from_secs(2),
-        write_json(stream.get_mut(), &response),
-    )
-    .await??;
-    Ok(())
+    }
+    .await;
+    let _ = tx.send(Inbound::Closed(conn)).await;
+    result
 }
 
 async fn write_json(
@@ -953,5 +1784,76 @@ mod tests {
             assert!(response.is_err() || !response.unwrap().ok);
             peer.await.unwrap();
         }
+    }
+
+    fn walk(remaining: u8) -> ShowWalk {
+        ShowWalk {
+            remaining,
+            records: Vec::new(),
+            bytes: 0,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn a_stale_lookup_result_never_answers_a_newer_show() {
+        let (reply, _received) = oneshot::channel();
+        let mut showing = Some(WaitingShow {
+            until: Instant::now() + SHOW_TIMEOUT,
+            msgid: "newer".into(),
+            walk: walk(1),
+            reply,
+        });
+        // A result for an interrupted show's msgid is discarded, not attributed.
+        assert!(claim_lookup(&mut showing, "older").is_none());
+        assert!(showing.is_some());
+        assert_eq!(claim_lookup(&mut showing, "newer").unwrap().msgid, "newer");
+        assert!(showing.is_none());
+    }
+
+    #[test]
+    fn private_ancestors_are_never_fetched_from_channel_history() {
+        let config = ClientConfig {
+            host: "localhost".into(),
+            port: 6697,
+            tls: true,
+            allow_insecure: false,
+            ca_certificate: None,
+            proxy: None,
+            account: "alice".into(),
+            nick: "Alice".into(),
+            token_file: "unused".into(),
+            channels: vec!["#work".into()],
+            artifact_url: None,
+            unix: None,
+            artifact_unix: None,
+        };
+        let mut state = State::new(&config).unwrap();
+        state.begin_epoch();
+        let mut dm = crate::protocol::Message::new("PRIVMSG", ["Alice", "hi"]);
+        dm.prefix = Some("Human!human@airc".into());
+        dm.tags.insert("account".into(), "human".into());
+        dm.tags.insert("msgid".into(), "dm1".into());
+        dm.tags.insert("+reply".into(), "gone".into());
+        state.ingest(&dm, false);
+        let mut walk = walk(1);
+        let ShowStep::Done(response) = walk.advance(&mut state, Some(("@1".into(), None))) else {
+            panic!("a private ancestor must not trigger a channel history lookup");
+        };
+        assert!(response.ok);
+        assert!(
+            response
+                .text
+                .starts_with("context @1 Alice Human(human) reply=msgid:gone: hi\n"),
+            "{}",
+            response.text
+        );
+        assert!(
+            response
+                .text
+                .contains("private messages have no server history"),
+            "{}",
+            response.text
+        );
     }
 }
