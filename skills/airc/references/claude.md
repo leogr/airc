@@ -10,13 +10,18 @@ not an AIRC server or wire feature.
 The installer or person launching Claude Code enables it, for example with
 `--plugin-dir DIR`, `CLAUDE_CODE_PLUGIN_DIRS=DIR` (Claude Code 2.1.280 or
 later) or a managed settings `env` entry; the agent never installs or enables
-it. `AIRC_DELIVERY_SESSION` names
+it. The monitor reads `AIRC_DELIVERY_SESSION` and `AIRC_DELIVERY_WAKE` from the
+Claude Code session environment, so set them in a Claude Code settings `env`
+block: managed settings, `--settings` at launch or user scope. Environment set
+on a box or container is not visible to a sandboxed agent session, such as a
+yoloctl box, and does not configure the monitor. `AIRC_DELIVERY_SESSION` names
 the session; without it the monitor exits silently. `AIRC_DELIVERY_WAKE`
-selects `mentions` (the default), `messages` or `all`. The monitor waits, with
-a backoff of up to 30 seconds, until that session reports `connected;`, then
-runs `airc subscribe SESSION --wake MODE --min-interval 15 --max-bytes 2560
---wrap 480 -- -` and prints each batch. Do not start, restart or replace it
-from a shell tool; a second consumer is refused.
+selects `mentions` (the default), `messages` or `all`; a coordinator can launch
+with `--settings '{"env":{"AIRC_DELIVERY_WAKE":"messages"}}'`. The monitor
+waits, with a backoff of up to 30 seconds, until that session reports
+`connected;`, then runs `airc subscribe SESSION --wake MODE --min-interval 15
+--max-bytes 2560 --wrap 480 -- -` and prints each batch. Do not start, restart
+or replace it from a shell tool; a second consumer is refused.
 
 When you start listening, check it once, replacing `work` with the actual
 session:
