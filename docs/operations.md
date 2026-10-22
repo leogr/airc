@@ -66,10 +66,11 @@ names only implemented features: `multiline`, `unix-listeners`, `unix-artifacts`
 `control-status`, `control-reload`, `acl-revoke`, `client-unix`,
 `client-artifact-unix`, `client-multiline`, `jsonl-v2`, `named-multiline`,
 `send-stdin`, `client-presence`, `server-presence`, `channel-add-reload`,
-`client-topic` and `named-channels`. A deployer should refuse a managed mode whose feature is missing
+`channel-delete-reload`, `client-topic` and `named-channels`. A deployer should refuse a managed mode whose feature is missing
 rather than fall back. `client-presence` covers JSONL `who`/`away`/`back` and
 away-notify negotiation/events; `server-presence` covers connection-scoped AWAY,
 WHO H/G and away-notify. `channel-add-reload` covers reload channel additions;
+`channel-delete-reload` explicit channel deletion through `removed_channels`;
 `client-topic` the JSONL version 2 `topic` operation; `named-channels` the named
 `join`/`part`/`topic` controls, followed-channel state and partial startup. The live control status includes the same implemented
 feature list: check that proof as well as executable probes when reusing a
@@ -88,18 +89,25 @@ one line capped at 1 MiB and then closed, with a ten-second connection deadline:
   count) and `accounts`, which lists connected accounts only, with connection
   counts. It is bounded by `limits.connections`, never truncated.
 - `{"op":"reload"}` re-reads the file the server started from. Only accounts,
-  channel additions, channel members/operators and `membership_generation` may
-  change; anything else fails with `RESTART_REQUIRED`. Every channel currently
-  applied must remain with its exact spelling, so a removal or rename is refused
-  even after earlier additions (A, then A+B, then A+C fails). New channel rows
-  and their actor state are staged in SQLite before the configuration, ACLs and
-  digest are published; a staging failure is `STORAGE_ERROR` and publishes
-  nothing. Rows staged by a failed attempt grant no access; a later reload reuses
-  them, keeping any stored topic, bans and history. A lower generation
+  channel additions and deletions, channel members/operators, `removed_channels`
+  and `membership_generation` may change; anything else fails with
+  `RESTART_REQUIRED`. Every channel currently applied must remain with its exact
+  spelling unless `removed_channels` lists it, so an unlisted removal or a rename
+  is refused even after earlier additions (A, then A+B, then A+C fails). One
+  SQLite transaction deletes each listed channel's messages, published and
+  staged artifacts, bans, topic and moderation, inserts new channel rows and
+  loads their stored state; any failure, an addition's included, is
+  `STORAGE_ERROR` and commits and publishes nothing. Only then are the
+  configuration, ACLs and digest published. An addition whose name still has
+  rows from a channel dropped without deletion intent keeps its stored topic,
+  bans and history. A lower generation
   fails with `GENERATION_STALE`; the same generation with different bytes fails
   with `GENERATION_CONFLICT`; the same bytes are an idempotent success. Rejected
   configurations leave applied state unchanged. Success returns `applied_generation`, `config_sha256`,
-  `incarnation`, `disconnected` (accounts) and `kicked` (`channel`, `account`).
+  `incarnation`, `disconnected` (accounts), `kicked` (`channel`, `account`) and
+  `deleted` (applied channels this reload deleted). Prove a deletion by the
+  matching generation and `config_sha256`: repeating an applied generation
+  succeeds with an empty `deleted`.
   Kick details stop at 1024 entries; `kicked_count` is the exact count and
   `kicked_truncated` says whether details were omitted. Applied state proof and
   the connection-bounded `disconnected` account list are not truncated.
@@ -114,11 +122,30 @@ account was removed or whose token hash changed loses authority in that step;
 artifact HTTP stops accepting the old token immediately. The server queues
 `ERROR :Membership revoked` before graceful close, but queue saturation, socket
 failure or the write deadline can prevent delivery. A member removed from a
-channel is KICKed by the server and cannot rejoin. Configured operators added or removed by the
+channel is KICKed by the server and cannot rejoin. Every joined session of a
+deleted channel receives `KICK <channel> <nick> :Channel deleted`; later JOIN,
+messages, history, topic, staging, uploads and downloads for it are refused,
+and nothing it held remains to replay. A multiline batch still open for it
+cannot reach a same-name successor: any other command, the rejoin included,
+aborts it first. An upload is bound to the
+membership generation that admitted it before its body arrived, so one
+admitted before a deletion is refused even after a same-name channel is
+created and rejoined. Configured operators added or removed by the
 reload gain or lose `+o`; dynamic roles granted by operators are kept. Reload
 requires a server started from a file (`aircd serve`); deleting a token file is
 not revocation. Prove an apply by matching generation, `config_sha256` and
 `incarnation`, and a later status that no longer lists revoked accounts.
+
+**Channel deletion.** `removed_channels = ["#name", …]` is explicit deletion
+intent: at most 1024 unique canonical (lowercase-folded) channel names, none of
+them configured in `channels`. A channel is deleted only when it is listed there
+and absent from `channels`; merely omitting a channel never deletes it. Startup
+applies the same list in its opening transaction, so a crash between publishing
+the file and a reload still converges, and a listed name that holds no rows is
+harmless. To create a channel with a deleted name again, drop the name from
+`removed_channels` in the same configuration that adds it; it starts with no
+history, artifacts, bans or topic. Deletion is logical: it neither erases
+database pages securely nor edits backups.
 
 ## Remote access
 

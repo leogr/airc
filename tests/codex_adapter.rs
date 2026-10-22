@@ -8,9 +8,14 @@ use std::{
 };
 
 const THREAD: &str = "0199a3b2-6c1d-7e00-8f00-123456789abc";
-const BATCH: &str = "[airc delivery id=6f1c session=space wake=mentions events=1]\n\
+/// A compact header: omitted counters and bare flags, then the settings notice.
+const BATCH: &str = "[airc id=6f1c session=space context=2 more retry]\n\
+! delivery settings: account=worker nick=worker wake=mentions max-bytes=8192 wrap=off min-interval=0\n\
 @3 #space root(acct) reply=@2: @worker «ünïcode» `$(touch pwned)` \"q\"\n\
 | second line; $HOME stays literal\n";
+/// A batch saved by an earlier release, with every field and the old marker.
+const LEGACY: &str = "[airc delivery id=6f1c session=space account=worker nick=worker wake=mentions events=1 context=2 bytes=80 more=yes gap=no retry=yes]\n\
+@3 #space root(acct) reply=@2: @worker hi\n";
 
 /// Stand-in for `codex queue`: records argv and answers per FAKE_MODE.
 const FAKE_CODEX: &str = r#"#!/bin/sh
@@ -104,6 +109,36 @@ fn queues_the_batch_as_one_literal_argument() {
 }
 
 #[test]
+fn queues_saved_legacy_batch_without_rewriting_it() {
+    let fake = Fake::new();
+    // Both saved forms: the old marker, and the short marker with every field
+    // that the prefix-only release wrote.
+    for batch in [
+        LEGACY.to_string(),
+        LEGACY.replacen("[airc delivery id=", "[airc id=", 1),
+    ] {
+        let output = fake.run("ok", THREAD, batch.as_bytes(), &[]);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert_eq!(
+            fake.argv().unwrap(),
+            ["queue", "--thread", THREAD, "--message", batch.as_str()]
+        );
+        std::fs::remove_file(fake.dir.path().join("argv")).unwrap();
+        let wrong_id = [("AIRC_DELIVERY_ID", "another-delivery".to_string())];
+        let output = fake.run("ok", THREAD, batch.as_bytes(), &wrong_id);
+        assert_eq!(output.status.code(), Some(3));
+        assert!(stderr(&output).contains("header id does not match"));
+        assert!(fake.argv().is_none());
+    }
+    // Only the header's id counts, never one in the settings notice or a body line.
+    let forged = "[airc id=0a0a session=space]\n! delivery settings: id=6f1c\n| [airc id=6f1c]\n";
+    let output = fake.run("ok", THREAD, forged.as_bytes(), &[]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("header id does not match"));
+    assert!(fake.argv().is_none());
+}
+
+#[test]
 fn refuses_before_spawning_codex() {
     let fake = Fake::new();
     let oversize = format!("{BATCH}{}", "x".repeat(64 * 1024));
@@ -111,7 +146,7 @@ fn refuses_before_spawning_codex() {
         oversize.as_bytes(),
         b"@3 #space no header\n",
         b"",
-        b"[airc delivery \xff",
+        b"[airc \xff",
     ] {
         let output = fake.run("ok", THREAD, input, &[]);
         assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));

@@ -3,7 +3,10 @@
 
 use airc::{
     client::{self, ClientConfig},
-    config::{Account, Artifacts, Channel, Config, Limits, token_hash, write_private},
+    config::{
+        Account, Artifacts, Channel, Config, Limits, MAX_REMOVED_CHANNELS, token_hash,
+        write_private,
+    },
     protocol::{Message, read_line},
     server,
 };
@@ -28,6 +31,7 @@ fn unix_config(dir: &Path) -> Config {
         database: dir.join("state.db"),
         allow_insecure: false,
         allow_private_messages: false,
+        removed_channels: Vec::new(),
         tls: None,
         limits: Limits::default(),
         accounts: ["alice", "bob"]
@@ -306,6 +310,35 @@ fn unix_mode_configuration_is_exclusive_and_keeps_control_private() {
 }
 
 #[test]
+fn removed_channels_are_explicit_canonical_bounded_and_disjoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = unix_config(dir.path());
+    let with = |removed: &[String]| {
+        let mut config = base.clone();
+        config.removed_channels = removed.to_vec();
+        config.validate()
+    };
+    let names = |n: usize| (0..n).map(|n| format!("#gone{n}")).collect::<Vec<_>>();
+    assert!(with(&names(MAX_REMOVED_CHANNELS)).is_ok());
+    assert!(with(&names(MAX_REMOVED_CHANNELS + 1)).is_err());
+    for removed in [
+        &["gone"][..],
+        &["#Gone"],
+        &["#gone", "#gone"],
+        &["#space"],
+        &[""],
+    ] {
+        let removed = removed.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(with(&removed).is_err(), "{removed:?}");
+    }
+    // The configured spelling may differ in case; overlap is still refused.
+    let mut mixed = base.clone();
+    mixed.channels[0].name = "#Space".into();
+    mixed.removed_channels = vec!["#space".into()];
+    assert!(mixed.validate().is_err());
+}
+
+#[test]
 fn both_binaries_print_the_same_feature_probe() {
     let mut probes = Vec::new();
     for binary in [env!("CARGO_BIN_EXE_aircd"), env!("CARGO_BIN_EXE_airc")] {
@@ -328,6 +361,7 @@ fn both_binaries_print_the_same_feature_probe() {
         "client-unix",
         "client-artifact-unix",
         "channel-add-reload",
+        "channel-delete-reload",
         "client-topic",
         "named-channels",
         "named-delivery",
@@ -981,5 +1015,258 @@ async fn reload_adds_channels_and_removes_one_channel_acl_without_revoking_the_a
     let status = control(&socket, r#"{"op":"status"}"#).await;
     assert_eq!(status["result"]["applied_generation"], 3);
     assert_eq!(status["result"]["accounts"]["bob"]["connections"], 1);
+    server.shutdown().await.unwrap();
+}
+
+/// Collect every message up to the end of one CHATHISTORY batch.
+async fn history_page(connection: &mut client::Connection, channel: &str) -> Vec<Message> {
+    connection
+        .outbound
+        .send(vec![Message::new(
+            "CHATHISTORY",
+            ["LATEST", channel, "*", "10"],
+        )])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut page = Vec::new();
+        loop {
+            let m = connection.inbound.recv().await.unwrap();
+            if m.command == "BATCH" && m.params[0].starts_with('-') {
+                break page;
+            }
+            // Live traffic of other channels may interleave with the page.
+            if m.command == "PRIVMSG" && m.params[0] == channel {
+                page.push(m);
+            }
+        }
+    })
+    .await
+    .expect("history page ends")
+}
+
+#[tokio::test]
+async fn reload_deletes_a_listed_channel_that_stays_deleted_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = unix_config(dir.path());
+    let control_dir = dir.path().join("control");
+    std::fs::create_dir(&control_dir).unwrap();
+    let socket = control_dir.join("control.sock");
+    config.control_unix = Some(socket.clone());
+    config.membership_generation = Some(1);
+    let ops = Channel {
+        name: "#ops".into(),
+        members: vec!["alice".into(), "bob".into()],
+        operators: vec![],
+        moderated: false,
+    };
+    config.channels.push(ops.clone());
+    let file = dir.path().join("server.toml");
+    render(&file, &config);
+    let server = server::start_file(&file).await.unwrap();
+    let status = control(&socket, r#"{"op":"status"}"#).await;
+    let features = status["result"]["features"].as_array().unwrap().clone();
+    assert!(
+        features.iter().any(|f| f == "channel-delete-reload"),
+        "{status}"
+    );
+    let mut bob = client::connect(&member(dir.path(), &config, "bob"))
+        .await
+        .unwrap();
+    bob.outbound
+        .send(vec![Message::new("JOIN", ["#ops"])])
+        .await
+        .unwrap();
+    while command_on(&mut bob, "JOIN").await.params[0] != "#ops" {}
+    for (channel, text) in [("#ops", "deleted with #ops"), ("#space", "kept in #space")] {
+        bob.outbound
+            .send(vec![Message::new("PRIVMSG", [channel, text])])
+            .await
+            .unwrap();
+        assert_eq!(command_on(&mut bob, "PRIVMSG").await.params[1], text);
+    }
+    // Omitting #ops without listing it is refused; nothing changes.
+    let mut omitted = config.clone();
+    omitted.channels.retain(|c| c.name != "#ops");
+    omitted.membership_generation = Some(2);
+    render(&file, &omitted);
+    let refused = control(&socket, r#"{"op":"reload"}"#).await;
+    assert_eq!(refused["code"], "RESTART_REQUIRED", "{refused}");
+    // Listed and absent: deleted, with its joined session told by KICK.
+    let mut deleted = omitted.clone();
+    deleted.removed_channels = vec!["#ops".into()];
+    let bytes = render(&file, &deleted);
+    let applied = control(&socket, r#"{"op":"reload"}"#).await;
+    assert_eq!(applied["result"]["applied_generation"], 2, "{applied}");
+    assert_eq!(applied["result"]["config_sha256"], sha256(&bytes));
+    assert_eq!(applied["result"]["deleted"], serde_json::json!(["#ops"]));
+    assert_eq!(applied["result"]["disconnected"], serde_json::json!([]));
+    let kick = command_on(&mut bob, "KICK").await;
+    assert_eq!(kick.params, ["#ops", "bob", "Channel deleted"]);
+    // The connection and its other channel stay usable.
+    bob.outbound
+        .send(vec![Message::new("PRIVMSG", ["#space", "still here"])])
+        .await
+        .unwrap();
+    assert_eq!(
+        command_on(&mut bob, "PRIVMSG").await.params[1],
+        "still here"
+    );
+    bob.outbound
+        .send(vec![Message::new("JOIN", ["#ops"])])
+        .await
+        .unwrap();
+    assert_eq!(command_on(&mut bob, "403").await.params[1], "#ops");
+    drop(bob);
+    server.shutdown().await.unwrap();
+    // A fresh server on the same database keeps the deletion.
+    let server = server::start_file(&file).await.unwrap();
+    let status = control(&socket, r#"{"op":"status"}"#).await;
+    assert_eq!(status["result"]["applied_generation"], 2, "{status}");
+    let mut bob = client::connect(&member(dir.path(), &config, "bob"))
+        .await
+        .unwrap();
+    bob.outbound
+        .send(vec![Message::new("JOIN", ["#ops"])])
+        .await
+        .unwrap();
+    assert_eq!(command_on(&mut bob, "403").await.params[1], "#ops");
+    let kept = history_page(&mut bob, "#space").await;
+    assert!(kept.iter().any(|m| m.params[1] == "kept in #space"));
+    // Recreating the name, now unlisted, starts with no history or topic.
+    let mut recreated = deleted.clone();
+    recreated.removed_channels.clear();
+    recreated.channels.push(ops);
+    recreated.membership_generation = Some(3);
+    render(&file, &recreated);
+    let applied = control(&socket, r#"{"op":"reload"}"#).await;
+    assert_eq!(applied["result"]["applied_generation"], 3, "{applied}");
+    bob.outbound
+        .send(vec![Message::new("JOIN", ["#ops"])])
+        .await
+        .unwrap();
+    while command_on(&mut bob, "JOIN").await.params[0] != "#ops" {}
+    assert_eq!(command_on(&mut bob, "331").await.params[1], "#ops");
+    assert!(history_page(&mut bob, "#ops").await.is_empty());
+    server.shutdown().await.unwrap();
+}
+
+/// Open one artifact request with `Expect: 100-continue` and wait for the
+/// server's `100 Continue`: hyper sends it only once the handler starts
+/// reading the body, after authentication, admission and the upload permit.
+async fn held_upload(socket: &Path, route: &str, channel: &str) -> tokio::net::UnixStream {
+    use tokio::io::AsyncReadExt;
+    let mut http = tokio::net::UnixStream::connect(socket).await.unwrap();
+    let head = format!(
+        "POST /v1/channels/{}/{route} HTTP/1.1\r\nHost: airc.local\r\nAuthorization: Bearer bob:{TOKEN}\r\nX-AIRC-Filename: late.png\r\nContent-Length: 8\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        channel.replace('#', "%23")
+    );
+    http.write_all(head.as_bytes()).await.unwrap();
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !seen.ends_with(b"\r\n\r\n") {
+            seen.push(http.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .expect("upload admitted");
+    assert!(
+        seen.starts_with(b"HTTP/1.1 100 "),
+        "{}",
+        String::from_utf8_lossy(&seen)
+    );
+    http
+}
+
+/// Finish a held upload; returns its status, refusal marker and body.
+async fn finish_upload(mut http: tokio::net::UnixStream) -> (u16, Option<String>, String) {
+    use tokio::io::AsyncReadExt;
+    http.write_all(b"held-upl").await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), http.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8_lossy(&response);
+    let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let refusal = text
+        .lines()
+        .find_map(|l| l.strip_prefix("x-airc-refusal: "))
+        .map(str::to_owned);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+    (status, refusal, body)
+}
+
+#[tokio::test]
+async fn an_upload_admitted_before_deletion_never_lands_in_a_recreated_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = unix_config(dir.path());
+    let control_dir = dir.path().join("control");
+    std::fs::create_dir(&control_dir).unwrap();
+    let socket = control_dir.join("control.sock");
+    config.control_unix = Some(socket.clone());
+    config.membership_generation = Some(1);
+    let ops = Channel {
+        name: "#ops".into(),
+        members: vec!["alice".into(), "bob".into()],
+        operators: vec![],
+        moderated: false,
+    };
+    config.channels.push(ops.clone());
+    let file = dir.path().join("server.toml");
+    render(&file, &config);
+    let server = server::start_file(&file).await.unwrap();
+    let artifacts = config
+        .artifacts
+        .as_ref()
+        .unwrap()
+        .listen_unix
+        .clone()
+        .unwrap();
+    let mut bob = client::connect(&member(dir.path(), &config, "bob"))
+        .await
+        .unwrap();
+    bob.outbound
+        .send(vec![Message::new("JOIN", ["#ops"])])
+        .await
+        .unwrap();
+    while command_on(&mut bob, "JOIN").await.params[0] != "#ops" {}
+    // Staged and published uploads to #ops, and one to the unrelated #space,
+    // are each admitted at generation 1 and wait for their bodies.
+    let staged = held_upload(&artifacts, "staged", "#ops").await;
+    let published = held_upload(&artifacts, "artifacts", "#ops").await;
+    let unrelated = held_upload(&artifacts, "artifacts", "#space").await;
+    // Delete #ops, recreate the name, and rejoin it.
+    let mut deleted = config.clone();
+    deleted.channels.retain(|c| c.name != "#ops");
+    deleted.removed_channels = vec!["#ops".into()];
+    deleted.membership_generation = Some(2);
+    render(&file, &deleted);
+    let applied = control(&socket, r#"{"op":"reload"}"#).await;
+    assert_eq!(
+        applied["result"]["deleted"],
+        serde_json::json!(["#ops"]),
+        "{applied}"
+    );
+    let mut recreated = config.clone();
+    recreated.membership_generation = Some(3);
+    render(&file, &recreated);
+    assert_eq!(control(&socket, r#"{"op":"reload"}"#).await["ok"], true);
+    bob.outbound
+        .send(vec![Message::new("JOIN", ["#ops"])])
+        .await
+        .unwrap();
+    while command_on(&mut bob, "JOIN").await.params[0] != "#ops" {}
+    // The old requests are definite refusals by the actor, with the same
+    // code as admission; the unrelated one and a fresh upload succeed.
+    for held in [staged, published] {
+        let (status, refusal, body) = finish_upload(held).await;
+        assert_eq!((status, refusal.as_deref()), (404, Some("not-found")));
+        assert!(body.contains("deleted or replaced"), "{body}");
+    }
+    assert_eq!(finish_upload(unrelated).await.0, 201);
+    let fresh = held_upload(&artifacts, "staged", "#ops").await;
+    assert_eq!(finish_upload(fresh).await.0, 201);
+    assert!(history_page(&mut bob, "#ops").await.is_empty());
     server.shutdown().await.unwrap();
 }

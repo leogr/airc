@@ -1,6 +1,6 @@
 # Storage, transport and server lifecycle
 
-Verification: `59064c6188658bf60131db6afc33ab7bbf45357c`, staged attachments at `cffe0962e3b907b2078f33f821231b2446fef1f5`, and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `59064c6188658bf60131db6afc33ab7bbf45357c`, staged attachments at `cffe0962e3b907b2078f33f821231b2446fef1f5`, channel deletion at `7da41509514601ec60d4b7a97ec3dedf5ad090db` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] Strict TOML configuration validates identifiers, account/channel references,
 resource limits and remote plaintext opt-ins before listeners start. Relative
@@ -29,6 +29,9 @@ and timestamp, prunes channel counts/age, and commits before the caller broadcas
 Artifact bytes and the associated message share that transaction. Reads filter
 age retention; periodic pruning removes expired rows. Physical shrinking is not
 performed. Channel moderation/topic and bans persist; session roles do not.
+Listed `removed_channels` intent deletes a channel's messages, published and
+staged artifacts, bans and row in one transaction at reload or startup: logical
+deletion, not secure erasure. [20](#source-20)
 Ban writes commit before state changes and broadcast; startup rejects malformed
 or oversized persisted lists. [4](#source-4) [5](#source-5) [12](#source-12) [13](#source-13) [14](#source-14)
 
@@ -87,3 +90,4 @@ continues receiving. [8](#source-8) [9](#source-9) [10](#source-10)
 17. <a id="source-17"></a> [src/server/core.rs](../../src/server/core.rs#L1275-L1350) — attachment `publish` checks, `MAX_TAGS` probe and `refuse_attachments`; `stage` at L2307; `src/server/http.rs` L90–L200: staging route, `refused` markers, lost-reply 503.
 18. <a id="source-18"></a> [src/attachments.rs](../../src/attachments.rs#L1-L210) — tag grammar, bounded offsets, marker positions, reserved encoding, record summary and detail.
 19. <a id="source-19"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L1944-L2370) — publication, refusals, multiline offsets, worst-case tag size, CLI staging, typed-refusal and old-server staging.
+20. <a id="source-20"></a> [src/store.rs](../../src/store.rs#L446-L455) — `purge`, called by `open` and `change_channels`.

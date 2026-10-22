@@ -44,6 +44,9 @@ pub(super) enum Event {
         data: Vec<u8>,
         /// Store unannounced for a later message (the staging route).
         stage: bool,
+        /// Membership generation of the configuration that admitted the
+        /// request before its body arrived.
+        admitted: u64,
         reply: oneshot::Sender<Result<serde_json::Value>>,
     },
     Download {

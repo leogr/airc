@@ -11,6 +11,7 @@ use crate::{
     protocol::read_line,
 };
 use anyhow::{Context, Result, bail, ensure};
+use delivery::Rendering;
 use serde::{Deserialize, Serialize};
 use state::{SEND_TAG, State, identity, safe};
 use std::{
@@ -121,6 +122,9 @@ pub enum Operation {
         /// The exact pending ID the operator authorized for one redelivery.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry: Option<String>,
+        /// Older clients omit these; their first deliver request fixes them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settings: Option<ConsumerSettings>,
     },
     Deliver {
         wait: u64,
@@ -177,6 +181,19 @@ impl Operation {
             topic,
         })
     }
+}
+
+/// What a delivery consumer declares at registration. Every deliver request on
+/// its connection must match; `status` reports them for recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumerSettings {
+    pub wake: Wake,
+    pub max_bytes: usize,
+    pub min_interval: u64,
+    /// `subscribe --wrap`, applied by the client after assembly; absent when off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap: Option<usize>,
 }
 
 /// A fresh caller-side control ID: 128 random bits as lowercase hex.
@@ -288,6 +305,9 @@ struct Consumer {
     last_request: chrono::DateTime<chrono::Utc>,
     retry: Option<String>,
     accepted_at: Option<Instant>,
+    /// Declared at registration, or fixed by an older client's first deliver
+    /// request with its wrap unknown; `None` until then.
+    options: Option<delivery::Options>,
 }
 fn consumer_status(consumer: Option<&Consumer>) -> String {
     let utc =
@@ -295,14 +315,16 @@ fn consumer_status(consumer: Option<&Consumer>) -> String {
     match consumer {
         None => "delivery consumer: none\n".into(),
         Some(c) => format!(
-            "delivery consumer: {} pid={} since={} last_request={}\n",
+            "delivery consumer: {} pid={} since={} last_request={} {}\n",
             match c.kind {
                 ConsumerKind::Wait => "wait",
                 ConsumerKind::Subscribe => "subscribe",
             },
             c.pid.map_or("unknown".into(), |pid| pid.to_string()),
             utc(&c.since),
-            utc(&c.last_request)
+            utc(&c.last_request),
+            c.options
+                .map_or("settings=unknown".into(), |options| options.to_string())
         ),
     }
 }
@@ -438,9 +460,7 @@ fn claim_lookup(showing: &mut Option<WaitingShow>, msgid: &str) -> Option<Waitin
 struct WaitingDelivery {
     conn: u64,
     until: Instant,
-    wake: Wake,
-    max_bytes: usize,
-    min_interval: Duration,
+    options: delivery::Options,
     reply: oneshot::Sender<Response>,
 }
 
@@ -773,6 +793,12 @@ pub async fn deliver(
         Operation::Consume {
             kind,
             retry: options.retry.clone(),
+            settings: Some(ConsumerSettings {
+                wake: options.wake,
+                max_bytes: options.max_bytes,
+                min_interval: options.min_interval,
+                wrap: options.wrap,
+            }),
         },
         10,
     )
@@ -1005,6 +1031,17 @@ fn validate(operation: &Operation) -> Result<()> {
     if let Some(request) = operation.control() {
         request.validate()?;
     }
+    let limits = |max_bytes: &usize, min_interval: &u64| {
+        ensure!(
+            (delivery::MIN_BYTES..=delivery::MAX_BYTES).contains(max_bytes)
+                && *min_interval <= delivery::MAX_INTERVAL,
+            "delivery requires --max-bytes {}–{} and --min-interval 0–{}",
+            delivery::MIN_BYTES,
+            delivery::MAX_BYTES,
+            delivery::MAX_INTERVAL
+        );
+        Ok(())
+    };
     if let Operation::Deliver {
         wait,
         max_bytes,
@@ -1012,13 +1049,22 @@ fn validate(operation: &Operation) -> Result<()> {
         ..
     } = operation
     {
+        ensure!(*wait <= 60, "internal delivery wait requires 0–60 seconds");
+        limits(max_bytes, min_interval)?;
+    }
+    if let Operation::Consume {
+        settings: Some(settings),
+        ..
+    } = operation
+    {
+        limits(&settings.max_bytes, &settings.min_interval)?;
         ensure!(
-            *wait <= 60
-                && (delivery::MIN_BYTES..=delivery::MAX_BYTES).contains(max_bytes)
-                && *min_interval <= 3600,
-            "delivery requires --max-bytes {}–{} and --min-interval 0–3600",
-            delivery::MIN_BYTES,
-            delivery::MAX_BYTES
+            settings
+                .wrap
+                .is_none_or(|wrap| (delivery::MIN_WRAP..=delivery::MAX_WRAP).contains(&wrap)),
+            "--wrap requires {}–{} bytes",
+            delivery::MIN_WRAP,
+            delivery::MAX_WRAP
         );
     }
     if let Operation::Show {
@@ -1061,7 +1107,7 @@ fn deliveries(state: &State, consumer: Option<&Consumer>, show: Option<&str>) ->
             consumer_status(consumer)
         )),
         Some(id) => match state.pending_delivery() {
-            Some(batch) if batch.id == id => Response::ok(batch.render(false)),
+            Some(batch) if batch.id == id => Response::ok(batch.render(Rendering::Inspect)),
             _ => Response::error(format!("no pending delivery {id}")),
         },
     }
@@ -1235,7 +1281,7 @@ async fn serve(
                     c.last_request = now;
                 }
                 match call.operation {
-                    Operation::Consume { kind, retry } => {
+                    Operation::Consume { kind, retry, settings } => {
                         let refusal = if let Some(active) = &consumer {
                             Some(format!("delivery consumer active since {} (pid {}); stop it first. Nothing was replayed.",
                                 active.since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -1253,7 +1299,13 @@ async fn serve(
                             let _ = call.reply.send(Response::error(text));
                         } else {
                             store.save(state)?; // A first consumer's starting cursor is durable.
-                            consumer = Some(Consumer { conn: call.conn, kind, pid: call.pid, since: now, last_request: now, retry, accepted_at: None });
+                            let options = settings.map(|s| delivery::Options {
+                                wake: s.wake.mode(),
+                                max_bytes: s.max_bytes,
+                                min_interval: s.min_interval,
+                                wrap: s.wrap.map_or(delivery::Wrap::Off, delivery::Wrap::Bytes),
+                            });
+                            consumer = Some(Consumer { conn: call.conn, kind, pid: call.pid, since: now, last_request: now, retry, accepted_at: None, options });
                             let _ = call.reply.send(Response::ok("delivery consumer registered\n"));
                         }
                     }
@@ -1262,11 +1314,18 @@ async fn serve(
                             let _ = call.reply.send(Response::error("deliver requires this connection's consumer registration"));
                             continue;
                         };
+                        let requested = delivery::Options { wake: wake.mode(), max_bytes, min_interval, wrap: delivery::Wrap::Unknown };
+                        let options = *active.options.get_or_insert(requested);
+                        if (options.wake, options.max_bytes, options.min_interval) != (requested.wake, requested.max_bytes, requested.min_interval) {
+                            let _ = call.reply.send(Response::error(format!("deliver settings differ from this consumer's ({options}); register a new consumer. Nothing was delivered.")));
+                            continue;
+                        }
                         match state.pending_delivery() {
                             Some(batch) if active.retry.as_deref() == Some(batch.id.as_str()) => {
-                                // The single redelivery the operator authorized by ID.
+                                // The single redelivery the operator authorized by ID,
+                                // with the settings it was assembled under.
                                 active.retry = None;
-                                let _ = call.reply.send(Response::delivered(batch.id.clone(), batch.render(true)));
+                                let _ = call.reply.send(Response::delivered(batch.id.clone(), batch.render(Rendering::Retry)));
                             }
                             Some(batch) => {
                                 let _ = call.reply.send(Response::error(format!("delivery {} awaits acceptance; nothing was replayed", batch.id)));
@@ -1275,9 +1334,7 @@ async fn serve(
                                 delivering = Some(WaitingDelivery {
                                     conn: call.conn,
                                     until: Instant::now() + Duration::from_secs(wait),
-                                    wake,
-                                    max_bytes,
-                                    min_interval: Duration::from_secs(min_interval),
+                                    options,
                                     reply: call.reply,
                                 });
                             }
@@ -1505,19 +1562,19 @@ async fn serve(
             delivering = None;
         }
         if let Some(d) = &delivering {
-            let mode = d.wake.mode();
+            let mode = d.options.wake;
             let decision = match state.delivery_readiness(mode, d.until.into_std()) {
                 Ok(attention::Readiness::Ready) => {
                     let early = consumer
                         .as_ref()
                         .and_then(|c| c.accepted_at)
-                        .is_some_and(|at| at.elapsed() < d.min_interval)
+                        .is_some_and(|at| {
+                            at.elapsed() < Duration::from_secs(d.options.min_interval)
+                        })
                         && !state.delivery_urgent(mode);
                     if early {
                         (Instant::now() >= d.until).then(|| Response::readiness(false))
-                    } else if let Some((id, text)) =
-                        state.prepare_delivery(session, mode, d.max_bytes)
-                    {
+                    } else if let Some((id, text)) = state.prepare_delivery(session, d.options) {
                         store.save(state)?; // Pending is durable BEFORE anyone can see it.
                         Some(Response::delivered(id, text))
                     } else {

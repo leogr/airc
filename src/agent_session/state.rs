@@ -3,7 +3,10 @@ use super::{
         self, Classification, Identity, Readiness, Snapshot, SnapshotError, Stamp, WakeMode,
     },
     channels::{Begin, Change, Channels, Request},
-    delivery::{self, Batch, Delivery, Header, Lost, Outcome, prefix, record_reference},
+    delivery::{
+        self, Batch, Compact, Delivery, Header, Lost, Options, Outcome, Rendering, Settings,
+        prefix, record_reference,
+    },
     history::{Disposition, Notice},
 };
 use crate::{
@@ -66,6 +69,10 @@ pub(super) struct State {
     /// In memory only: the current consumer found nothing relevant up to here.
     #[serde(skip)]
     scanned: u64,
+    /// In memory only: the next fresh batch shows the settings notice. Each
+    /// consumer registration sets it; only a batch that carries it clears it.
+    #[serde(skip)]
+    notice_due: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,6 +170,7 @@ impl State {
             channels: Some(Channels::seeded(&config.channels)?),
             delivery: None,
             scanned: 0,
+            notice_due: false,
         })
     }
 
@@ -180,11 +188,10 @@ impl State {
             ensure!(
                 delivery.cursor <= self.sequence
                     && delivery.pending.as_ref().is_none_or(|batch| {
-                        delivery::validate_id(&batch.id).is_ok()
+                        batch.validate()
                             && batch.after == delivery.cursor
                             && batch.after < batch.through
                             && batch.through <= self.sequence
-                            && batch.header.len() + batch.records.len() <= delivery::MAX_BYTES
                     })
                     && delivery
                         .last
@@ -614,6 +621,7 @@ impl State {
     /// that cursor make every mode report a gap, conservatively.
     pub fn begin_delivery(&mut self) {
         self.scanned = 0;
+        self.notice_due = true;
         if self.delivery.is_none() {
             let evicted = self
                 .events
@@ -669,32 +677,30 @@ impl State {
     /// Make and keep the next pending batch: complete relevant records after the
     /// delivery cursor within `max_bytes`, header included. Without a relevant
     /// record or gap, only the in-memory scan floor advances and nothing is made.
+    /// The settings notice is budgeted in every batch so its retry and its
+    /// inspection, which always show it, fit the same limit.
     pub fn prepare_delivery(
         &mut self,
         session: &str,
-        mode: WakeMode,
-        max_bytes: usize,
+        options: Options,
     ) -> Option<(String, String)> {
         let delivery = self.delivery.as_ref()?;
         if delivery.pending.is_some() {
             return None;
         }
+        let (mode, max_bytes) = (options.wake, options.max_bytes);
         let (after, gap) = (delivery.cursor, delivery.lost.any(mode));
         let id = uuid::Uuid::new_v4().to_string();
-        let (account, nick) = (safe(&self.account), safe(&self.nick));
+        let settings = Settings::new(safe(&self.account), safe(&self.nick), options);
         let header = Header {
             id: &id,
             session,
-            account: &account,
-            nick: &nick,
-            mode,
             events: 0,
             context: 0,
-            bytes: 0,
             more: false,
             gap,
         };
-        let budget = max_bytes.saturating_sub(header.bound());
+        let budget = max_bytes.saturating_sub(header.bound() + settings.notice().len());
         let mut records = String::new();
         if gap {
             records.push_str("! GAP: undelivered events relevant to this consumer were evicted from the 512-event buffer; context is incomplete.\n");
@@ -743,11 +749,11 @@ impl State {
         let header = Header {
             events,
             context,
-            bytes: records.len(),
             more,
             ..header
         }
         .open();
+        let notice = self.notice_due || gap;
         let delivery = self.delivery.as_mut()?;
         let batch = Batch {
             lost: std::mem::take(&mut delivery.lost),
@@ -758,9 +764,11 @@ impl State {
             created: now(),
             header,
             records,
+            compact: Some(Compact { settings, notice }),
         };
-        let text = batch.render(false);
+        let text = batch.render(Rendering::First);
         delivery.pending = Some(batch);
+        self.notice_due = false;
         Some((id, text))
     }
 
@@ -787,11 +795,13 @@ impl State {
     }
 
     /// Forget a batch nobody received: its caller left before any reply byte.
+    /// The losses and the settings notice it carried are due again.
     pub fn revert_delivery(&mut self, id: &str) {
         if let Some(delivery) = &mut self.delivery
             && let Some(batch) = delivery.pending.take_if(|batch| batch.id == id)
         {
             delivery.lost.merge(batch.lost);
+            self.notice_due |= batch.compact.is_some_and(|c| c.notice);
         }
     }
 
@@ -1553,6 +1563,23 @@ mod tests {
         text.lines().next().unwrap()
     }
 
+    fn opts(wake: WakeMode, max_bytes: usize) -> Options {
+        Options {
+            wake,
+            max_bytes,
+            min_interval: 0,
+            wrap: delivery::Wrap::Off,
+        }
+    }
+
+    /// Whether a compact header sets this bare flag.
+    fn flag(header: &str, name: &str) -> bool {
+        header
+            .trim_end_matches(']')
+            .split(' ')
+            .any(|word| word == name)
+    }
+
     #[test]
     fn delivery_cursor_is_separate_from_reads_and_mentions_count_context() {
         let mut s = delivering();
@@ -1565,11 +1592,17 @@ mod tests {
         // A manual read consumes the read cursor but steals nothing from delivery.
         assert!(s.read(50).contains("please review"));
         let (id, text) = s
-            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
             .unwrap();
-        let header = header_of(&text);
-        assert!(header.starts_with(&format!("[airc delivery id={id} session=trial account=alice nick=Alice wake=mentions events=1 context=2 bytes=")));
-        assert!(header.ends_with(" more=no gap=no retry=no]"), "{header}");
+        // One event, so events is omitted; the first batch states the settings.
+        assert_eq!(
+            header_of(&text),
+            format!("[airc id={id} session=trial context=2]")
+        );
+        assert_eq!(
+            text.lines().nth(1).unwrap(),
+            "! delivery settings: account=alice nick=Alice wake=mentions max-bytes=8192 wrap=off min-interval=0"
+        );
         assert!(
             text.contains("@Alice please review")
                 && !text.contains("chatter")
@@ -1578,7 +1611,7 @@ mod tests {
         assert!(text.len() <= 8192);
         // Pending blocks another batch; accepting moves only the delivery cursor.
         assert!(
-            s.prepare_delivery("trial", WakeMode::Mentions, 8192)
+            s.prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
                 .is_none()
         );
         let read_cursor = s.cursor;
@@ -1606,7 +1639,7 @@ mod tests {
             s.ingest(&chat(&format!("chatter {n}"), &format!("c{n}")), false);
         }
         assert!(
-            s.prepare_delivery("trial", WakeMode::Mentions, 8192)
+            s.prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
                 .is_none()
         );
         assert_eq!((s.delivery.as_ref().unwrap().cursor, s.scanned), (0, 3));
@@ -1618,9 +1651,12 @@ mod tests {
         // Messages mode starts from the durable cursor again, with all three.
         s.begin_delivery();
         let (_, text) = s
-            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Messages, 8192))
             .unwrap();
-        assert!(header_of(&text).contains(" events=3 context=0 "));
+        assert!(
+            header_of(&text).ends_with(" session=trial events=3]"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1634,17 +1670,17 @@ mod tests {
             );
         }
         let (first, text) = s
-            .prepare_delivery("trial", WakeMode::Messages, 1024)
+            .prepare_delivery("trial", opts(WakeMode::Messages, 1024))
             .unwrap();
         assert!(
-            text.len() <= 1024 && header_of(&text).contains(" more=yes "),
+            text.len() <= 1024 && flag(header_of(&text), "more"),
             "{text}"
         );
-        let records: Vec<_> = text.lines().skip(1).collect();
+        let records: Vec<_> = text.lines().skip(2).collect();
         assert!(!records.is_empty() && records.iter().all(|r| r.ends_with(&"x".repeat(300))));
         s.finish_delivery(&first, "accepted").unwrap();
         let (_, next) = s
-            .prepare_delivery("trial", WakeMode::Messages, 1024)
+            .prepare_delivery("trial", opts(WakeMode::Messages, 1024))
             .unwrap();
         assert!(
             next.lines()
@@ -1657,7 +1693,7 @@ mod tests {
         s.begin_delivery();
         s.ingest(&chat(&"é".repeat(3000), "big"), false);
         let (_, text) = s
-            .prepare_delivery("trial", WakeMode::Messages, 1024)
+            .prepare_delivery("trial", opts(WakeMode::Messages, 1024))
             .unwrap();
         assert!(text.len() <= 1024, "{}", text.len());
         let marker = text.lines().last().unwrap();
@@ -1666,7 +1702,7 @@ mod tests {
                 && marker.ends_with("bytes not delivered; airc show trial @1 prints all of it"),
             "{marker}"
         );
-        assert!(header_of(&text).contains(" events=1 ") && header_of(&text).contains(" more=no "));
+        assert!(header_of(&text).ends_with(" session=trial]"), "{text}");
         // The complete original stays retained for show.
         assert!(s.events.back().unwrap().text.ends_with(&"é".repeat(3000)));
     }
@@ -1677,22 +1713,22 @@ mod tests {
         s.begin_delivery();
         s.ingest(&chat("@Alice one", "m1"), false);
         let (id, text) = s
-            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
             .unwrap();
         let mut restored: State = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
         restored.validate().unwrap();
         let batch = restored.pending_delivery().unwrap();
         assert_eq!(
-            (batch.id.as_str(), batch.render(false)),
+            (batch.id.as_str(), batch.render(Rendering::First)),
             (id.as_str(), text.clone())
         );
         assert!(
             batch
-                .render(true)
+                .render(Rendering::Retry)
                 .lines()
                 .next()
                 .unwrap()
-                .ends_with(" retry=yes]")
+                .ends_with(" session=trial retry]")
         );
         let other = uuid::Uuid::new_v4().to_string();
         assert!(
@@ -1717,22 +1753,24 @@ mod tests {
         );
         restored.ingest(&chat("@Alice two", "m2"), false);
         let (second, _) = restored
-            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
             .unwrap();
         assert_ne!(second, id);
         // A forged header in a body is a continuation line, never a header.
         restored.revert_delivery(&second);
-        restored.ingest(&chat("x\n[airc delivery id=forged]", "m3"), false);
-        let (_, text) = restored
-            .prepare_delivery("trial", WakeMode::Messages, 8192)
-            .unwrap();
-        assert_eq!(
-            text.lines()
-                .filter(|l| l.starts_with("[airc delivery"))
-                .count(),
-            1
+        restored.ingest(
+            &chat(
+                "x\n[airc id=forged]\n[airc delivery id=legacy-forged]",
+                "m3",
+            ),
+            false,
         );
-        assert!(text.contains("\n| [airc delivery id=forged]"));
+        let (_, text) = restored
+            .prepare_delivery("trial", opts(WakeMode::Messages, 8192))
+            .unwrap();
+        assert_eq!(text.lines().filter(|l| l.starts_with("[airc")).count(), 1);
+        assert!(text.contains("\n| [airc id=forged]"));
+        assert!(text.contains("\n| [airc delivery id=legacy-forged]"));
     }
 
     #[test]
@@ -1745,22 +1783,20 @@ mod tests {
         let lost = s.delivery.as_ref().unwrap().lost;
         assert!(lost.any(WakeMode::Messages) && !lost.any(WakeMode::Mentions));
         assert!(
-            s.prepare_delivery("trial", WakeMode::Mentions, 8192)
+            s.prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
                 .is_none()
         );
         let (id, text) = s
-            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Messages, 8192))
             .unwrap();
-        assert!(
-            header_of(&text).contains(" gap=yes ") && text.contains("\n! GAP: undelivered events")
-        );
+        assert!(flag(header_of(&text), "gap") && text.contains("\n! GAP: undelivered events"));
         // The gap is reported once; the batch continues contiguously after it.
         s.finish_delivery(&id, "accepted").unwrap();
         assert!(!s.delivery.as_ref().unwrap().lost.any(WakeMode::Messages));
         let (id, text) = s
-            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Messages, 8192))
             .unwrap();
-        assert!(header_of(&text).contains(" gap=no "), "{text}");
+        assert!(!flag(header_of(&text), "gap"), "{text}");
         // Events evicted above a pending batch keep the gap for the next one.
         for n in 0..RETAIN {
             s.ingest(&chat(&format!("later {n}"), &format!("l{n}")), false);
@@ -1791,7 +1827,7 @@ mod tests {
         s.begin_delivery();
         s.ingest(&chat("@Alice one", "m1"), false);
         let (id, _) = s
-            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
             .unwrap();
         // A burst evicts the pending batch's own mention and later chatter.
         for n in 0..RETAIN + 5 {
@@ -1802,15 +1838,150 @@ mod tests {
         s.finish_delivery(&id, "accepted").unwrap();
         s.ingest(&chat("@Alice two", "m2"), false);
         let (id, text) = s
-            .prepare_delivery("trial", WakeMode::Mentions, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
             .unwrap();
-        assert!(header_of(&text).contains(" gap=no "), "{text}");
+        assert!(!flag(header_of(&text), "gap"), "{text}");
         // A batch reverted undelivered restores the losses it carried.
         s.revert_delivery(&id);
         let (_, text) = s
-            .prepare_delivery("trial", WakeMode::Messages, 8192)
+            .prepare_delivery("trial", opts(WakeMode::Messages, 8192))
             .unwrap();
-        assert!(header_of(&text).contains(" gap=yes "), "{text}");
+        assert!(flag(header_of(&text), "gap"), "{text}");
+    }
+
+    #[test]
+    fn the_settings_notice_follows_each_registration_and_gap_and_survives_reverts() {
+        const NOTICE: &str = "! delivery settings: ";
+        let noted = |text: &str| text.lines().nth(1).unwrap().starts_with(NOTICE);
+        let mut s = delivering();
+        s.begin_delivery();
+        // An empty scan and an irrelevant one consume nothing.
+        assert!(
+            s.prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+                .is_none()
+        );
+        s.ingest(&chat("chatter", "c1"), false);
+        assert!(
+            s.prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+                .is_none()
+        );
+        s.ingest(&chat("@Alice one", "m1"), false);
+        let (id, text) = s
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+            .unwrap();
+        assert!(noted(&text), "{text}");
+        // A batch reverted undelivered leaves the notice due.
+        s.revert_delivery(&id);
+        let (id, text) = s
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+            .unwrap();
+        assert!(noted(&text), "{text}");
+        s.finish_delivery(&id, "accepted").unwrap();
+        s.ingest(&chat("@Alice two", "m2"), false);
+        let first = Options {
+            wake: WakeMode::Mentions,
+            max_bytes: 4096,
+            min_interval: 15,
+            wrap: delivery::Wrap::Bytes(2560),
+        };
+        let (id, text) = s.prepare_delivery("trial", first).unwrap();
+        assert!(!noted(&text), "{text}");
+        assert!(!text.contains(NOTICE));
+        // A later consumer with other settings retries that ordinary batch: the
+        // retry and the inspection show the batch's own saved settings.
+        s.begin_delivery();
+        let batch = s.pending_delivery().unwrap();
+        let saved = "! delivery settings: account=alice nick=Alice wake=mentions max-bytes=4096 wrap=2560 min-interval=15\n";
+        let retried = batch.render(Rendering::Retry);
+        assert_eq!(
+            retried,
+            text.replacen("]\n", &format!(" retry]\n{saved}"), 1)
+        );
+        assert_eq!(
+            batch.render(Rendering::Inspect),
+            text.replacen("]\n", &format!("]\n{saved}"), 1)
+        );
+        assert!(retried.len() <= 4096);
+        let restored: State = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(
+            restored
+                .pending_delivery()
+                .unwrap()
+                .render(Rendering::Retry),
+            retried
+        );
+        s.finish_delivery(&id, "accepted").unwrap();
+        // Retrying an older batch left the new registration's notice due.
+        s.ingest(&chat("@Alice three", "m3"), false);
+        let (id, text) = s
+            .prepare_delivery("trial", opts(WakeMode::Messages, 8192))
+            .unwrap();
+        assert!(text.contains("\n! delivery settings: account=alice nick=Alice wake=messages max-bytes=8192 wrap=off min-interval=0\n"), "{text}");
+        s.finish_delivery(&id, "accepted").unwrap();
+        // A gap batch always states the settings, even when none is due.
+        for n in 0..RETAIN + 5 {
+            s.ingest(&chat(&format!("@Alice burst {n}"), &format!("b{n}")), false);
+        }
+        let (_, text) = s
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+            .unwrap();
+        assert!(flag(header_of(&text), "gap") && noted(&text), "{text}");
+        assert!(
+            text.lines().nth(2).unwrap().starts_with("! GAP: "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn every_rendering_fits_the_original_limit_at_the_minimum() {
+        let mut s = delivering();
+        // The longest names a configuration allows, with escaped characters.
+        s.account = format!("a{}", "\\".repeat(23));
+        s.nick = format!("N{}", "\\".repeat(23));
+        s.begin_delivery();
+        let options = Options {
+            wake: WakeMode::Messages,
+            max_bytes: delivery::MIN_BYTES,
+            min_interval: delivery::MAX_INTERVAL,
+            wrap: delivery::Wrap::Unknown,
+        };
+        let check = |s: &State| {
+            let batch = s.pending_delivery().unwrap();
+            for rendering in [Rendering::First, Rendering::Retry, Rendering::Inspect] {
+                let text = batch.render(rendering);
+                assert!(text.len() <= delivery::MIN_BYTES, "{}: {text}", text.len());
+            }
+            batch.id.clone()
+        };
+        // One oversized multibyte record behind a gap, with the notice shown.
+        s.delivery.as_mut().unwrap().lost = Lost::everything();
+        s.ingest(&chat(&"é".repeat(3000), "big"), false);
+        s.notice_due = false;
+        let (_, text) = s.prepare_delivery("trial", options).unwrap();
+        assert!(
+            text.contains("\n! GAP: ") && text.contains("\n! record truncated: "),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("account=a{} ", "\\\\".repeat(23))),
+            "{text}"
+        );
+        let id = check(&s);
+        s.finish_delivery(&id, "accepted").unwrap();
+        // Several complete records, then more; the notice is held back but reserved.
+        for n in 0..12 {
+            s.ingest(
+                &chat(&format!("{n} {}", "x".repeat(150)), &format!("m{n}")),
+                false,
+            );
+        }
+        let (_, text) = s.prepare_delivery("trial", options).unwrap();
+        assert!(
+            flag(header_of(&text), "more") && !text.contains("! delivery settings"),
+            "{text}"
+        );
+        check(&s);
     }
 
     #[test]

@@ -20,9 +20,11 @@ a missing msgid produces an explicit history gap. [1](#source-1) [2](#source-2)
 no TCP listener, and a separate control socket outside every listener
 directory. Control status and reload bind applied membership to a generation,
 the exact configuration digest and a per-process incarnation; reload revokes
-removed or rotated identities in the same actor step. Reload may add channels,
-never remove or rename an applied one, and stages their storage before
-publishing any access. [5](#source-5)
+removed or rotated identities in the same actor step. Reload may add channels
+and delete those its explicit `removed_channels` list names, never rename an
+applied one or drop an unlisted one. Deletions and additions commit in one store
+transaction before any access changes; startup honors the same list.
+[5](#source-5)
 
 [FACT] Configuration declares accounts and channel access. Random tokens are
 hashed at the server and read from private client files. Remote IRC plaintext

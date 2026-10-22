@@ -27,6 +27,7 @@ pub const FEATURES: &[&str] = &[
     "client-presence",
     "server-presence",
     "channel-add-reload",
+    "channel-delete-reload",
     "client-topic",
     "named-channels",
     "artifact-cli",

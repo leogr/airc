@@ -115,6 +115,7 @@ fn init(directory: PathBuf) -> Result<()> {
         database: "airc.sqlite3".into(),
         allow_insecure: false,
         allow_private_messages: false,
+        removed_channels: Vec::new(),
         tls: None,
         limits: Limits::default(),
         accounts,

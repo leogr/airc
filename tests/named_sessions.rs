@@ -39,6 +39,7 @@ impl Fixture {
             database: dir.path().join("state.sqlite3"),
             allow_insecure: false,
             allow_private_messages: false,
+            removed_channels: Vec::new(),
             tls: None,
             artifacts: None,
             limits: Limits {
@@ -1622,7 +1623,7 @@ fn delivery_id(batch: &str) -> String {
     batch
         .lines()
         .next()
-        .and_then(|header| header.strip_prefix("[airc delivery id="))
+        .and_then(|header| header.strip_prefix("[airc id="))
         .and_then(|rest| rest.split(' ').next())
         .expect("delivery header")
         .to_string()
@@ -1666,13 +1667,18 @@ async fn wait_deliver_prints_only_mentions_and_manual_reads_never_steal() {
         ])
         .await;
     let header = delivered.lines().next().unwrap();
-    assert!(
-        header.starts_with("[airc delivery id=")
-            && header.contains(
-                " session=trial account=alice nick=alice wake=mentions events=1 context=1 "
-            )
-            && header.ends_with(" more=no gap=no retry=no]"),
+    assert_eq!(
+        header,
+        format!(
+            "[airc id={} session=trial context=1]",
+            delivery_id(&delivered)
+        ),
         "{delivered}"
+    );
+    // Each `wait --deliver` registers anew, so its batch states the settings.
+    assert_eq!(
+        delivered.lines().nth(1).unwrap(),
+        "! delivery settings: account=alice nick=alice wake=mentions max-bytes=8192 wrap=off min-interval=0"
     );
     assert!(delivered.contains("human(human): @alice please review"));
     assert!(!delivered.contains("routine chatter"));
@@ -1720,6 +1726,10 @@ async fn failed_sinks_leave_one_pending_batch_until_explicit_id_bound_recovery()
             "trial".into(),
             "--wake".into(),
             "mentions".into(),
+            "--max-bytes".into(),
+            "4096".into(),
+            "--wrap".into(),
+            "2048".into(),
             "--".into(),
             "sh".into(),
             "-c".into(),
@@ -1732,11 +1742,16 @@ async fn failed_sinks_leave_one_pending_batch_until_explicit_id_bound_recovery()
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let subscriber = f.cli(&argv);
     let mention = async {
-        eventually(
+        let status = eventually(
             || f.ok(&["status", "trial"]),
             |s| s.contains("delivery consumer: subscribe"),
         )
         .await;
+        // Status reports the live consumer's settings for recovery.
+        assert!(
+            status.contains(" wake=mentions max-bytes=4096 wrap=2048 min-interval=0\n"),
+            "{status}"
+        );
         send(&mut human, "@alice first").await;
     };
     let (failed, ()) = tokio::join!(subscriber, mention);
@@ -1771,8 +1786,11 @@ async fn failed_sinks_leave_one_pending_batch_until_explicit_id_bound_recovery()
         text(&refused)
     );
     assert!(!unused.exists());
+    let notice = "! delivery settings: account=alice nick=alice wake=mentions max-bytes=4096 wrap=2048 min-interval=0\n";
+    assert!(batch.contains(&format!("]\n{notice}@")), "{batch}");
     assert_eq!(f.ok(&["deliveries", "trial", "--show", &id]).await, batch);
-    // The operator-authorized retry redelivers that exact batch once, flagged.
+    // The operator-authorized retry redelivers that exact batch once, flagged,
+    // with its original settings although this consumer uses others.
     let retried = f
         .ok(&[
             "wait",
@@ -1784,7 +1802,7 @@ async fn failed_sinks_leave_one_pending_batch_until_explicit_id_bound_recovery()
             "0",
         ])
         .await;
-    assert_eq!(retried, batch.replacen(" retry=no]", " retry=yes]", 1));
+    assert_eq!(retried, batch.replacen("]\n", " retry]\n", 1));
     assert!(
         f.ok(&["deliveries", "trial"])
             .await
@@ -1940,6 +1958,22 @@ async fn subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_
     )
     .await;
     assert!(status.contains(&format!("pid={pid} ")), "{status}");
+    // After a model's context loss, status recovers the same live consumer and
+    // its settings; nothing re-registers it.
+    let consumer = |status: &str| {
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("delivery consumer: "))
+            .unwrap()
+            .to_string();
+        let (head, rest) = line.split_once(" last_request=").unwrap();
+        format!("{head} {}", rest.split_once(' ').unwrap().1)
+    };
+    let registered = consumer(&status);
+    assert!(
+        registered.ends_with(" wake=mentions max-bytes=8192 wrap=off min-interval=0"),
+        "{registered}"
+    );
     // A second consumer and every recovery mutation are refused while it runs.
     let second = f
         .cli(&["wait", "trial", "--deliver", "--timeout", "0"])
@@ -1964,10 +1998,7 @@ async fn subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_
     eventually(|| read(out.clone()), |s| s.contains("@alice one")).await;
     send(&mut human, "@alice two").await;
     let batches = eventually(|| read(out.clone()), |s| s.contains("@alice two")).await;
-    let headers: Vec<_> = batches
-        .lines()
-        .filter(|l| l.starts_with("[airc delivery"))
-        .collect();
+    let headers: Vec<_> = batches.lines().filter(|l| l.starts_with("[airc")).collect();
     assert_eq!(headers.len(), 2, "{batches}");
     let env = eventually(
         || read(out.with_extension("env")),
@@ -1982,6 +2013,13 @@ async fn subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_
         |s| s.contains("pending=none") && s.contains(" accepted="),
     )
     .await;
+    assert_eq!(consumer(&f.ok(&["status", "trial"]).await), registered);
+    // Only the first batch after registration states the settings.
+    assert_eq!(
+        batches.matches("! delivery settings: ").count(),
+        1,
+        "{batches}"
+    );
     // Killing the consumer releases the slot at once; no timer is involved.
     subscriber.kill().await.unwrap();
     eventually(
@@ -2028,6 +2066,198 @@ async fn subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_
 }
 
 #[tokio::test]
+async fn older_consumers_report_unknown_settings_and_one_connection_keeps_its_settings() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    async fn call(
+        socket: &mut BufReader<UnixStream>,
+        operation: serde_json::Value,
+    ) -> serde_json::Value {
+        let request = format!("{}\n", json!({"version": 2, "operation": operation}));
+        socket
+            .get_mut()
+            .write_all(request.as_bytes())
+            .await
+            .unwrap();
+        let line = timeout(Duration::from_secs(15), read_line(socket, 1 << 21))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+    let path = f.root.join("trial/client.sock");
+    let open = || {
+        let path = path.clone();
+        async move { BufReader::new(UnixStream::connect(path).await.unwrap()) }
+    };
+    let consumer_line = |status: String| {
+        status
+            .lines()
+            .find(|l| l.starts_with("delivery consumer: "))
+            .unwrap()
+            .to_string()
+    };
+    // An older client registers without settings; its first deliver fixes them.
+    let mut older = open().await;
+    let registered = call(&mut older, json!({"op": "consume", "kind": "subscribe"})).await;
+    assert_eq!(registered["ok"], true, "{registered}");
+    let line = consumer_line(f.ok(&["status", "trial"]).await);
+    assert!(line.ends_with(" settings=unknown"), "{line}");
+    let idle = call(
+        &mut older,
+        json!({"op": "deliver", "wait": 0, "wake": "mentions", "max_bytes": 4096}),
+    )
+    .await;
+    assert_eq!(
+        (&idle["ok"], &idle["ready"]),
+        (&json!(true), &json!(false)),
+        "{idle}"
+    );
+    let line = consumer_line(f.ok(&["status", "trial"]).await);
+    assert!(
+        line.ends_with(" wake=mentions max-bytes=4096 wrap=unknown min-interval=0"),
+        "{line}"
+    );
+    let changed = call(
+        &mut older,
+        json!({"op": "deliver", "wait": 0, "wake": "mentions", "max_bytes": 8192}),
+    )
+    .await;
+    assert!(
+        changed["ok"] == false
+            && changed["text"]
+                .as_str()
+                .unwrap()
+                .contains("deliver settings differ from this consumer's"),
+        "{changed}"
+    );
+    send(&mut human, "@alice from an older client").await;
+    let delivered = call(
+        &mut older,
+        json!({"op": "deliver", "wait": 10, "wake": "mentions", "max_bytes": 4096}),
+    )
+    .await;
+    let text = delivered["text"].as_str().unwrap();
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .ends_with(" max-bytes=4096 wrap=unknown min-interval=0"),
+        "{text}"
+    );
+    let id = delivered["delivery"].as_str().unwrap();
+    let accepted = call(&mut older, json!({"op": "accept", "id": id})).await;
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    drop(older);
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: none"),
+    )
+    .await;
+    // A declared registration refuses a deliver request with other settings.
+    let mut declared = open().await;
+    let settings = json!({"wake": "mentions", "max_bytes": 4096, "min_interval": 0, "wrap": 640});
+    let registered = call(
+        &mut declared,
+        json!({"op": "consume", "kind": "subscribe", "settings": settings}),
+    )
+    .await;
+    assert_eq!(registered["ok"], true, "{registered}");
+    let line = consumer_line(f.ok(&["status", "trial"]).await);
+    assert!(
+        line.ends_with(" wake=mentions max-bytes=4096 wrap=640 min-interval=0"),
+        "{line}"
+    );
+    let other = call(
+        &mut declared,
+        json!({"op": "deliver", "wait": 0, "wake": "all", "max_bytes": 4096, "min_interval": 0}),
+    )
+    .await;
+    assert_eq!(other["ok"], false, "{other}");
+    // Its second batch omits the notice and is left pending.
+    let deliver = json!({"op": "deliver", "wait": 10, "wake": "mentions", "max_bytes": 4096, "min_interval": 0});
+    for (n, accept) in [(1, true), (2, false)] {
+        send(&mut human, &format!("@alice declared {n}")).await;
+        let batch = call(&mut declared, deliver.clone()).await;
+        let text = batch["text"].as_str().unwrap().to_string();
+        assert_eq!(text.contains("! delivery settings: "), n == 1, "{text}");
+        let id = batch["delivery"].as_str().unwrap().to_string();
+        if accept {
+            assert_eq!(
+                call(&mut declared, json!({"op": "accept", "id": id})).await["ok"],
+                true
+            );
+        }
+    }
+    drop(declared);
+    let pending = eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: none"),
+    )
+    .await;
+    let id = pending
+        .split_once(" pending=")
+        .and_then(|(_, rest)| rest.split(' ').next())
+        .unwrap()
+        .to_string();
+    // A consumer with other settings retries it: status shows the current
+    // settings, while --show and the retry show the batch's original ones.
+    let original = "! delivery settings: account=alice nick=alice wake=mentions max-bytes=4096 wrap=640 min-interval=0\n";
+    let mut retrying = open().await;
+    let current = json!({"wake": "messages", "max_bytes": 8192, "min_interval": 0});
+    let registered = call(
+        &mut retrying,
+        json!({"op": "consume", "kind": "wait", "retry": id, "settings": current}),
+    )
+    .await;
+    assert_eq!(registered["ok"], true, "{registered}");
+    let line = consumer_line(f.ok(&["status", "trial"]).await);
+    assert!(
+        line.ends_with(" wake=messages max-bytes=8192 wrap=off min-interval=0"),
+        "{line}"
+    );
+    let shown = f.ok(&["deliveries", "trial", "--show", &id]).await;
+    assert!(shown.contains(&format!("]\n{original}@")), "{shown}");
+    let retried = call(
+        &mut retrying,
+        json!({"op": "deliver", "wait": 0, "wake": "messages", "max_bytes": 8192, "min_interval": 0}),
+    )
+    .await;
+    assert_eq!(retried["delivery"], json!(id), "{retried}");
+    assert_eq!(
+        retried["text"].as_str().unwrap(),
+        shown.replacen("]\n", " retry]\n", 1)
+    );
+    assert_eq!(
+        call(&mut retrying, json!({"op": "accept", "id": id})).await["ok"],
+        true
+    );
+    drop(retrying);
+    // Invalid declared settings are refused before registration.
+    let mut invalid = open().await;
+    let refused = call(
+        &mut invalid,
+        json!({"op": "consume", "kind": "subscribe",
+               "settings": {"wake": "mentions", "max_bytes": 4096, "min_interval": 0, "wrap": 63}}),
+    )
+    .await;
+    assert!(
+        refused["ok"] == false
+            && refused["text"]
+                .as_str()
+                .unwrap()
+                .contains("--wrap requires"),
+        "{refused}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn subscribe_wrap_splits_long_stdout_lines_into_continuations() {
     use tokio::io::AsyncBufReadExt;
     let f = Fixture::new();
@@ -2070,8 +2300,22 @@ async fn subscribe_wrap_splits_long_stdout_lines_into_continuations() {
             .expect("subscriber output")
     }
     let header = next(&mut lines).await;
-    assert!(header.starts_with("[airc delivery id="), "{header}");
-    let mut record = vec![next(&mut lines).await];
+    assert!(header.starts_with("[airc id="), "{header}");
+    // The first batch states the settings; wrapping continues that notice too.
+    let mut notice = vec![next(&mut lines).await];
+    let mut record = loop {
+        let line = next(&mut lines).await;
+        if !line.starts_with("| ") {
+            break vec![line];
+        }
+        notice.push(line);
+    };
+    assert!(
+        notice[0].starts_with("! delivery settings: ")
+            && notice.concat().contains("wake=mentions")
+            && notice.iter().all(|line| line.len() <= 64),
+        "{notice:?}"
+    );
     while !record.concat().contains("obey") {
         record.push(next(&mut lines).await);
     }

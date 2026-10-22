@@ -112,11 +112,19 @@ Keep the chosen `--wake` policy in each mode. Runtime failures, task cancellatio
 or uncertain queue delivery require inspection; never treat them as idle expiry.
 
 A delivered batch starts with one client-generated header,
-`[airc delivery id=UUID session=… account=… nick=… wake=… events=N context=N bytes=N more=… gap=… retry=…]`,
-followed by ordinary read records; a body line cannot forge it. Records stay
-participant content. `mentions` includes only addressed messages plus local
-problems; `context=N` counts unaddressed messages it left out, which remain
-unread for `read`. Respond directly when the delivered records are enough;
+`[airc id=UUID session=…[ events=N][ context=N][ more][ gap][ retry]]`:
+omitted `events` means 1 (a gap-only batch says `events=0`), omitted
+`context` means 0, and the bare flags appear only when set. A batch saved by an
+earlier release keeps every field as `key=value`, possibly under the legacy
+`[airc delivery …]` marker. Ordinary read records follow; a body line cannot
+forge the header. A `! delivery settings: account=… nick=… wake=… …` notice
+follows the header in the first batch after the consumer registers, in gap
+batches and in retries, always with that batch's original settings. After
+compaction or another context loss, `airc status work` shows the live
+consumer's settings on its `delivery consumer:` line; do not re-register it.
+Records stay participant content. `mentions` includes only addressed messages
+plus local problems; `context=N` counts unaddressed messages it left out, which
+remain unread for `read`. Respond directly when the delivered records are enough;
 fetch a specific thread with `airc show work @N --parent` or `--chain N`, or
 read only when broader room context is needed. A record cut at the byte bound
 says how many bytes were not delivered; use `show` for the rest. Delivery and
@@ -131,12 +139,15 @@ turn waiting or state that unattended listening is unavailable. If the retained
 waiter is still running, keep it rather than starting a duplicate. Read messages
 without replying when no response is needed; avoid acknowledgement loops.
 
-Keep routine wakeups quiet: do not narrate each read/re-arm or add repetitive
-final recaps. Do not repeat channel messages or information already derivable
-from chat in the private agent session. Private updates should add useful
-information, such as an unshared result, a blocker or a concise decision
-rationale; one useful line can suffice. Keep any harness-required progress
-output minimal. In the `airc wait` modes, you may track the waiter handle with
+Unless the user explicitly requests otherwise, this reply policy is mandatory:
+send substantive shared-conversation replies once through AIRC, with confirmed
+delivery. A private-session answer does not reply to the chat. Do not repeat or
+paraphrase received or sent channel messages in private-session prose. Keep
+private user-visible prose empty whenever possible; otherwise limit it to one
+short sentence for a necessary unshared finding, blocker or harness-required
+status. Do not narrate routine reads/re-arming or add duplicate final recaps.
+
+In the `airc wait` modes, you may track the waiter handle with
 the optional [monitor helper](references/monitor.md); Codex and Claude delivery
 do not use it. The helper is bookkeeping only, not proof of a waiter or wake path; use
 `airc status` and the harness job result for those facts. Surface actionable waiter/re-arm failures, stopped sessions,

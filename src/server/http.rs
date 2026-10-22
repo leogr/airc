@@ -57,7 +57,7 @@ impl Api {
     }
 }
 
-fn authenticate(api: &Api, headers: &HeaderMap) -> Option<String> {
+fn authenticate(config: &crate::config::Config, headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
@@ -73,7 +73,7 @@ fn authenticate(api: &Api, headers: &HeaderMap) -> Option<String> {
     decoded
         .as_deref()
         .and_then(|s| s.split_once(':'))
-        .and_then(|(name, token)| api.config().authenticate(name, token))
+        .and_then(|(name, token)| config.authenticate(name, token))
 }
 
 fn unauthorized() -> Response {
@@ -126,13 +126,18 @@ async fn accept(
     body: Body,
     stage: bool,
 ) -> Response {
-    let account = match authenticate(&api, &headers) {
+    // One snapshot authenticates and admits the request; its generation
+    // travels with the body, so a deletion while the body arrives cannot
+    // redirect it to a same-name successor.
+    let config = api.config();
+    let account = match authenticate(&config, &headers) {
         Some(account) => account,
         None => return unauthorized(),
     };
-    if !api.config().may_read(&account, &channel) {
+    if !config.may_read(&account, &channel) {
         return refused(StatusCode::NOT_FOUND, "not-found", "No such channel");
     }
+    let admitted = config.membership_generation.unwrap_or(0);
     let filename = headers
         .get("x-airc-filename")
         .and_then(|h| h.to_str().ok())
@@ -153,7 +158,7 @@ async fn accept(
             "Uploads are busy; try later",
         );
     };
-    let cap = api.config().artifacts.as_ref().unwrap().max_bytes;
+    let cap = config.artifacts.as_ref().unwrap().max_bytes;
     let bytes = match tokio::time::timeout(Duration::from_secs(30), to_bytes(body, cap)).await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(_)) => {
@@ -180,6 +185,7 @@ async fn accept(
             filename,
             data: bytes.to_vec(),
             stage,
+            admitted,
             reply,
         })
         .await
@@ -212,7 +218,7 @@ async fn accept(
 }
 
 async fn download(State(api): State<Api>, Path(id): Path<String>, headers: HeaderMap) -> Response {
-    let account = match authenticate(&api, &headers) {
+    let account = match authenticate(&api.config(), &headers) {
         Some(account) => account,
         None => return unauthorized(),
     };

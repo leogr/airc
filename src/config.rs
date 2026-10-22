@@ -9,6 +9,10 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+/// Bound on `removed_channels`, so deletion intent stays small and every
+/// reload or startup purge is bounded.
+pub const MAX_REMOVED_CHANNELS: usize = 1024;
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -30,6 +34,11 @@ pub struct Config {
     pub allow_insecure: bool,
     #[serde(default)]
     pub allow_private_messages: bool,
+    /// Explicit deletion intent: canonical names of channels whose stored
+    /// state reload and startup purge. Only a listed name absent from
+    /// `channels` is deleted; omission alone never deletes anything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_channels: Vec<String>,
     pub tls: Option<Tls>,
     #[serde(default)]
     pub limits: Limits,
@@ -285,6 +294,21 @@ impl Config {
             !channels.is_empty() && channels.len() <= 128,
             "configure 1 to 128 channels"
         );
+        ensure!(
+            self.removed_channels.len() <= MAX_REMOVED_CHANNELS,
+            "removed_channels lists at most {MAX_REMOVED_CHANNELS} channels"
+        );
+        let mut removed = BTreeSet::new();
+        for name in &self.removed_channels {
+            ensure!(
+                valid_channel(name) && *name == fold(name) && removed.insert(name.as_str()),
+                "removed_channels must list unique canonical channel names"
+            );
+            ensure!(
+                !channels.contains(name),
+                "{name} cannot be both configured and removed"
+            );
+        }
         if let Some(a) = &self.artifacts {
             match (&a.listen, &a.listen_unix) {
                 (Some(listen), None) => ensure!(

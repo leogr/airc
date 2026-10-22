@@ -55,8 +55,12 @@ Caller EOF, readiness, timeout and shutdown release the registration.
 `status` also reports the delivery state described below:
 `delivery: unused`, or `delivery: cursor=N pending=ID since=UTC events=A..B|none
 last=ID accepted|dropped=UTC|none`, then `delivery consumer: none` or
-`delivery consumer: wait|subscribe pid=PID since=UTC last_request=UTC`. A
-consumer is never released on a timer.
+`delivery consumer: wait|subscribe pid=PID since=UTC last_request=UTC SETTINGS`,
+where SETTINGS is `wake=MODE max-bytes=N wrap=N|off|unknown min-interval=S`
+(`settings=unknown` while an older client has registered but not yet asked
+for a batch). A consumer is never released on a timer. An agent that lost its
+context recovers the live consumer's identity and settings with `status`; it
+does not re-register or replace the consumer.
 
 The optional [monitor helper](../skills/airc/scripts/airc-monitor.py) keeps one
 private harness job handle for the `wait` recipes; its record is bookkeeping,
@@ -286,20 +290,42 @@ policy only advance it silently.
 A batch is one header line followed by ordinary read records:
 
 ```text
-[airc delivery id=UUID session=trial account=ACCOUNT nick=NICK wake=mentions events=2 context=5 bytes=812 more=no gap=no retry=no]
+[airc id=UUID session=trial events=2 context=5]
+! delivery settings: account=ACCOUNT nick=NICK wake=mentions max-bytes=8192 wrap=off min-interval=0
 @14 #work Alice(alice): @agent-a please check the parser.
 ```
 
-The client writes the header; a body line cannot forge it because continuation
-lines start with `| `. `id` is a random UUID per batch. `events` counts included
-records, and `context` counts unaddressed messages it left out (still unread
-for `read`). `bytes` is the size of the records. `more=yes` means the next batch
-follows without debounce, and `gap=yes` that relevant undelivered events above the
-pending or accepted batch were evicted (reported once). `retry=yes` marks an explicit redelivery. `mentions` includes only
-addressed messages and critical local notices; `messages` and `all` follow
-their wake policies. `--max-bytes` (default 8192, 1024–1048576) bounds the whole
-batch, header included, using complete records. A single larger record is
-delivered alone as a UTF-8-safe prefix that ends with
+The header grammar is
+`[airc id=UUID session=NAME[ events=N][ context=N][ more][ gap][ retry]]`. The
+client writes it; a body line cannot forge it because continuation lines start
+with `| `. `id`, a random UUID per batch, and `session` always come first.
+`events` counts included records and is omitted only when it is 1, so a
+gap-only batch says `events=0`. `context` counts unaddressed messages left out
+(still unread for `read`) and is omitted when 0. The bare flags are present
+only when set: `more` means the next batch follows without debounce, `gap` that
+relevant undelivered events above the pending or accepted batch were evicted
+(reported once), and `retry` marks an explicit redelivery. `mentions` includes
+only addressed messages and critical local notices; `messages` and `all`
+follow their wake policies.
+
+The `! delivery settings:` local notice states the account, nick and consumer
+settings the batch was assembled under. It follows the header in the first
+batch after each consumer registration and in every gap batch; an empty scan,
+an idle timeout or a batch reverted undelivered leaves it due. A retry and
+`deliveries --show` always include it, from the batch's own saved settings,
+never the current consumer's. `wrap` is the original consumer's transport
+setting; a retrying consumer applies its own. The worker persists these
+settings with every batch and reserves the notice's bytes even when the first
+rendering omits it, so the first delivery, a retry and an inspection all fit
+the original `--max-bytes`.
+
+Batches saved by an earlier release keep their full-field header, under
+either the `[airc delivery …]` or the `[airc id=…]` marker, and render
+unchanged with `retry=yes|no` and no notice; nothing relabels them.
+Receivers should accept both forms and default omitted fields. `--max-bytes`
+(default 8192, 1024–1048576) bounds the whole batch, header and notice
+included, using complete records. A single larger record is delivered alone as
+a UTF-8-safe prefix that ends with
 `! record truncated: N of M bytes not delivered; airc show SESSION @R prints all of it`.
 
 `wait --deliver` prints one batch, flushes stdout, then accepts it; a caller
@@ -314,8 +340,7 @@ diagnostic that includes the adapter's captured stderr. Nothing is retried.
 `-- -` writes batches to stdout and accepts each after flushing.
 `--wrap N` (64–65536 bytes) first splits each line after the header that is
 longer than N bytes at UTF-8 boundaries. Every continuation starts with `| `,
-so a split never begins a line that reads as a record; `bytes` still counts the
-unwrapped records. The bundled [Claude Code plugin](../integrations/claude-plugin)
+so a split never begins a line that reads as a record. The bundled [Claude Code plugin](../integrations/claude-plugin)
 runs `-- -` as a session monitor with `--max-bytes 2560 --wrap 480`. Claude Code
 starts plugin monitors only in interactive sessions; a non-interactive
 `claude -p` session gets no delivery and uses a `wait` recipe instead.
@@ -325,10 +350,13 @@ agent processed it.
 
 Only one consumer can be registered per session: a second `wait --deliver` or
 `subscribe` is refused, and registration lasts as long as the consumer's
-connection to the worker. An unaccepted batch stays **pending**, and no restart
+connection to the worker. A consumer declares its settings when it registers,
+and the worker refuses a delivery request on that connection with other
+settings. A registration from an older client carries none; its first request
+fixes wake, byte limit and interval, and its wrap stays `unknown`. An unaccepted batch stays **pending**, and no restart
 replays it: a new consumer is refused with the pending ID. After inspecting it
 with `deliveries --show ID`, either rerun the consumer with
-`--retry-pending ID` (one redelivery, `retry=yes`), record
+`--retry-pending ID` (one redelivery flagged `retry`), record
 `--mark-accepted ID`, or `--drop ID`; dropped events stay readable with `read`.
 These recovery commands are refused while a consumer is registered. Sinks do
 not deduplicate, so a retry after an uncertain hand-off can deliver a batch

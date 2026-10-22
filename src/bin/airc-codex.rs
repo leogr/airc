@@ -21,7 +21,8 @@ use std::{
 /// Whole stdin payload, header included. Well below Linux `MAX_ARG_STRLEN`
 /// because the batch travels as one `codex queue --message` argument.
 const MAX_BATCH_BYTES: usize = 64 * 1024;
-const HEADER_PREFIX: &str = "[airc delivery ";
+const HEADER_PREFIX: &str = "[airc id=";
+const LEGACY_HEADER_PREFIX: &str = "[airc delivery ";
 /// Below the subscriber's default sink timeout so a hung CLI is reported here.
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 /// After `codex queue` exits, wait this long for its pipes to reach EOF; a
@@ -241,7 +242,7 @@ fn read_batch(input: impl Read) -> Result<String, String> {
     if batch.contains('\0') {
         return Err("batch contains NUL".into());
     }
-    if !batch.starts_with(HEADER_PREFIX) {
+    if !batch.starts_with(HEADER_PREFIX) && !batch.starts_with(LEGACY_HEADER_PREFIX) {
         return Err("batch does not start with an airc delivery header".into());
     }
     Ok(batch)
@@ -313,8 +314,10 @@ mod tests {
 
     #[test]
     fn batch_bounds_and_shape() {
-        let batch = "[airc delivery id=x session=space]\n@1 #space a(b): hi\n";
-        assert_eq!(read_batch(batch.as_bytes()).unwrap(), batch);
+        for marker in ["[airc id=", "[airc delivery id="] {
+            let batch = format!("{marker}x session=space]\n@1 #space a(b): hi\n");
+            assert_eq!(read_batch(batch.as_bytes()).unwrap(), batch);
+        }
         let exact = format!(
             "{HEADER_PREFIX}{}",
             "x".repeat(MAX_BATCH_BYTES - HEADER_PREFIX.len())
@@ -324,26 +327,41 @@ mod tests {
         assert!(read_batch(over.as_bytes()).unwrap_err().contains("exceeds"));
         assert!(read_batch(&b""[..]).is_err());
         assert!(read_batch(&b"@1 #space a(b): no header"[..]).is_err());
+        assert!(read_batch(&b"[airc session=space]\n| [airc id=x]"[..]).is_err());
+        assert!(read_batch(&b"[airc \0"[..]).unwrap_err().contains("NUL"));
         assert!(
-            read_batch(&b"[airc delivery \0"[..])
-                .unwrap_err()
-                .contains("NUL")
-        );
-        assert!(
-            read_batch(&b"[airc delivery \xff"[..])
+            read_batch(&b"[airc \xff"[..])
                 .unwrap_err()
                 .contains("UTF-8")
         );
     }
 
     #[test]
+    fn compact_headers_with_bare_flags_and_zero_counters_keep_the_exact_id_check() {
+        for header in [
+            "[airc id=6f1c session=space]",
+            "[airc id=6f1c session=space events=0 gap]",
+            "[airc id=6f1c session=space events=3 context=2 more gap retry]",
+        ] {
+            let batch = format!(
+                "{header}\n! delivery settings: account=a nick=a wake=mentions max-bytes=8192 wrap=off min-interval=0\n"
+            );
+            assert_eq!(read_batch(batch.as_bytes()).unwrap(), batch);
+            assert!(check_delivery_id(&batch, Some("6f1c")).is_ok());
+            assert!(check_delivery_id(&batch, Some("6f1")).is_err());
+        }
+    }
+
+    #[test]
     fn header_id_must_match_the_announced_delivery() {
-        let batch = "[airc delivery id=6f1c session=space]\n@1 #space a(b): id=6f1c\n";
-        assert!(check_delivery_id(batch, None).is_ok());
-        assert!(check_delivery_id(batch, Some("6f1c")).is_ok());
-        assert!(check_delivery_id(batch, Some("6f1d")).is_err());
-        let no_id = "[airc delivery session=space]\n@1 #space a(b): id=6f1c\n";
-        assert!(check_delivery_id(no_id, Some("6f1c")).is_err());
+        for marker in ["[airc ", "[airc delivery "] {
+            let batch = format!("{marker}id=6f1c session=space]\n@1 #space a(b): id=6f1c\n");
+            assert!(check_delivery_id(&batch, None).is_ok());
+            assert!(check_delivery_id(&batch, Some("6f1c")).is_ok());
+            assert!(check_delivery_id(&batch, Some("6f1d")).is_err());
+            let no_id = format!("{marker}session=space]\n| [airc id=6f1c session=space]\n");
+            assert!(check_delivery_id(&no_id, Some("6f1c")).is_err());
+        }
     }
 
     #[test]

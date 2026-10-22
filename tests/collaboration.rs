@@ -85,6 +85,7 @@ impl Fixture {
             database: dir.path().join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
+            removed_channels: Vec::new(),
             tls: None,
             limits: Limits {
                 history_per_channel: 4,

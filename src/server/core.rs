@@ -98,17 +98,34 @@ struct Channel {
     topic: String,
     bans: BTreeMap<String, Ban>,
     members: BTreeMap<u64, Role>,
+    /// Membership generation that made this channel live. An upload admitted
+    /// under an older generation never lands in a same-name channel created
+    /// after a deletion.
+    since: u64,
 }
 
 impl Channel {
-    fn load(config: &crate::config::Channel, store: &Store) -> Result<Self> {
+    fn load(config: &crate::config::Channel, store: &Store, since: u64) -> Result<Self> {
         let key = fold(&config.name);
-        let (moderated, topic) = store.channel(&key)?;
+        Self::new(
+            config,
+            store.channel(&key)?,
+            store.bans(&key, ban::MAX_BANS)?,
+            since,
+        )
+    }
+
+    /// Validate one channel's stored state before it becomes live.
+    fn new(
+        config: &crate::config::Channel,
+        (moderated, topic): (bool, String),
+        bans: Vec<Ban>,
+        since: u64,
+    ) -> Result<Self> {
         ensure!(
             topic.len() <= 200 && !topic.contains(['\r', '\n', '\0']),
             "invalid stored topic"
         );
-        let bans = store.bans(&key, ban::MAX_BANS)?;
         for entry in &bans {
             ensure!(
                 ban::normalize(&entry.mask).as_deref() == Some(entry.mask.as_str()),
@@ -124,6 +141,7 @@ impl Channel {
                 .map(|entry| (entry.mask.clone(), entry))
                 .collect(),
             members: BTreeMap::new(),
+            since,
         })
     }
 }
@@ -150,7 +168,12 @@ pub(super) struct State {
 pub(super) fn reloadable_baseline(config: &Config) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(config)?;
     if let Some(fields) = value.as_object_mut() {
-        for reloadable in ["accounts", "channels", "membership_generation"] {
+        for reloadable in [
+            "accounts",
+            "channels",
+            "removed_channels",
+            "membership_generation",
+        ] {
             fields.remove(reloadable);
         }
     }
@@ -160,8 +183,9 @@ pub(super) fn reloadable_baseline(config: &Config) -> Result<serde_json::Value> 
 impl State {
     pub fn new(config: Arc<Config>, store: Store) -> Result<Self> {
         let mut channels = BTreeMap::new();
+        let since = config.membership_generation.unwrap_or(0);
         for c in &config.channels {
-            channels.insert(fold(&c.name), Channel::load(c, &store)?);
+            channels.insert(fold(&c.name), Channel::load(c, &store, since)?);
         }
         Ok(Self {
             shared: Arc::new(std::sync::RwLock::new(config.clone())),
@@ -237,20 +261,24 @@ impl State {
         if reloadable_baseline(&new).ok().as_ref() != Some(baseline) {
             return control_failure(
                 "RESTART_REQUIRED",
-                "only accounts, channel additions/members/operators and membership_generation reload",
+                "only accounts, channel additions/deletions/members/operators and membership_generation reload",
             );
         }
         // Compare with the currently applied catalog, not the startup baseline:
-        // A -> A+B -> A+C must refuse removing B. Exact spelling is stable even
-        // when the generic config uses mixed-case names.
+        // A -> A+B -> A+C must refuse dropping B unless removed_channels lists
+        // it. Exact spelling is stable even when the generic config uses
+        // mixed-case names, so a rename is never a deletion.
+        let deleted = |name: &str| new.removed_channels.iter().any(|r| *r == fold(name));
         if self.config.channels.iter().any(|old| {
-            !new.channels
-                .iter()
-                .any(|candidate| candidate.name == old.name)
+            !deleted(&old.name)
+                && !new
+                    .channels
+                    .iter()
+                    .any(|candidate| candidate.name == old.name)
         }) {
             return control_failure(
                 "RESTART_REQUIRED",
-                "reload cannot remove or rename an applied channel",
+                "reload cannot rename an applied channel or remove one not listed in removed_channels",
             );
         }
         let applied = self.config.membership_generation.unwrap_or(0);
@@ -268,7 +296,7 @@ impl State {
                     &format!("generation {generation} is applied with different content"),
                 );
             }
-            return self.reloaded(Vec::new(), Vec::new(), 0);
+            return self.reloaded(Vec::new(), Vec::new(), 0, Vec::new());
         }
         let additions = new
             .channels
@@ -276,19 +304,25 @@ impl State {
             .filter(|channel| !self.channels.contains_key(&fold(&channel.name)))
             .cloned()
             .collect::<Vec<_>>();
-        let prepared = (|| -> Result<BTreeMap<String, Channel>> {
-            self.store.add_channels(&additions)?;
-            additions
-                .iter()
-                .map(|channel| Ok((fold(&channel.name), Channel::load(channel, &self.store)?)))
-                .collect()
-        })();
+        // Purges and additions, with every stored-state load an addition
+        // needs, commit together or not at all.
+        let prepared = self.store.change_channels(
+            &new.removed_channels,
+            &additions,
+            ban::MAX_BANS,
+            |channel, row, bans| {
+                Ok((
+                    fold(&channel.name),
+                    Channel::new(channel, row, bans, generation)?,
+                ))
+            },
+        );
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 return control_failure(
                     "STORAGE_ERROR",
-                    &format!("channel additions were not applied: {error:#}"),
+                    &format!("channel changes were not applied: {error:#}"),
                 );
             }
         };
@@ -296,10 +330,18 @@ impl State {
         let mut next = (*old).clone();
         next.accounts = new.accounts;
         next.channels = new.channels;
+        next.removed_channels = new.removed_channels;
         next.membership_generation = new.membership_generation;
         let next = Arc::new(next);
-        // All fallible store work is finished. Actor state and shared ACL/proof
-        // become visible together before the next queued event is processed.
+        // All fallible store work is committed. Actor state and shared
+        // ACL/proof become visible together before the next queued event is
+        // processed, so queued JOIN, send, history, topic, staging, upload and
+        // download requests for a deleted channel are refused.
+        let removed = next
+            .removed_channels
+            .iter()
+            .filter_map(|key| self.channels.remove(key))
+            .collect::<Vec<_>>();
         self.channels.extend(prepared);
         self.config = next.clone();
         *self
@@ -307,6 +349,21 @@ impl State {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
         self.digest = Some(digest);
+        // Every joined session of a deleted channel learns of it by KICK.
+        let mut deletions = Vec::with_capacity(removed.len());
+        for channel in removed {
+            let mut remaining = channel.members.keys().copied().collect::<Vec<_>>();
+            while let Some(&id) = remaining.first() {
+                let mut kick = Message::new(
+                    "KICK",
+                    [&channel.name, &self.clients[&id].nick, "Channel deleted"],
+                );
+                kick.prefix = Some(self.config.server_name.clone());
+                self.broadcast(remaining.clone(), kick);
+                remaining.remove(0);
+            }
+            deletions.push(channel.name);
+        }
         // A removed account or a changed token hash ends every session of it.
         let token = |config: &Config, name: &str| {
             config
@@ -393,17 +450,19 @@ impl State {
                 }
             }
         }
-        self.reloaded(disconnected.into_iter().collect(), kicked, kicks)
+        self.reloaded(disconnected.into_iter().collect(), kicked, kicks, deletions)
     }
 
     /// Applied state is always exact. `disconnected` is bounded by the
     /// connection limit; `kicked` details stop at `MAX_KICK_DETAILS`, with the
     /// exact `kicked_count` and `kicked_truncated` reporting the rest.
+    /// `deleted` names the applied channels this reload purged (at most 128).
     fn reloaded(
         &self,
         disconnected: Vec<String>,
         kicked: Vec<serde_json::Value>,
         kicks: usize,
+        deleted: Vec<String>,
     ) -> serde_json::Value {
         serde_json::json!({"ok": true, "result": {
             "applied_generation": self.config.membership_generation,
@@ -413,6 +472,7 @@ impl State {
             "kicked_truncated": kicks > kicked.len(),
             "kicked": kicked,
             "kicked_count": kicks,
+            "deleted": deleted,
         }})
     }
 
@@ -530,12 +590,13 @@ impl State {
                 filename,
                 data,
                 stage,
+                admitted,
                 reply,
             } => {
                 let result = if stage {
-                    self.stage(&account, &channel, &filename, &data)
+                    self.stage(&account, &channel, &filename, &data, admitted)
                 } else {
-                    self.artifact(&account, &channel, &filename, &data)
+                    self.artifact(&account, &channel, &filename, &data, admitted)
                 };
                 let _ = reply.send(result);
             }
@@ -2235,6 +2296,7 @@ impl State {
         channel: &str,
         filename: &str,
         data: &[u8],
+        admitted: u64,
     ) -> Result<serde_json::Value> {
         let config = self
             .config
@@ -2242,10 +2304,7 @@ impl State {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("artifacts disabled"))?;
         let channel = fold(channel);
-        ensure!(
-            self.config.may_read(account, &channel),
-            "channel unavailable"
-        );
+        self.admit_upload(account, &channel, admitted)?;
         let c = &self.channels[&channel];
         let sender = c
             .members
@@ -2301,6 +2360,33 @@ impl State {
         )
     }
 
+    /// An upload admitted under membership generation `admitted` may land only
+    /// in the live channel that already existed then, never in a same-name
+    /// channel created after a deletion. Both refusals match HTTP admission's
+    /// definite `not-found`, so no client is told to join first.
+    fn admit_upload(&self, account: &str, channel: &str, admitted: u64) -> Result<()> {
+        let refusal = |reason| {
+            anyhow::Error::new(UploadRefusal {
+                status: 404,
+                code: "not-found",
+                reason,
+            })
+        };
+        if !self.config.may_read(account, channel) {
+            return Err(refusal("No such channel"));
+        }
+        if !self
+            .channels
+            .get(channel)
+            .is_some_and(|c| c.since <= admitted)
+        {
+            return Err(refusal(
+                "Channel was deleted or replaced after this upload began",
+            ));
+        }
+        Ok(())
+    }
+
     /// Store one artifact unannounced for a later message to publish. It needs
     /// the same access as an upload, never appears in history and cannot be
     /// downloaded until published.
@@ -2310,6 +2396,7 @@ impl State {
         channel: &str,
         filename: &str,
         data: &[u8],
+        admitted: u64,
     ) -> Result<serde_json::Value> {
         let config = self
             .config
@@ -2317,10 +2404,7 @@ impl State {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("artifacts disabled"))?;
         let channel = fold(channel);
-        ensure!(
-            self.config.may_read(account, &channel),
-            "channel unavailable"
-        );
+        self.admit_upload(account, &channel, admitted)?;
         ensure!(
             self.channels[&channel].members.keys().any(|id| {
                 self.clients[id].account.as_deref() == Some(account)
@@ -2607,6 +2691,7 @@ mod tests {
             database: directory.path().join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
+            removed_channels: Vec::new(),
             tls: None,
             limits: Limits::default(),
             accounts: vec![Account {
@@ -2666,6 +2751,7 @@ mod tests {
             database: directory.path().join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
+            removed_channels: Vec::new(),
             tls: None,
             limits: Limits::default(),
             accounts: vec![Account {
@@ -2777,6 +2863,7 @@ mod tests {
             database: directory.path().join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
+            removed_channels: Vec::new(),
             tls: None,
             limits: Limits::default(),
             accounts: vec![account("alice"), account("bob")],
@@ -2843,6 +2930,7 @@ mod tests {
             database: directory.path().join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
+            removed_channels: Vec::new(),
             tls: None,
             limits: Limits::default(),
             accounts: vec![Account {
@@ -2908,5 +2996,266 @@ mod tests {
         assert!(state.channels.contains_key("#d"));
         let same = state.reload(added, "three".into());
         assert_eq!(same["result"]["applied_generation"], 3, "{same}");
+    }
+
+    fn drain(output: &mut mpsc::Receiver<String>) -> String {
+        let mut sent = String::new();
+        while let Ok(lines) = output.try_recv() {
+            sent.push_str(&lines);
+        }
+        sent
+    }
+
+    /// #space and #gone, both joined by alice (1) and bob (2), each with
+    /// history, a topic, a ban, a staged and a published artifact.
+    fn deletion_state() -> (
+        State,
+        Vec<mpsc::Receiver<String>>,
+        Config,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let account = |name: &str| Account {
+            name: name.into(),
+            token_sha256: token_hash("test"),
+        };
+        let channel = |name: &str| ChannelConfig {
+            name: name.into(),
+            members: vec!["alice".into(), "bob".into()],
+            operators: vec![],
+            moderated: false,
+        };
+        let config = Config {
+            server_name: "test.airc".into(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            control_unix: None,
+            membership_generation: Some(1),
+            database: directory.path().join("state.db"),
+            allow_insecure: false,
+            allow_private_messages: false,
+            removed_channels: Vec::new(),
+            tls: None,
+            limits: Limits::default(),
+            accounts: vec![account("alice"), account("bob")],
+            channels: vec![channel("#space"), channel("#gone")],
+            artifacts: Some(crate::config::Artifacts {
+                listen: Some("127.0.0.1:0".parse().unwrap()),
+                listen_unix: None,
+                public_url: "http://127.0.0.1/".into(),
+                max_bytes: 1024,
+                per_channel: 4,
+            }),
+        };
+        let store = Store::open(&config).unwrap();
+        let mut state = State::new(Arc::new(config.clone()), store).unwrap();
+        state.set_source("one".into(), reloadable_baseline(&config).unwrap());
+        let mut outputs = Vec::new();
+        for (id, name) in [(1u64, "alice"), (2, "bob")] {
+            let (out, output) = mpsc::channel(256);
+            let (kill, _) = watch::channel(false);
+            state.handle(Event::Connect {
+                id,
+                out,
+                queued: Arc::default(),
+                kill,
+            });
+            for line in [
+                "CAP REQ :batch draft/multiline draft/chathistory message-tags".to_owned(),
+                format!("PASS {name}:test"),
+                format!("NICK {name}"),
+                format!("USER {name} 0 * :x"),
+                "CAP END".into(),
+                "JOIN #space".into(),
+                "JOIN #gone".into(),
+            ] {
+                state.handle(Event::Message(id, Message::parse(&line).unwrap()));
+            }
+            outputs.push(output);
+        }
+        for channel in ["#space", "#gone"] {
+            let line = format!("PRIVMSG {channel} :kept in {channel}");
+            state.handle(Event::Message(1, Message::parse(&line).unwrap()));
+            state.store.set_channel(channel, false, "a topic").unwrap();
+            let ban = Ban {
+                mask: "evil!*@*".into(),
+                set_by: "alice".into(),
+                set_at: 1,
+            };
+            state.store.add_ban(channel, &ban).unwrap();
+            state
+                .stage("alice", channel, "s.png", b"staged", 1)
+                .unwrap();
+            state
+                .artifact("alice", channel, "a.png", b"published", 1)
+                .unwrap();
+        }
+        (state, outputs, config, directory)
+    }
+
+    #[test]
+    fn reload_deletes_only_an_explicitly_listed_channel_in_one_transaction() {
+        let (mut state, mut outputs, config, _directory) = deletion_state();
+        let seeded = [2, 1, 1, 1, 1];
+        assert_eq!(state.store.rows_for_test("#gone"), seeded);
+        let space = state.store.rows_for_test("#space");
+        let unchanged = |state: &State| {
+            assert_eq!(state.store.rows_for_test("#gone"), seeded);
+            assert_eq!(state.config.membership_generation, Some(1));
+            assert_eq!(state.digest.as_deref(), Some("one"));
+            assert_eq!(state.channels["#gone"].members.len(), 2);
+            assert!(
+                state
+                    .shared_config()
+                    .read()
+                    .unwrap()
+                    .may_read("bob", "#gone")
+            );
+        };
+        // Omission alone is no deletion intent.
+        let mut omitted = config.clone();
+        omitted.channels.retain(|c| c.name != "#gone");
+        omitted.membership_generation = Some(2);
+        let reply = state.reload(omitted.clone(), "two".into());
+        assert_eq!(reply["code"], "RESTART_REQUIRED", "{reply}");
+        unchanged(&state);
+        // Stale or conflicting generations purge nothing either.
+        let mut deleted = omitted.clone();
+        deleted.removed_channels = vec!["#gone".into()];
+        for (generation, digest, code) in [
+            (0, "zero", "GENERATION_STALE"),
+            (1, "other", "GENERATION_CONFLICT"),
+        ] {
+            let mut candidate = deleted.clone();
+            candidate.membership_generation = Some(generation);
+            assert_eq!(state.reload(candidate, digest.into())["code"], code);
+            unchanged(&state);
+        }
+        // A failed addition in the same reload rolls the purge back too.
+        let mut mixed = deleted.clone();
+        mixed.channels.push(ChannelConfig {
+            name: "#new".into(),
+            members: vec!["alice".into()],
+            operators: vec![],
+            moderated: false,
+        });
+        state
+            .store
+            .execute_for_test(
+                "INSERT INTO channels(name, moderated, topic) VALUES ('#new', 0, 'bad' || char(10) || 'topic')",
+            )
+            .unwrap();
+        let reply = state.reload(mixed.clone(), "two".into());
+        assert_eq!(reply["code"], "STORAGE_ERROR", "{reply}");
+        unchanged(&state);
+        assert!(!state.channels.contains_key("#new"));
+        // Before the deletion applies, alice opens a multiline batch for #gone.
+        for line in [
+            "BATCH +late draft/multiline #gone",
+            "@batch=late PRIVMSG #gone :queued before deletion",
+        ] {
+            state.handle(Event::Message(1, Message::parse(line).unwrap()));
+        }
+        for output in &mut outputs {
+            drain(output);
+        }
+        // Repaired storage: the purge and the addition commit together.
+        state
+            .store
+            .execute_for_test("UPDATE channels SET topic='' WHERE name='#new'")
+            .unwrap();
+        let reply = state.reload(mixed.clone(), "two".into());
+        let result = &reply["result"];
+        assert_eq!(result["applied_generation"], 2, "{reply}");
+        assert_eq!(result["deleted"], serde_json::json!(["#gone"]));
+        assert_eq!(result["kicked_count"], 0);
+        assert_eq!(state.store.rows_for_test("#gone"), [0; 5]);
+        assert_eq!(state.store.rows_for_test("#space"), space);
+        assert!(!state.channels.contains_key("#gone") && state.channels.contains_key("#new"));
+        assert_eq!(state.channels["#space"].members.len(), 2);
+        assert!(
+            !state
+                .shared_config()
+                .read()
+                .unwrap()
+                .may_read("bob", "#gone")
+        );
+        for (output, nick) in outputs.iter_mut().zip(["alice", "bob"]) {
+            let sent = drain(output);
+            assert!(
+                sent.contains(&format!(":test.airc KICK #gone {nick} :Channel deleted")),
+                "{sent}"
+            );
+        }
+        // Requests after the purge are refused and cannot reintroduce rows.
+        for line in [
+            "JOIN #gone",
+            "PRIVMSG #gone :late",
+            "TOPIC #gone :late",
+            "CHATHISTORY LATEST #gone * 10",
+        ] {
+            state.handle(Event::Message(2, Message::parse(line).unwrap()));
+        }
+        let sent = drain(&mut outputs[1]);
+        assert!(
+            sent.contains("403 bob #gone :No accessible channel"),
+            "{sent}"
+        );
+        assert!(sent.contains("442 bob #gone"), "{sent}");
+        assert!(
+            sent.contains("FAIL CHATHISTORY INVALID_TARGET #gone"),
+            "{sent}"
+        );
+        assert!(
+            !sent.contains("queued before deletion") && !sent.contains("PRIVMSG"),
+            "{sent}"
+        );
+        assert!(state.stage("bob", "#gone", "s.png", b"x", 2).is_err());
+        assert!(state.artifact("bob", "#gone", "a.png", b"x", 2).is_err());
+        assert_eq!(state.store.rows_for_test("#gone"), [0; 5]);
+        // Repeating the intent for an absent channel is harmless.
+        let mut again = mixed.clone();
+        again.membership_generation = Some(3);
+        let reply = state.reload(again.clone(), "three".into());
+        assert_eq!(reply["result"]["deleted"], serde_json::json!([]), "{reply}");
+        // A same-name channel created later starts empty.
+        let mut recreated = again;
+        recreated.removed_channels.clear();
+        recreated.channels.push(config.channels[1].clone());
+        recreated.membership_generation = Some(4);
+        assert_eq!(state.reload(recreated, "four".into())["ok"], true);
+        let gone = &state.channels["#gone"];
+        assert!(gone.topic.is_empty() && gone.bans.is_empty() && gone.members.is_empty());
+        assert!(state.store.history("#gone").unwrap().is_empty());
+        state.handle(Event::Message(2, Message::parse("JOIN #gone").unwrap()));
+        assert!(drain(&mut outputs[1]).contains("331 bob #gone"));
+        // alice's batch, opened before the deletion, cannot post into the
+        // successor: her rejoin, like any other command, aborts it first and
+        // its remaining lines are discarded.
+        for line in [
+            "JOIN #gone",
+            "@batch=late PRIVMSG #gone :after recreation",
+            "BATCH -late",
+        ] {
+            state.handle(Event::Message(1, Message::parse(line).unwrap()));
+        }
+        let sent = drain(&mut outputs[0]);
+        assert!(
+            sent.contains("FAIL BATCH MULTILINE_INVALID :Batch interrupted by another command"),
+            "{sent}"
+        );
+        assert!(state.clients[&1].batch.is_none());
+        assert!(state.store.history("#gone").unwrap().is_empty());
+        let relayed = drain(&mut outputs[1]);
+        assert!(!relayed.contains("PRIVMSG"), "{relayed}");
+        // Uploads admitted before the deletion (generation 1) whose bodies
+        // finish only now, after recreation and rejoin, land nowhere; the
+        // unrelated #space keeps accepting them, and a fresh admission works.
+        assert!(state.stage("bob", "#gone", "s.png", b"late", 1).is_err());
+        assert!(state.artifact("bob", "#gone", "a.png", b"late", 1).is_err());
+        assert_eq!(state.store.rows_for_test("#gone"), [0, 0, 0, 0, 1]);
+        assert!(state.stage("bob", "#space", "s.png", b"late", 1).is_ok());
+        assert!(state.artifact("bob", "#space", "a.png", b"late", 1).is_ok());
+        assert!(state.stage("bob", "#gone", "s.png", b"fresh", 4).is_ok());
     }
 }

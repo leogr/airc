@@ -96,6 +96,10 @@ impl Store {
         tx.execute_batch("PRAGMA user_version=4;")?;
         // Expired staged rows never become visible; drop them with their bytes.
         tx.execute("DELETE FROM staged WHERE expires < ?1", [now()])?;
+        // Startup honors the same explicit deletion intent as reload, so a
+        // crash before or after a reload commit converges; repeating it is
+        // harmless. Configured channels are never listed (validated).
+        purge(&tx, &config.removed_channels)?;
         for c in &config.channels {
             tx.execute(
                 "INSERT OR IGNORE INTO channels(name, moderated) VALUES (?1, ?2)",
@@ -111,26 +115,38 @@ impl Store {
     }
 
     pub fn channel(&self, name: &str) -> Result<(bool, String)> {
-        Ok(self.db.query_row(
-            "SELECT moderated, topic FROM channels WHERE name=?1",
-            [name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?)
+        channel_row(&self.db, name)
     }
 
-    /// Prepare additions before live catalog publication. Existing rows retain
-    /// their topics, moderation, bans and history. A later staging failure may
-    /// leave inert rows, but rows alone never grant access to a channel.
-    pub fn add_channels(&mut self, channels: &[crate::config::Channel]) -> Result<()> {
+    /// Prepare one reload's catalog change in a single transaction: purge the
+    /// explicitly removed channels, add the new ones (existing rows keep their
+    /// topic, moderation, bans and history) and load each addition's stored
+    /// state through `load`. Any error, `load`'s included, commits nothing, so
+    /// a purge never outlives a failed addition.
+    pub fn change_channels<T>(
+        &mut self,
+        removed: &[String],
+        added: &[crate::config::Channel],
+        ban_limit: usize,
+        mut load: impl FnMut(&crate::config::Channel, (bool, String), Vec<Ban>) -> Result<T>,
+    ) -> Result<Vec<T>> {
         let tx = self.db.transaction()?;
-        for channel in channels {
+        purge(&tx, removed)?;
+        let mut loaded = Vec::with_capacity(added.len());
+        for channel in added {
+            let key = crate::protocol::fold(&channel.name);
             tx.execute(
                 "INSERT OR IGNORE INTO channels(name, moderated) VALUES (?1, ?2)",
-                params![crate::protocol::fold(&channel.name), channel.moderated],
+                params![key, channel.moderated],
             )?;
+            loaded.push(load(
+                channel,
+                channel_row(&tx, &key)?,
+                bans(&tx, &key, ban_limit)?,
+            )?);
         }
         tx.commit()?;
-        Ok(())
+        Ok(loaded)
     }
 
     /// Fault injection for staging tests only.
@@ -138,6 +154,20 @@ impl Store {
     pub(crate) fn execute_for_test(&self, sql: &str) -> Result<()> {
         self.db.execute_batch(sql)?;
         Ok(())
+    }
+
+    /// Stored messages, artifacts, staged artifacts, bans and channel rows of
+    /// one folded channel, for deletion tests only.
+    #[cfg(test)]
+    pub(crate) fn rows_for_test(&self, channel: &str) -> [i64; 5] {
+        let count = |sql: &str| self.db.query_row(sql, [channel], |r| r.get(0)).unwrap();
+        [
+            count("SELECT COUNT(*) FROM messages WHERE channel=?1"),
+            count("SELECT COUNT(*) FROM artifacts WHERE channel=?1"),
+            count("SELECT COUNT(*) FROM staged WHERE channel=?1"),
+            count("SELECT COUNT(*) FROM bans WHERE channel=?1"),
+            count("SELECT COUNT(*) FROM channels WHERE name=?1"),
+        ]
     }
 
     pub fn set_channel(&self, name: &str, moderated: bool, topic: &str) -> Result<()> {
@@ -149,19 +179,7 @@ impl Store {
     }
 
     pub fn bans(&self, channel: &str, limit: usize) -> Result<Vec<Ban>> {
-        let mut statement = self.db.prepare(
-            "SELECT mask,set_by,set_at FROM bans WHERE channel=?1 ORDER BY mask LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![channel, (limit + 1) as i64], |r| {
-            Ok(Ban {
-                mask: r.get(0)?,
-                set_by: r.get(1)?,
-                set_at: r.get(2)?,
-            })
-        })?;
-        let bans = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(bans.len() <= limit, "stored channel ban list exceeds limit");
-        Ok(bans)
+        bans(&self.db, channel, limit)
     }
 
     pub fn add_ban(&self, channel: &str, ban: &Ban) -> Result<()> {
@@ -398,6 +416,44 @@ impl Store {
     }
 }
 
+fn channel_row(db: &Connection, name: &str) -> Result<(bool, String)> {
+    Ok(db.query_row(
+        "SELECT moderated, topic FROM channels WHERE name=?1",
+        [name],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
+fn bans(db: &Connection, channel: &str, limit: usize) -> Result<Vec<Ban>> {
+    let mut statement =
+        db.prepare("SELECT mask,set_by,set_at FROM bans WHERE channel=?1 ORDER BY mask LIMIT ?2")?;
+    let rows = statement.query_map(params![channel, (limit + 1) as i64], |r| {
+        Ok(Ban {
+            mask: r.get(0)?,
+            set_by: r.get(1)?,
+            set_at: r.get(2)?,
+        })
+    })?;
+    let bans = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(bans.len() <= limit, "stored channel ban list exceeds limit");
+    Ok(bans)
+}
+
+/// Delete every stored row of each named channel: messages, published and
+/// staged artifacts, bans, topic and moderation. Only explicit deletion
+/// intent reaches this; a channel merely absent from the configuration keeps
+/// its rows. This is logical deletion, not secure erasure.
+fn purge(db: &Connection, names: &[String]) -> Result<()> {
+    for name in names {
+        let key = crate::protocol::fold(name);
+        for table in ["messages", "artifacts", "staged", "bans"] {
+            db.execute(&format!("DELETE FROM {table} WHERE channel=?1"), [&key])?;
+        }
+        db.execute("DELETE FROM channels WHERE name=?1", [&key])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,7 +463,11 @@ mod tests {
     };
 
     fn open(dir: &std::path::Path) -> Store {
-        Store::open(&Config {
+        Store::open(&config(dir)).unwrap()
+    }
+
+    fn config(dir: &std::path::Path) -> Config {
+        Config {
             server_name: "test.airc".into(),
             listen: Some("127.0.0.1:0".parse().unwrap()),
             listen_unix: None,
@@ -416,6 +476,7 @@ mod tests {
             database: dir.join("state.db"),
             allow_insecure: false,
             allow_private_messages: false,
+            removed_channels: Vec::new(),
             tls: None,
             limits: Limits::default(),
             accounts: vec![crate::config::Account {
@@ -424,8 +485,7 @@ mod tests {
             }],
             channels: vec![],
             artifacts: None,
-        })
-        .unwrap()
+        }
     }
 
     fn id(n: usize) -> String {
@@ -521,6 +581,56 @@ mod tests {
                 .unwrap(),
             Ok(())
         );
+    }
+
+    #[test]
+    fn startup_purges_only_explicitly_removed_channels_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = |channels: &[&str], removed: &[&str]| Config {
+            channels: channels
+                .iter()
+                .map(|name| crate::config::Channel {
+                    name: (*name).into(),
+                    members: vec!["alice".into()],
+                    operators: vec![],
+                    moderated: false,
+                })
+                .collect(),
+            removed_channels: removed.iter().map(|name| (*name).into()).collect(),
+            ..config(dir.path())
+        };
+        let mut store = Store::open(&catalog(&["#a", "#b"], &[])).unwrap();
+        for (n, channel) in ["#a", "#b"].into_iter().enumerate() {
+            store.append(channel, &mut message("alice"), None).unwrap();
+            store.set_channel(channel, true, "kept topic").unwrap();
+            let ban = Ban {
+                mask: "evil!*@*".into(),
+                set_by: "alice".into(),
+                set_at: 1,
+            };
+            store.add_ban(channel, &ban).unwrap();
+            let staged = store.stage(&id(n), "alice", channel, "x.png", "sha", b"x", 1 << 20);
+            assert_eq!(staged.unwrap(), Ok(()));
+        }
+        let seeded = [1, 0, 1, 1, 1];
+        drop(store);
+        // Omitting #b is no deletion intent: its rows stay.
+        let store = Store::open(&catalog(&["#a"], &[])).unwrap();
+        assert_eq!(store.rows_for_test("#b"), seeded);
+        drop(store);
+        // Listed intent purges at startup; repeating it is harmless and
+        // leaves every other channel's rows.
+        for _ in 0..2 {
+            let store = Store::open(&catalog(&["#a"], &["#b"])).unwrap();
+            assert_eq!(store.rows_for_test("#b"), [0; 5]);
+            assert_eq!(store.rows_for_test("#a"), seeded);
+        }
+        // A later channel with the same name starts from fresh defaults.
+        let store = Store::open(&catalog(&["#a", "#b"], &[])).unwrap();
+        assert_eq!(store.channel("#b").unwrap(), (false, String::new()));
+        assert!(store.bans("#b", 10).unwrap().is_empty());
+        assert!(store.history("#b").unwrap().is_empty());
+        assert_eq!(store.channel("#a").unwrap(), (true, "kept topic".into()));
     }
 
     #[test]

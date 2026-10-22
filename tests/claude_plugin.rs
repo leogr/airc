@@ -27,7 +27,7 @@ subscribe)
   printf '%s\0' "$@" > "$FAKE_DIR/argv"
   case "$FAKE_MODE" in
   batch)
-    printf '[airc delivery id=1 session=%s]\n@1 #work bob(bob): @worker hi\n' "$2"
+    printf '[airc id=1 session=%s events=0 gap retry]\n! delivery settings: account=worker nick=worker wake=mentions max-bytes=2560 wrap=480 min-interval=15\n@1 #work bob(bob): @worker hi\n' "$2"
     echo "! session closed before replying; a batch may be pending"
     exit 1 ;;
   usage) echo "error: invalid value 'loud' for '--wake <WAKE>'" >&2; exit 2 ;;
@@ -162,8 +162,10 @@ fn waits_for_the_connection_then_prints_batches_and_one_stop_line() {
         ]
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
+    // The monitor forwards the compact header, its bare flags and the settings
+    // notice untouched.
     assert!(stdout.starts_with(
-        "[airc delivery id=1 session=space]\n@1 #work bob(bob): @worker hi\n! session closed"
+        "[airc id=1 session=space events=0 gap retry]\n! delivery settings: account=worker nick=worker wake=mentions max-bytes=2560 wrap=480 min-interval=15\n@1 #work bob(bob): @worker hi\n! session closed"
     ));
     assert_eq!(
         stop_lines(&stdout),
