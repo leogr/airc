@@ -32,6 +32,9 @@ where
 {
     let app = Router::new()
         .route("/v1/channels/{channel}/artifacts", post(upload))
+        // A separate route: a server without staging rejects it before any
+        // mutation, so a stage can never become an announced upload.
+        .route("/v1/channels/{channel}/staged", post(stage))
         .route("/v1/artifacts/{id}", get(download))
         .with_state(Api {
             config,
@@ -76,13 +79,25 @@ fn authenticate(api: &Api, headers: &HeaderMap) -> Option<String> {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            "Basic realm=\"AIRC artifacts\", charset=\"UTF-8\"",
-        )],
+        [
+            (
+                header::WWW_AUTHENTICATE.as_str(),
+                "Basic realm=\"AIRC artifacts\", charset=\"UTF-8\"",
+            ),
+            (REFUSAL, "unauthorized"),
+        ],
         "Authentication required",
     )
         .into_response()
+}
+
+/// Marks an upload answer given before the request reached the store, so
+/// nothing was stored. A status without it (a lost actor reply, a proxy
+/// failure) proves nothing about the outcome.
+const REFUSAL: &str = "x-airc-refusal";
+
+fn refused(status: StatusCode, code: &'static str, reason: &'static str) -> Response {
+    (status, [(REFUSAL, code)], reason).into_response()
 }
 
 async fn upload(
@@ -91,12 +106,32 @@ async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    accept(api, channel, headers, body, false).await
+}
+
+/// Store bytes unannounced for one later message to publish.
+async fn stage(
+    State(api): State<Api>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    accept(api, channel, headers, body, true).await
+}
+
+async fn accept(
+    api: Api,
+    channel: String,
+    headers: HeaderMap,
+    body: Body,
+    stage: bool,
+) -> Response {
     let account = match authenticate(&api, &headers) {
         Some(account) => account,
         None => return unauthorized(),
     };
     if !api.config().may_read(&account, &channel) {
-        return StatusCode::NOT_FOUND.into_response();
+        return refused(StatusCode::NOT_FOUND, "not-found", "No such channel");
     }
     let filename = headers
         .get("x-airc-filename")
@@ -109,16 +144,32 @@ async fn upload(
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
-        return (StatusCode::BAD_REQUEST, "Invalid filename").into_response();
+        return refused(StatusCode::BAD_REQUEST, "filename", "Invalid filename");
     }
     let Ok(_permit) = api.uploads.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "Uploads are busy; try later",
+        );
     };
     let cap = api.config().artifacts.as_ref().unwrap().max_bytes;
     let bytes = match tokio::time::timeout(Duration::from_secs(30), to_bytes(body, cap)).await {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+        Ok(Err(_)) => {
+            return refused(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too-large",
+                "Artifact too large",
+            );
+        }
+        Err(_) => {
+            return refused(
+                StatusCode::REQUEST_TIMEOUT,
+                "timeout",
+                "Upload body timed out",
+            );
+        }
     };
     let (reply, rx) = oneshot::channel();
     if api
@@ -128,20 +179,34 @@ async fn upload(
             channel,
             filename,
             data: bytes.to_vec(),
+            stage,
             reply,
         })
         .await
         .is_err()
     {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stopping",
+            "Server is stopping",
+        );
     }
+    // The actor stores nothing when it answers with an error.
     match rx.await {
         Ok(Ok(value)) => (StatusCode::CREATED, axum::Json(value)).into_response(),
-        Ok(Err(_)) => (
-            StatusCode::FORBIDDEN,
-            "Upload unavailable; join with speaking permission",
-        )
-            .into_response(),
+        Ok(Err(e)) => match e.downcast_ref::<super::core::UploadRefusal>() {
+            Some(refusal) => refused(
+                StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::FORBIDDEN),
+                refusal.code,
+                refusal.reason,
+            ),
+            None => refused(
+                StatusCode::FORBIDDEN,
+                "unavailable",
+                "Upload unavailable; join with speaking permission",
+            ),
+        },
+        // A lost reply: the outcome is unknown, so no refusal marker.
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }

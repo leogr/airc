@@ -1,5 +1,6 @@
 #[cfg(unix)]
 pub mod agent_session;
+pub mod attachments;
 pub mod client;
 pub mod config;
 pub mod multiline;
@@ -33,6 +34,7 @@ pub const FEATURES: &[&str] = &[
     "named-waiter-status",
     "named-delivery",
     "named-show",
+    "message-attachments",
 ];
 
 /// The `features` probe printed by both binaries.

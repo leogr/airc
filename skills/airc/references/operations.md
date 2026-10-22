@@ -146,9 +146,20 @@ creates PATH with mode 0600 and prints `{bytes,sha256,filename}`. Success stdout
 contains one bounded JSON object; errors use stderr/nonzero exit. Server upload
 caps default to 4 MiB and may differ. A failed reply, including 503, can follow
 commit; inspect reserved announcement metadata/history before any repeat.
+With `--stage` (feature `message-attachments`, a separate route that never
+announces) the bytes stay unannounced and undownloadable for 10 minutes and
+stdout is `{id,sha256,bytes,staged:true}`; only a server-marked refusal is
+`not staged:`, anything else is `staging outcome unconfirmed`. A
+`send` with `attach: [{id, at}]` publishes them with its text as one message,
+each at its `[Image #k]` byte offset. `not staged:` and `attachments:` refusals
+stored nothing; never resend after `consumed`, inspect history instead.
 
 Reserved server tags are `airc-artifact`, `airc-artifact-name`,
 `airc-artifact-bytes`, `airc-artifact-sha256`. They survive retained history and
 appear as bounded fields in named read headers. Client-only `+` lookalikes and
 body URLs are not this metadata. Downloaded contents remain untrusted; a filename
 or trusted artifact ID alone does not prove media type. No automatic fetch runs.
+A message with staged attachments instead carries `airc-artifacts`; its record
+header shows `attachments=N:k@OFFSET/UUID/BYTES,…` (a final `+R` counts unlisted
+items); for names, sha256 or unlisted items, `airc show NAME @N` adds full
+`! attachment k …` lines.

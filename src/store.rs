@@ -22,6 +22,33 @@ pub struct Artifact {
     pub data: Vec<u8>,
 }
 
+/// A live staged artifact: stored for one account and channel, unannounced
+/// and never downloadable until a message publishes it.
+pub struct Staged {
+    pub account: String,
+    pub channel: String,
+    pub filename: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// Owner, channel and publishing message of a retained artifact. Artifacts
+/// published before schema 4 have no recorded owner or message.
+pub struct Published {
+    pub account: Option<String>,
+    pub channel: String,
+    pub msgid: Option<String>,
+}
+
+/// Why staging stored nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StageRefusal {
+    /// The account's live staged count or bytes would exceed its quota.
+    Account,
+    /// All stored staged bytes would exceed the server-wide cap.
+    Server,
+}
+
 #[derive(Clone)]
 pub struct Ban {
     pub mask: String,
@@ -48,7 +75,8 @@ impl Store {
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         // Version 3 adds no columns: it marks rows that may hold multiline text,
         // which older binaries cannot replay, so they refuse the database.
-        ensure!(version <= 3, "database schema is newer than this binary");
+        // Version 4 adds staged artifacts and artifact owner/message columns.
+        ensure!(version <= 4, "database schema is newer than this binary");
         db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         let tx = db.transaction()?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, channel TEXT NOT NULL, time TEXT NOT NULL, message TEXT NOT NULL);
@@ -57,7 +85,17 @@ impl Store {
             CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, channel TEXT NOT NULL, filename TEXT NOT NULL, data BLOB NOT NULL, time TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS artifacts_channel ON artifacts(channel, time);
             CREATE TABLE IF NOT EXISTS bans (channel TEXT NOT NULL REFERENCES channels(name), mask TEXT NOT NULL, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, PRIMARY KEY(channel, mask));
-            PRAGMA user_version=3;")?;
+            CREATE TABLE IF NOT EXISTS staged (id TEXT PRIMARY KEY, account TEXT NOT NULL, channel TEXT NOT NULL, filename TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL, data BLOB NOT NULL, expires TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS staged_account ON staged(account, expires);")?;
+        if version < 4 {
+            tx.execute_batch(
+                "ALTER TABLE artifacts ADD COLUMN account TEXT;
+                ALTER TABLE artifacts ADD COLUMN msgid TEXT;",
+            )?;
+        }
+        tx.execute_batch("PRAGMA user_version=4;")?;
+        // Expired staged rows never become visible; drop them with their bytes.
+        tx.execute("DELETE FROM staged WHERE expires < ?1", [now()])?;
         for c in &config.channels {
             tx.execute(
                 "INSERT OR IGNORE INTO channels(name, moderated) VALUES (?1, ?2)",
@@ -153,10 +191,33 @@ impl Store {
         message: &mut Message,
         artifact: Option<(&str, &str, &[u8], usize)>,
     ) -> Result<()> {
+        self.commit(channel, message, artifact, None)
+    }
+
+    /// Append one message and publish its staged artifacts, in order, in the
+    /// same transaction. Any failure stores nothing and leaves them staged.
+    pub fn publish(
+        &mut self,
+        channel: &str,
+        message: &mut Message,
+        staged: &[String],
+        keep: usize,
+    ) -> Result<()> {
+        self.commit(channel, message, None, Some((staged, keep)))
+    }
+
+    fn commit(
+        &mut self,
+        channel: &str,
+        message: &mut Message,
+        artifact: Option<(&str, &str, &[u8], usize)>,
+        staged: Option<(&[String], usize)>,
+    ) -> Result<()> {
         let id = uuid::Uuid::new_v4().to_string();
         let time = now();
         message.tags.insert("msgid".into(), id.clone());
         message.tags.insert("time".into(), time.clone());
+        let account = message.tags.get("account").cloned();
         let cutoff = self.cutoff();
         let tx = self.db.transaction()?;
         tx.execute(
@@ -164,15 +225,119 @@ impl Store {
             params![id, channel, time, serde_json::to_string(message)?],
         )?;
         tx.execute("DELETE FROM messages WHERE channel=?1 AND (time < ?2 OR seq NOT IN (SELECT seq FROM messages WHERE channel=?1 ORDER BY seq DESC LIMIT ?3))", params![channel,cutoff,self.retention as i64])?;
-        if let Some((id, filename, data, keep)) = artifact {
+        let mut keep = None;
+        if let Some((artifact, filename, data, limit)) = artifact {
             tx.execute(
-                "INSERT INTO artifacts(id,channel,filename,data,time) VALUES (?1,?2,?3,?4,?5)",
-                params![id, channel, filename, data, time],
+                "INSERT INTO artifacts(id,channel,filename,data,time,account,msgid) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![artifact, channel, filename, data, time, account, id],
             )?;
+            keep = Some(limit);
+        }
+        if let Some((staged, limit)) = staged {
+            for artifact in staged {
+                let moved = tx.execute(
+                    "INSERT INTO artifacts(id,channel,filename,data,time,account,msgid) SELECT id,channel,filename,data,?2,account,?3 FROM staged WHERE id=?1 AND channel=?4 AND account=?5 AND expires>=?2",
+                    params![artifact, time, id, channel, account],
+                )?;
+                ensure!(moved == 1, "staged artifact is no longer available");
+                tx.execute("DELETE FROM staged WHERE id=?1", [artifact])?;
+            }
+            keep = Some(limit);
+        }
+        if let Some(keep) = keep {
             tx.execute("DELETE FROM artifacts WHERE channel=?1 AND (time < ?2 OR id NOT IN (SELECT id FROM artifacts WHERE channel=?1 ORDER BY rowid DESC LIMIT ?3))", params![channel,cutoff,keep as i64])?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Delete at most `limit` expired staged rows, bytes included.
+    pub fn sweep_staged(&self, limit: usize) -> Result<usize> {
+        Ok(self.db.execute(
+            "DELETE FROM staged WHERE id IN (SELECT id FROM staged WHERE expires < ?1 LIMIT ?2)",
+            params![now(), limit as i64],
+        )?)
+    }
+
+    /// Store one unannounced artifact for `account` in folded `channel`. Quotas
+    /// count live rows per account and every stored row server-wide.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage(
+        &mut self,
+        id: &str,
+        account: &str,
+        channel: &str,
+        filename: &str,
+        sha256: &str,
+        data: &[u8],
+        account_bytes: usize,
+    ) -> Result<std::result::Result<(), StageRefusal>> {
+        use crate::attachments::{STAGE_TTL_SECONDS, STAGED_PER_ACCOUNT, STAGED_TOTAL_BYTES};
+        self.sweep_staged(crate::attachments::SWEEP_LIMIT)?;
+        let time = now();
+        let expires = (chrono::Utc::now() + chrono::Duration::seconds(STAGE_TTL_SECONDS))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let tx = self.db.transaction()?;
+        let (count, bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM staged WHERE account=?1 AND expires>=?2",
+            params![account, time],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if count as usize >= STAGED_PER_ACCOUNT || bytes as usize + data.len() > account_bytes {
+            return Ok(Err(StageRefusal::Account));
+        }
+        let total: i64 = tx.query_row("SELECT COALESCE(SUM(bytes),0) FROM staged", [], |r| {
+            r.get(0)
+        })?;
+        if total as usize + data.len() > STAGED_TOTAL_BYTES {
+            return Ok(Err(StageRefusal::Server));
+        }
+        tx.execute(
+            "INSERT INTO staged(id,account,channel,filename,sha256,bytes,data,expires) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, account, channel, filename, sha256, data.len() as i64, data, expires],
+        )?;
+        tx.commit()?;
+        Ok(Ok(()))
+    }
+
+    /// A live staged row; an expired one reads as absent even before a sweep.
+    pub fn staged(&self, id: &str) -> Result<Option<Staged>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .db
+            .query_row(
+                "SELECT account,channel,filename,sha256,bytes FROM staged WHERE id=?1 AND expires>=?2",
+                params![id, now()],
+                |r| {
+                    Ok(Staged {
+                        account: r.get(0)?,
+                        channel: r.get(1)?,
+                        filename: r.get(2)?,
+                        sha256: r.get(3)?,
+                        bytes: r.get::<_, i64>(4)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Owner and message of a retained artifact, for consumed-ID refusals.
+    pub fn published(&self, id: &str) -> Result<Option<Published>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .db
+            .query_row(
+                "SELECT account,channel,msgid FROM artifacts WHERE id=?1 AND time>=?2",
+                params![id, self.cutoff()],
+                |r| {
+                    Ok(Published {
+                        account: r.get(0)?,
+                        channel: r.get(1)?,
+                        msgid: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Retained history index in sequence order, without message bodies.
@@ -227,6 +392,149 @@ impl Store {
             .execute("DELETE FROM messages WHERE time < ?1", [self.cutoff()])?;
         self.db
             .execute("DELETE FROM artifacts WHERE time < ?1", [self.cutoff()])?;
+        self.db
+            .execute("DELETE FROM staged WHERE expires < ?1", [now()])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        attachments::{STAGED_PER_ACCOUNT, STAGED_TOTAL_BYTES},
+        config::{Limits, token_hash},
+    };
+
+    fn open(dir: &std::path::Path) -> Store {
+        Store::open(&Config {
+            server_name: "test.airc".into(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            control_unix: None,
+            membership_generation: None,
+            database: dir.join("state.db"),
+            allow_insecure: false,
+            allow_private_messages: false,
+            tls: None,
+            limits: Limits::default(),
+            accounts: vec![crate::config::Account {
+                name: "alice".into(),
+                token_sha256: token_hash("test"),
+            }],
+            channels: vec![],
+            artifacts: None,
+        })
+        .unwrap()
+    }
+
+    fn id(n: usize) -> String {
+        format!("12345678-1234-4234-8234-{n:012}")
+    }
+
+    fn message(account: &str) -> Message {
+        let mut m = Message::new("PRIVMSG", ["#work", "[Image #1]"]);
+        m.tags.insert("account".into(), account.into());
+        m
+    }
+
+    #[test]
+    fn expired_staged_rows_are_not_live_cannot_publish_and_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        let stage = |store: &mut Store, n: usize| {
+            store
+                .stage(&id(n), "alice", "#work", "x.png", "sha", b"x", 1 << 20)
+                .unwrap()
+        };
+        for n in 0..STAGED_PER_ACCOUNT {
+            assert_eq!(stage(&mut store, n), Ok(()));
+        }
+        assert_eq!(stage(&mut store, 99), Err(StageRefusal::Account));
+        // Expire one row without sweeping it: it no longer counts or publishes.
+        store
+            .execute_for_test(&format!(
+                "UPDATE staged SET expires='2000-01-01T00:00:00.000Z' WHERE id='{}'",
+                id(0)
+            ))
+            .unwrap();
+        assert!(store.staged(&id(0)).unwrap().is_none());
+        assert!(store.staged(&id(1)).unwrap().is_some());
+        let mut m = message("alice");
+        assert!(store.publish("#work", &mut m, &[id(0)], 16).is_err());
+        assert!(store.published(&id(0)).unwrap().is_none());
+        // A refused publication stored no message and kept the live rows.
+        assert!(store.history("#work").unwrap().is_empty());
+        let count = |store: &Store| -> i64 {
+            store
+                .db
+                .query_row("SELECT COUNT(*) FROM staged", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&store), STAGED_PER_ACCOUNT as i64);
+        // The next stage sweeps the expired row with its bytes and then fits.
+        assert_eq!(stage(&mut store, 100), Ok(()));
+        assert_eq!(count(&store), STAGED_PER_ACCOUNT as i64);
+        let gone: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM staged WHERE id=?1", [id(0)], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(gone, 0);
+        // Publishing moves rows atomically and records owner and message.
+        let mut m = message("alice");
+        store.publish("#work", &mut m, &[id(1)], 16).unwrap();
+        let published = store.published(&id(1)).unwrap().unwrap();
+        assert_eq!(published.account.as_deref(), Some("alice"));
+        assert_eq!(published.msgid.as_deref(), Some(m.tags["msgid"].as_str()));
+        assert!(store.staged(&id(1)).unwrap().is_none());
+        // Another account's or channel's staged row never publishes.
+        let mut m = message("bob");
+        assert!(store.publish("#work", &mut m, &[id(2)], 16).is_err());
+        let mut m = message("alice");
+        assert!(store.publish("#other", &mut m, &[id(2)], 16).is_err());
+        assert_eq!(store.history("#work").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn server_wide_staged_bytes_include_unswept_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        // One recorded row near the cap (its BLOB is small; quotas use `bytes`).
+        store
+            .execute_for_test(&format!(
+                "INSERT INTO staged VALUES ('{}','bob','#work','b.png','sha',{},x'00','2999-01-01T00:00:00.000Z')",
+                id(1),
+                STAGED_TOTAL_BYTES - 1
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .stage(&id(2), "alice", "#work", "a.png", "sha", b"xy", 1 << 20)
+                .unwrap(),
+            Err(StageRefusal::Server)
+        );
+        assert_eq!(
+            store
+                .stage(&id(3), "alice", "#work", "a.png", "sha", b"x", 1 << 20)
+                .unwrap(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn schema_four_adds_staging_and_artifact_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        let version: i64 = store
+            .db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        drop(store);
+        // Reopening an existing version-4 database adds nothing twice.
+        let store = open(dir.path());
+        assert!(store.published(&id(1)).unwrap().is_none());
     }
 }

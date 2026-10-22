@@ -175,6 +175,10 @@ enum ArtifactCommand {
         name: String,
         #[arg(long, required = true)]
         stdin: bool,
+        /// Store it unannounced for one later message to publish (needs the
+        /// server's `message-attachments` feature).
+        #[arg(long)]
+        stage: bool,
     },
     /// Download a UUID into a new private file; refuses URLs and overwrites.
     Download {
@@ -192,6 +196,7 @@ async fn artifact_command(command: ArtifactCommand) -> Result<()> {
             channel,
             name,
             stdin: _,
+            stage,
         } => {
             use tokio::io::AsyncReadExt;
             let config = airc::client::ClientConfig::load(&config)?;
@@ -204,7 +209,11 @@ async fn artifact_command(command: ArtifactCommand) -> Result<()> {
             )
             .await
             .map_err(|_| anyhow::anyhow!("artifact stdin timed out"))??;
-            airc::client::upload_bytes(&config, &channel, &name, bytes).await?
+            if stage {
+                airc::client::stage_bytes(&config, &channel, &name, bytes).await?
+            } else {
+                airc::client::upload_bytes(&config, &channel, &name, bytes).await?
+            }
         }
         ArtifactCommand::Download {
             config,

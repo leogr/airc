@@ -61,6 +61,26 @@ The announcement body stays readable for clients without tags. Neither body text
 nor a filename proves that the artifact is an image, and clients never need to
 follow its displayed URL. Older stored announcements have no reserved metadata.
 
+A message can instead publish several staged artifacts itself (feature
+`message-attachments`). Its client-only `+airc-attach=UUID@OFFSET,…` tag lists
+1–8 unique staged IDs; the k-th offset is the byte position of the marker
+`[Image #k]` in the logical (reassembled multiline) text, in order without
+overlap. Only a channel PRIVMSG publishes: the server strips the tag, checks
+that every ID is a live staging of this account in this folded channel and that
+the sender may still speak and read there, then stores the message, moves the
+artifacts out of staging and sets the reserved `airc-artifacts` tag
+(`UUID/BYTES/SHA256/OFFSET/NAME,…`, marker order) in one transaction before any
+delivery. The encoded tag section, with room for a later `batch` reference, must
+fit `MAX_TAGS`. Any failure stores nothing and is a definite
+`FAIL PRIVMSG ATTACHMENTS <target>` (or `FAIL BATCH ATTACHMENTS`) with reason
+`attachments: invalid`, `unavailable` (artifacts disabled or read access lost),
+`unknown k=K`, `consumed k=K msgid=M` (only to the owner of an already
+published ID, including an ordinary announced upload, whose msgid is its
+announcement), `too-long`, `store` or `channel-only`. A NOTICE or TAGMSG drops
+the tag. Only the listed spans are attachments; a typed
+look-alike marker is text. Clients without the feature or `message-tags` see
+the text with its markers and no attachment metadata or download URL.
+
 Messages use CRLF (LF input is tolerated), at most 15 parameters, and at most
 512 bytes including CRLF excluding tags. Tags have a separate 4096-byte budget;
 relayed client metadata has a smaller 2048-byte budget to reserve server tags.
@@ -196,6 +216,21 @@ The artifact and its channel announcement commit together. GET
 credentials. Content is delivered as an attachment with `nosniff` and no caching.
 Uploads return ID, URL, bytes, SHA-256 and announcement msgid. Expired files return
 404; an old announcement may remain after a file is removed by count retention.
+
+POST `/v1/channels/%23work/staged` stages instead: the same access checks apply,
+but nothing is announced or stored in history and GET returns 404, even to its
+owner, until a message publishes it. The reply is `{id,sha256,bytes,staged:true}`.
+It is a separate route so that a server without staging rejects it before any
+mutation; it never becomes an announced upload. Upload answers given before the
+request reaches the store carry `X-AIRC-Refusal: <code>` (for example
+`staging-quota`, `staging-capacity`, `busy`, `unavailable`); only those prove
+that nothing was stored. A status without it, such as a 503 after a lost actor
+reply or from a proxy, leaves the outcome unknown.
+Staging persists across restarts for 10 minutes. Each account holds at most 8
+live staged artifacts and 8 × `max_bytes` across channels (409 when exceeded);
+all stored staged rows, including expired ones not yet swept, share a 64 MiB
+server cap (503). Expired rows are deleted at startup, by periodic pruning and at
+most 64 at a time before each stage or publication. Rows are never deduplicated.
 
 ## Deliberate limits
 

@@ -345,7 +345,7 @@ impl ShowWalk {
         while let Some((reference, channel)) = next.take() {
             let (local, msgid) = if reference.starts_with('@') {
                 (
-                    state.retained_record(&reference).map(str::to_owned),
+                    state.retained_show(&reference),
                     state.resolve_reference(&reference).ok(),
                 )
             } else {
@@ -358,7 +358,7 @@ impl ShowWalk {
                 }
                 let local = state
                     .local_reference(msgid)
-                    .and_then(|r| state.retained_record(&r).map(str::to_owned));
+                    .and_then(|r| state.retained_show(&r));
                 (local, Some(msgid.to_string()))
             };
             match (local, msgid, channel) {

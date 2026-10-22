@@ -518,6 +518,9 @@ enum Operation {
         target: String,
         text: String,
         reply_to: Option<String>,
+        /// Staged artifacts this one message publishes, at their markers.
+        #[serde(default)]
+        attach: Option<Vec<crate::attachments::Attach>>,
     },
     Join {
         channel: String,
@@ -653,6 +656,9 @@ struct Pending {
     receipt: String,
     target: String,
     digest: String,
+    /// The echo must carry the same reply and published attachments.
+    reply: Option<String>,
+    attach: Option<Vec<crate::attachments::Attach>>,
     until: tokio::time::Instant,
 }
 
@@ -729,6 +735,25 @@ fn confirms(config: &ClientConfig, pending: &Pending, message: &Message) -> bool
             .is_some_and(|(nick, _)| fold(nick) == fold(&config.nick))
         && fold(&message.params[0]) == fold(&pending.target)
         && crate::config::token_hash_bytes(message.params[1].as_bytes()) == pending.digest
+        && message.tags.get("+reply") == pending.reply.as_ref()
+        && attachments_match(message, pending.attach.as_deref())
+}
+
+/// The echo published exactly the staged attachments this send referenced, in
+/// order and at the same offsets; a send without attachments published none.
+fn attachments_match(message: &Message, sent: Option<&[crate::attachments::Attach]>) -> bool {
+    use crate::attachments::{RESERVED_TAG, parse_published};
+    match (sent, message.tags.get(RESERVED_TAG)) {
+        (None, None) => true,
+        (Some(sent), Some(raw)) => parse_published(raw).is_some_and(|items| {
+            items.len() == sent.len()
+                && items
+                    .iter()
+                    .zip(sent)
+                    .all(|(p, s)| p.id == s.id && p.at == s.at)
+        }),
+        _ => false,
+    }
 }
 
 const SEND_TAG: &str = "+airc-send";
@@ -854,6 +879,7 @@ async fn run_frontend_v2(
                 target,
                 text,
                 reply_to,
+                attach,
             } => {
                 if pending.is_some() {
                     Err(anyhow::anyhow!(
@@ -861,6 +887,7 @@ async fn run_frontend_v2(
                     ))
                 } else {
                     let receipt = uuid::Uuid::new_v4().simple().to_string();
+                    let (sent_reply, sent_attach) = (reply_to.clone(), attach.clone());
                     let prepared = (|| {
                         ensure!(
                             valid_channel(&target) || valid_nick(&target),
@@ -874,6 +901,12 @@ async fn run_frontend_v2(
                                 "invalid reply id"
                             );
                             tags.insert("+reply".into(), reply);
+                        }
+                        if let Some(attach) = attach {
+                            tags.insert(
+                                crate::attachments::CLIENT_TAG.into(),
+                                attach_tag(&target, &text, &attach)?,
+                            );
                         }
                         multiline::outbound(
                             (&config.nick, &config.account),
@@ -893,6 +926,8 @@ async fn run_frontend_v2(
                                 receipt: receipt.clone(),
                                 target,
                                 digest: crate::config::token_hash_bytes(text.as_bytes()),
+                                reply: sent_reply,
+                                attach: sent_attach,
                                 until: tokio::time::Instant::now() + wait,
                             });
                             if connection.outbound.send(frames).await.is_err() {
@@ -1084,17 +1119,33 @@ pub fn topic_message(channel: &str, text: Option<&str>) -> Result<Message> {
     Ok(message)
 }
 
+/// The `+airc-attach` value for a channel message whose text holds each
+/// referenced marker; the server repeats every check before publishing.
+fn attach_tag(target: &str, text: &str, attach: &[crate::attachments::Attach]) -> Result<String> {
+    use crate::attachments::{encode_refs, valid_positions, valid_refs};
+    ensure!(valid_channel(target), "attachments need a channel target");
+    ensure!(
+        valid_refs(attach) && valid_positions(text, attach),
+        "invalid attachments: 1–8 unique staged IDs, each at its [Image #k] marker in order"
+    );
+    Ok(encode_refs(attach))
+}
+
 fn to_message(operation: Operation) -> Result<Message> {
     let m = match operation {
         Operation::Send {
             target,
             text,
             reply_to,
+            attach,
         } => {
             ensure!(
                 valid_channel(&target) || valid_nick(&target),
                 "invalid target"
             );
+            let attach = attach
+                .map(|attach| attach_tag(&target, &text, &attach))
+                .transpose()?;
             let mut m = Message::new("PRIVMSG", [target, text]);
             if let Some(reply) = reply_to {
                 ensure!(
@@ -1102,6 +1153,9 @@ fn to_message(operation: Operation) -> Result<Message> {
                     "invalid reply id"
                 );
                 m.tags.insert("+reply".into(), reply);
+            }
+            if let Some(attach) = attach {
+                m.tags.insert(crate::attachments::CLIENT_TAG.into(), attach);
             }
             m
         }
@@ -1206,6 +1260,9 @@ async fn upload(config: &ClientConfig, channel: &str, path: &Path) -> Result<Val
     upload_bytes(config, channel, filename, bytes).await
 }
 
+/// Bytes of a refusal's reason kept for its diagnostic.
+const REFUSAL_BYTES: usize = 512;
+
 /// Client-side upload/download ceiling; managed servers may impose a lower cap.
 pub const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARTIFACT_REPLY: usize = 8192;
@@ -1293,6 +1350,89 @@ pub async fn upload_bytes(
     result.context("upload outcome unconfirmed; inspect authenticated history before retrying")
 }
 
+/// Stage bytes for one later message: stored for this account and channel,
+/// unannounced and not downloadable until a send publishes them. The staging
+/// route never announces, on any server (one without staging rejects it). Only
+/// a typed pre-commit refusal (`not staged:`) proves nothing was stored; any
+/// other failure leaves at most an unannounced row that expires.
+pub async fn stage_bytes(
+    config: &ClientConfig,
+    channel: &str,
+    filename: &str,
+    bytes: Vec<u8>,
+) -> Result<Value> {
+    ensure!(valid_channel(channel), "invalid channel");
+    ensure!(
+        valid_artifact_filename(filename),
+        "filename must use 1–100 letters, digits, dots, dashes or underscores"
+    );
+    ensure!(bytes.len() <= MAX_ARTIFACT_BYTES, "upload exceeds 16 MiB");
+    let size = bytes.len();
+    let digest = crate::config::token_hash_bytes(&bytes);
+    let base = artifact_origin(config)?;
+    let mut url = reqwest::Url::parse(base)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("invalid artifact URL"))?
+        .extend(["v1", "channels", channel, "staged"]);
+    const UNCONFIRMED: &str = "staging outcome unconfirmed; staging never announces, and any stored copy expires unpublished";
+    let response = http_client(config)?
+        .post(url)
+        .basic_auth(&config.account, Some(config.token()?))
+        .header("x-airc-filename", filename)
+        .body(bytes)
+        .send()
+        .await
+        .context(UNCONFIRMED)?;
+    let status = response.status();
+    if !status.is_success() {
+        // Only the server's typed pre-commit refusal proves nothing was stored;
+        // a bare status may be a lost reply or a proxy failure.
+        let code = response
+            .headers()
+            .get("x-airc-refusal")
+            .and_then(|v| v.to_str().ok())
+            .filter(|c| {
+                (1..=32).contains(&c.len())
+                    && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            })
+            .map(str::to_owned);
+        let Some(code) = code else {
+            bail!("{UNCONFIRMED} (HTTP {})", status.as_u16());
+        };
+        let mut response = response;
+        let mut body = Vec::new();
+        while body.len() < REFUSAL_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let take = chunk.len().min(REFUSAL_BYTES - body.len());
+                    body.extend_from_slice(&chunk[..take]);
+                }
+                _ => break,
+            }
+        }
+        let reason: String = String::from_utf8_lossy(&body)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        bail!("not staged: HTTP {} {code}: {reason}", status.as_u16());
+    }
+    let result: Result<Value> = async {
+        let value: Value =
+            serde_json::from_slice(&artifact_response(response, MAX_ARTIFACT_REPLY).await?)?;
+        let id = value["id"].as_str().context("missing artifact ID")?;
+        ensure!(crate::attachments::valid_id(id), "invalid artifact ID");
+        ensure!(
+            value["staged"] == json!(true)
+                && value["bytes"].as_u64() == Some(size as u64)
+                && value["sha256"].as_str() == Some(&digest),
+            "staged artifact digest/size mismatch"
+        );
+        Ok(json!({"id":id, "sha256":digest, "bytes":size, "staged":true}))
+    }
+    .await;
+    result.context(UNCONFIRMED)
+}
+
 /// Download a UUID from the configured origin into a new private local file.
 /// The returned server filename is metadata only; it never selects the path.
 pub async fn download(config: &ClientConfig, artifact: &str, path: &Path) -> Result<Value> {
@@ -1344,6 +1484,8 @@ mod tests {
             receipt: "r1".into(),
             target: "#space".into(),
             digest: crate::config::token_hash_bytes(text.as_bytes()),
+            reply: None,
+            attach: None,
             until: tokio::time::Instant::now(),
         });
         let mut join = Message::new("JOIN", ["#space"]);
@@ -1371,6 +1513,109 @@ mod tests {
         assert_eq!(receipt["state"], "confirmed");
         assert_eq!(receipt["msgid"], "m1");
         assert_eq!(ring.events.len(), 5, "every message is still recorded");
+    }
+
+    #[test]
+    fn a_receipt_needs_the_same_reply_and_published_attachments() {
+        use crate::attachments::{Attach, Published, RESERVED_TAG, encode_published};
+        let config: ClientConfig = toml::from_str(
+            "host = \"127.0.0.1\"\nport = 6667\naccount = \"alice\"\nnick = \"alice\"\ntoken_file = \"t\"\n",
+        )
+        .unwrap();
+        let a = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let b = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        let text = "see [Image #1]";
+        let pending = Pending {
+            receipt: "r1".into(),
+            target: "#space".into(),
+            digest: crate::config::token_hash_bytes(text.as_bytes()),
+            reply: Some("parent".into()),
+            attach: Some(vec![Attach {
+                id: a.into(),
+                at: 4,
+            }]),
+            until: tokio::time::Instant::now(),
+        };
+        let published = |id: &str, at: usize| {
+            encode_published(&[Published {
+                id: id.into(),
+                bytes: 3,
+                sha256: "a".repeat(64),
+                at,
+                name: "paste-1.png".into(),
+            }])
+        };
+        // Token, account, nick, target and text all match in every case.
+        let echo = |reply: Option<&str>, artifacts: Option<String>| {
+            let mut m = Message::new("PRIVMSG", ["#space", text]);
+            m.prefix = Some("alice!alice@airc".into());
+            m.tags.insert("account".into(), "alice".into());
+            m.tags.insert(SEND_TAG.into(), "r1".into());
+            if let Some(reply) = reply {
+                m.tags.insert("+reply".into(), reply.into());
+            }
+            if let Some(artifacts) = artifacts {
+                m.tags.insert(RESERVED_TAG.into(), artifacts);
+            }
+            m
+        };
+        assert!(confirms(
+            &config,
+            &pending,
+            &echo(Some("parent"), Some(published(a, 4)))
+        ));
+        for (why, message) in [
+            (
+                "other artifact",
+                echo(Some("parent"), Some(published(b, 4))),
+            ),
+            ("other offset", echo(Some("parent"), Some(published(a, 5)))),
+            ("no artifacts", echo(Some("parent"), None)),
+            ("invalid tag", echo(Some("parent"), Some("x".into()))),
+            ("other reply", echo(Some("other"), Some(published(a, 4)))),
+            ("no reply", echo(None, Some(published(a, 4)))),
+        ] {
+            assert!(!confirms(&config, &pending, &message), "{why}");
+        }
+        let plain = Pending {
+            reply: None,
+            attach: None,
+            ..pending
+        };
+        assert!(confirms(&config, &plain, &echo(None, None)));
+        assert!(
+            !confirms(&config, &plain, &echo(None, Some(published(a, 4)))),
+            "a plain send never confirms an echo that published attachments"
+        );
+        // A mismatched echo is recorded but leaves the send pending: no receipt.
+        let mut ring = Ring {
+            events: VecDeque::new(),
+            bytes: 0,
+            cursor: 0,
+        };
+        let mut waiting = Some(Pending {
+            reply: Some("parent".into()),
+            attach: Some(vec![Attach {
+                id: a.into(),
+                at: 4,
+            }]),
+            ..plain
+        });
+        observe(
+            &config,
+            &mut ring,
+            &mut waiting,
+            echo(Some("parent"), Some(published(b, 4))),
+        );
+        assert!(waiting.is_some() && ring.events.len() == 1);
+        observe(
+            &config,
+            &mut ring,
+            &mut waiting,
+            echo(Some("parent"), Some(published(a, 4))),
+        );
+        assert!(waiting.is_none());
+        assert_eq!(ring.events.back().unwrap().1["state"], "confirmed");
     }
 
     #[tokio::test]

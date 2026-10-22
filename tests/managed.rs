@@ -699,6 +699,153 @@ async fn jsonl_v2_assembles_multiline_and_reports_correlated_receipts() {
 }
 
 #[tokio::test]
+async fn jsonl_v2_publishes_staged_attachments_as_one_confirmed_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = unix_config(dir.path());
+    let server = server::start(config.clone()).await.unwrap();
+    let alice = member(dir.path(), &config, "alice");
+    let (mut requests, mut responses, task) = jsonl(alice.clone(), 2).await;
+    assert_eq!(json_line(&mut responses).await["version"], 2);
+    let mut seen = Vec::new();
+    let staged = client::stage_bytes(&alice, "#space", "paste-1.png", b"png".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(staged["staged"], true, "{staged}");
+    let id = staged["id"].as_str().unwrap().to_owned();
+    // A marker away from its offset is refused locally; nothing is sent.
+    let send = |n: u8, text: &str, at: usize| {
+        let send = serde_json::json!({"id":n,"op":"send","target":"#space","text":text,"attach":[{"id":id,"at":at}]});
+        format!("{send}\n")
+    };
+    requests
+        .write_all(send(1, "see [Image #1]", 0).as_bytes())
+        .await
+        .unwrap();
+    let refused = json_line(&mut responses).await;
+    assert_eq!(refused["ok"], false);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid attachments"),
+        "{refused}"
+    );
+    let text = "see\n[Image #1] here";
+    requests
+        .write_all(send(2, text, 4).as_bytes())
+        .await
+        .unwrap();
+    let receipt = json_line(&mut responses).await["result"]["receipt"].clone();
+    let echo = until_event(&mut requests, &mut responses, &mut seen, |e| {
+        e["command"] == "PRIVMSG" && e["params"][1] == text
+    })
+    .await;
+    assert_eq!(
+        echo["tags"]["airc-artifacts"],
+        format!(
+            "{id}/3/{}/4/paste-1.png",
+            staged["sha256"].as_str().unwrap()
+        )
+    );
+    assert!(echo["tags"].get("+airc-attach").is_none());
+    let confirmed = until_event(&mut requests, &mut responses, &mut seen, |e| {
+        e["event"] == "receipt" && e["receipt"] == receipt
+    })
+    .await;
+    assert_eq!(confirmed["state"], "confirmed");
+    assert_eq!(confirmed["msgid"], echo["tags"]["msgid"]);
+    // Resending the same submission is a correlated, definite rejection that
+    // names the message which already published it.
+    requests
+        .write_all(send(3, text, 4).as_bytes())
+        .await
+        .unwrap();
+    let receipt = json_line(&mut responses).await["result"]["receipt"].clone();
+    let rejected = until_event(&mut requests, &mut responses, &mut seen, |e| {
+        e["event"] == "receipt" && e["receipt"] == receipt
+    })
+    .await;
+    assert_eq!(rejected["state"], "rejected");
+    let consumed = format!(
+        "attachments: consumed k=1 msgid={}",
+        echo["tags"]["msgid"].as_str().unwrap()
+    );
+    assert!(
+        rejected["reason"].as_str().unwrap().ends_with(&consumed),
+        "{rejected}"
+    );
+    requests
+        .write_all(b"{\"id\":9,\"op\":\"quit\"}\n")
+        .await
+        .unwrap();
+    task.await.unwrap().unwrap();
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn jsonl_v2_replays_a_multiline_attachment_message_from_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = unix_config(dir.path());
+    let server = server::start(config.clone()).await.unwrap();
+    let alice = member(dir.path(), &config, "alice");
+    let (mut requests, mut responses, task) = jsonl(alice.clone(), 2).await;
+    assert_eq!(json_line(&mut responses).await["version"], 2);
+    let mut ids = Vec::new();
+    for name in ["paste-1.png", "paste-2.png"] {
+        let staged = client::stage_bytes(&alice, "#space", name, b"png".to_vec())
+            .await
+            .unwrap();
+        ids.push(staged["id"].as_str().unwrap().to_owned());
+    }
+    let text = "first [Image #1]\nsecond [Image #2]";
+    let second = text.find("[Image #2]").unwrap();
+    let send = serde_json::json!({"id":1,"op":"send","target":"#space","text":text,
+        "attach":[{"id":ids[0],"at":6},{"id":ids[1],"at":second}]});
+    requests
+        .write_all(format!("{send}\n").as_bytes())
+        .await
+        .unwrap();
+    let receipt = json_line(&mut responses).await["result"]["receipt"].clone();
+    let mut seen = Vec::new();
+    let confirmed = until_event(&mut requests, &mut responses, &mut seen, |e| {
+        e["event"] == "receipt" && e["receipt"] == receipt
+    })
+    .await;
+    assert_eq!(confirmed["state"], "confirmed", "{confirmed}");
+    // A fresh client replays it from history as one assembled message whose
+    // offsets still hold their markers.
+    let (mut bob_requests, mut bob, bob_task) = jsonl(member(dir.path(), &config, "bob"), 2).await;
+    json_line(&mut bob).await;
+    let history = serde_json::json!({"id":"h","op":"history","channel":"#space","direction":"LATEST","reference":"*","limit":10});
+    bob_requests
+        .write_all(format!("{history}\n").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(json_line(&mut bob).await["ok"], true);
+    let mut replayed = Vec::new();
+    let replay = until_event(&mut bob_requests, &mut bob, &mut replayed, |e| {
+        e["command"] == "PRIVMSG" && e["params"][1] == text
+    })
+    .await;
+    assert!(replay["tags"].get("batch").is_some(), "{replay}");
+    let offsets: Vec<usize> = replay["tags"]["airc-artifacts"]
+        .as_str()
+        .unwrap()
+        .split(',')
+        .map(|item| item.split('/').nth(3).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(offsets, [6, second]);
+    for (requests, task) in [(&mut requests, task), (&mut bob_requests, bob_task)] {
+        requests
+            .write_all(b"{\"id\":9,\"op\":\"quit\"}\n")
+            .await
+            .unwrap();
+        task.await.unwrap().unwrap();
+    }
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn relative_configuration_names_resolve_unix_endpoints_from_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let room = dir.path().join("room");

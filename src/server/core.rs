@@ -1,8 +1,9 @@
 use super::{ControlOp, Event, ban};
 use crate::{
+    attachments::{self, Published},
     config::Config,
-    protocol::{Message, fold, valid_channel, valid_nick},
-    store::{Ban, Entry, Store},
+    protocol::{MAX_TAGS, Message, fold, valid_channel, valid_nick},
+    store::{Ban, Entry, StageRefusal, Store},
 };
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -32,6 +33,25 @@ const AWAY_LEN: usize = 200;
 const MULTILINE: &str = "draft/multiline";
 const CONCAT: &str = "draft/multiline-concat";
 const BATCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Tag bytes kept free on a published attachment message for the `batch`
+/// reference that relays and history replays add.
+const TAG_HEADROOM: usize = 128;
+
+/// An upload the server refused with a definite status; nothing was stored.
+#[derive(Debug)]
+pub(super) struct UploadRefusal {
+    pub status: u16,
+    pub code: &'static str,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for UploadRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for UploadRefusal {}
 
 /// One client-initiated draft/multiline batch, assembled before any delivery.
 struct OpenBatch {
@@ -509,9 +529,14 @@ impl State {
                 channel,
                 filename,
                 data,
+                stage,
                 reply,
             } => {
-                let result = self.artifact(&account, &channel, &filename, &data);
+                let result = if stage {
+                    self.stage(&account, &channel, &filename, &data)
+                } else {
+                    self.artifact(&account, &channel, &filename, &data)
+                };
                 let _ = reply.send(result);
             }
             Event::Download { account, id, reply } => {
@@ -1131,6 +1156,13 @@ impl State {
         }
         m.tags
             .retain(|k, _| k.starts_with('+') && self.clients[&id].caps.contains("message-tags"));
+        // Only a channel PRIVMSG can publish staged attachments.
+        let attach = m.tags.remove(attachments::CLIENT_TAG);
+        if attach.is_some() && m.command == "PRIVMSG" && !target.starts_with('#') {
+            self.refuse_attachments(id, batch, &target, "channel-only");
+            return Ok(());
+        }
+        let attach = attach.filter(|_| m.command == "PRIVMSG");
         // Reserve space for authoritative tags; never let client metadata overflow a recipient.
         if m.tags
             .iter()
@@ -1182,7 +1214,12 @@ impl State {
             }
             m.params[0] = c.name.clone();
             peers = c.members.keys().copied().collect::<BTreeSet<_>>();
-            if m.command != "TAGMSG" {
+            if let Some(raw) = attach {
+                if let Err(reason) = self.publish(id, &key, &mut m, &raw) {
+                    self.refuse_attachments(id, batch, &target, &reason);
+                    return Ok(());
+                }
+            } else if m.command != "TAGMSG" {
                 self.store.append(&key, &mut m, None)?;
             }
         } else {
@@ -1230,6 +1267,85 @@ impl State {
             self.send_frames(peer, frames);
         }
         Ok(())
+    }
+
+    /// Verify a send's staged attachments and publish the message with them
+    /// in one store transaction. The error is the refusal reason; any refusal
+    /// stores nothing. A consumed ID names its message only to its owner.
+    fn publish(&mut self, id: u64, key: &str, m: &mut Message, raw: &str) -> Result<(), String> {
+        let account = self.clients[&id].account.clone().unwrap();
+        let keep = self.config.artifacts.as_ref().map(|a| a.per_channel);
+        let refs = attachments::parse_refs(raw)
+            .filter(|refs| attachments::valid_positions(&m.params[1], refs))
+            .ok_or("invalid")?;
+        if keep.is_none() || !self.config.may_read(&account, key) {
+            return Err("unavailable".into());
+        }
+        let _ = self.store.sweep_staged(attachments::SWEEP_LIMIT);
+        let mut items = Vec::with_capacity(refs.len());
+        for (k, r) in (1..).zip(&refs) {
+            let staged = self.store.staged(&r.id).map_err(|_| "store")?;
+            match staged {
+                Some(s) if s.account == account && s.channel == key => {
+                    items.push(Published {
+                        id: r.id.clone(),
+                        bytes: s.bytes,
+                        sha256: s.sha256,
+                        at: r.at,
+                        name: s.filename,
+                    });
+                }
+                Some(_) => return Err(format!("unknown k={k}")),
+                None => {
+                    let published = self.store.published(&r.id).map_err(|_| "store")?;
+                    let owned = published
+                        .filter(|p| {
+                            p.account.as_deref() == Some(account.as_str()) && p.channel == key
+                        })
+                        .and_then(|p| p.msgid);
+                    return Err(match owned {
+                        Some(msgid) => format!("consumed k={k} msgid={msgid}"),
+                        None => format!("unknown k={k}"),
+                    });
+                }
+            }
+        }
+        m.tags.insert(
+            attachments::RESERVED_TAG.into(),
+            attachments::encode_published(&items),
+        );
+        // Measure the tag section every relay and replay carries, with the
+        // message ID the store adds and room for a batch reference. The text
+        // is left out: a multiline body is relayed in separate lines.
+        let mut probe = Message::new(&m.command, [m.params[0].as_str(), "x"]);
+        probe.tags = m.tags.clone();
+        probe
+            .tags
+            .insert("msgid".into(), uuid::Uuid::nil().to_string());
+        let fits = probe.encode().is_ok_and(|line| {
+            line.split_once(' ')
+                .is_some_and(|(tags, _)| tags.len() + TAG_HEADROOM <= MAX_TAGS)
+        });
+        if !fits {
+            m.tags.remove(attachments::RESERVED_TAG);
+            return Err("too-long".into());
+        }
+        let ids: Vec<String> = items.into_iter().map(|p| p.id).collect();
+        if self.store.publish(key, m, &ids, keep.unwrap_or(0)).is_err() {
+            m.tags.remove(attachments::RESERVED_TAG);
+            return Err("store".into());
+        }
+        Ok(())
+    }
+
+    /// A definite attachment refusal the JSONL client maps to `rejected`.
+    fn refuse_attachments(&mut self, id: u64, batch: bool, target: &str, reason: &str) {
+        let reason = format!("attachments: {reason}");
+        if batch {
+            self.fail_batch(id, &["ATTACHMENTS"], &reason);
+        } else {
+            self.fail(id, "PRIVMSG", "ATTACHMENTS", target, &reason);
+        }
     }
 
     /// Reject one message. A rejected multiline batch always reports
@@ -2183,6 +2299,73 @@ impl State {
         Ok(
             serde_json::json!({"id":id,"url":url,"sha256":digest,"bytes":data.len(),"msgid":m.tags["msgid"]}),
         )
+    }
+
+    /// Store one artifact unannounced for a later message to publish. It needs
+    /// the same access as an upload, never appears in history and cannot be
+    /// downloaded until published.
+    fn stage(
+        &mut self,
+        account: &str,
+        channel: &str,
+        filename: &str,
+        data: &[u8],
+    ) -> Result<serde_json::Value> {
+        let config = self
+            .config
+            .artifacts
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("artifacts disabled"))?;
+        let channel = fold(channel);
+        ensure!(
+            self.config.may_read(account, &channel),
+            "channel unavailable"
+        );
+        ensure!(
+            self.channels[&channel].members.keys().any(|id| {
+                self.clients[id].account.as_deref() == Some(account)
+                    && self.may_speak(*id, &channel)
+            }),
+            "join channel with speaking permission before uploading"
+        );
+        ensure!(data.len() <= config.max_bytes, "artifact too large");
+        ensure!(
+            attachments::valid_name(filename),
+            "filename must use letters, digits, dot, dash or underscore"
+        );
+        let account_bytes = config.max_bytes * attachments::STAGED_PER_ACCOUNT;
+        let id = uuid::Uuid::new_v4().to_string();
+        let digest = crate::config::token_hash_bytes(data);
+        let refusal = |status, code, reason| {
+            anyhow::Error::new(UploadRefusal {
+                status,
+                code,
+                reason,
+            })
+        };
+        match self.store.stage(
+            &id,
+            account,
+            &channel,
+            filename,
+            &digest,
+            data,
+            account_bytes,
+        )? {
+            Ok(()) => {
+                Ok(serde_json::json!({"id":id,"sha256":digest,"bytes":data.len(),"staged":true}))
+            }
+            Err(StageRefusal::Account) => Err(refusal(
+                409,
+                "staging-quota",
+                "staging quota exceeded for this account",
+            )),
+            Err(StageRefusal::Server) => Err(refusal(
+                503,
+                "staging-capacity",
+                "staging capacity exhausted; try later",
+            )),
+        }
     }
 }
 

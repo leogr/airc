@@ -7,6 +7,7 @@ use super::{
     history::{Disposition, Notice},
 };
 use crate::{
+    attachments,
     client::{ClientConfig, JoinRefusal},
     multiline::{self, Limits},
     protocol::{Message, fold, valid_channel, valid_nick},
@@ -72,6 +73,9 @@ pub(super) struct State {
 struct Event {
     sequence: u64,
     text: String,
+    /// Full attachment metadata lines, shown by `show` but never delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     /// Attention class; absent in older state, then treated as critical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     class: Option<Classification>,
@@ -225,10 +229,15 @@ impl State {
     }
 
     fn record(&mut self, text: String, class: Classification) {
+        self.record_with(text, class, None);
+    }
+
+    fn record_with(&mut self, text: String, class: Classification, detail: Option<String>) {
         self.sequence += 1;
         self.events.push_back(Event {
             sequence: self.sequence,
             text,
+            detail,
             class: Some(class),
             observed: self.elapsed(),
         });
@@ -388,7 +397,8 @@ impl State {
                         message.params[1].len()
                     ), if joined_page { Classification::Critical } else { class });
                 } else {
-                    self.record(text, class);
+                    let detail = published(message).map(|items| attachments::detail(&items));
+                    self.record_with(text, class, detail);
                 }
             }
         } else if matches!(
@@ -462,8 +472,8 @@ impl State {
                 format!(" reply={reference}")
             })
             .unwrap_or_default();
-        let header = format!(
-            "{label}{} {} {}({}){}{}: ",
+        let mut header = format!(
+            "{label}{} {} {}({}){}{}",
             reference,
             safe(&message.params[0]),
             safe(nick),
@@ -471,16 +481,26 @@ impl State {
             reply,
             artifact_metadata(message),
         );
+        // The whole header stays within one monitor line; `show` has the rest.
+        if let Some(items) = published(message) {
+            let summary = attachments::summary(&items, header.len(), attachments::HEADER_BUDGET);
+            header.push_str(&summary);
+        }
+        header.push_str(": ");
         (reference, header)
     }
 
-    /// The retained record whose header starts with this local `@N`.
-    pub fn retained_record(&self, reference: &str) -> Option<&str> {
+    /// The retained record whose header starts with this local `@N`, followed
+    /// by its full attachment metadata for `show`.
+    pub fn retained_show(&self, reference: &str) -> Option<String> {
         self.events
             .iter()
             .rev()
-            .map(|e| e.text.as_str())
-            .find(|text| record_reference(text) == Some(reference))
+            .find(|e| record_reference(&e.text) == Some(reference))
+            .map(|e| match &e.detail {
+                Some(detail) => format!("{}\n{detail}", e.text),
+                None => e.text.clone(),
+            })
     }
 
     /// The local `@N` already assigned to a server msgid.
@@ -497,7 +517,11 @@ impl State {
             return None;
         }
         let (_, header) = self.header(message, "");
-        Some(framed(header, &message.params[1]))
+        let text = framed(header, &message.params[1]);
+        Some(match published(message) {
+            Some(items) => format!("{text}\n{}", attachments::detail(&items)),
+            None => text,
+        })
     }
 
     pub fn begin_lookup(&mut self, channel: &str, msgid: &str) -> Result<(), String> {
@@ -1106,6 +1130,21 @@ pub(super) fn safe(text: &str) -> String {
         .replace("\\'", "'")
 }
 
+/// Attachments from the reserved server tag of an authenticated message, only
+/// when every entry is valid and sits at its marker in the text.
+fn published(message: &Message) -> Option<Vec<attachments::Published>> {
+    message.tags.get("account")?;
+    let items = attachments::parse_published(message.tags.get(attachments::RESERVED_TAG)?)?;
+    let refs: Vec<_> = items
+        .iter()
+        .map(|p| attachments::Attach {
+            id: p.id.clone(),
+            at: p.at,
+        })
+        .collect();
+    attachments::valid_positions(message.params.get(1)?, &refs).then_some(items)
+}
+
 /// Render only reserved server tags, never an apparent artifact URL in text or
 /// a client-only +airc-artifact tag. Metadata identifies bytes, not media type.
 fn artifact_metadata(message: &Message) -> String {
@@ -1172,6 +1211,94 @@ mod tests {
         m.tags.insert("account".into(), "human".into());
         m.tags.insert("msgid".into(), id.into());
         m
+    }
+
+    fn attachments_tag(ids: &[&str], text: &str, name: &str) -> String {
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let at = text.find(&attachments::marker(i + 1)).unwrap();
+                format!("{id}/4/{}/{at}/{name}", "a".repeat(64))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[test]
+    fn attachment_records_carry_a_bounded_summary_and_show_has_full_metadata() {
+        let id = "12345678-1234-4234-8234-123456789012";
+        let text = "see [Image #1]\nok";
+        let mut message = chat(text, "with-one");
+        message.tags.insert(
+            attachments::RESERVED_TAG.into(),
+            attachments_tag(&[id], text, "paste-1.png"),
+        );
+        let mut state = state();
+        state.ingest(&message, false);
+        let output = state.read(50);
+        let header = output.lines().find(|l| l.starts_with("@1 ")).unwrap();
+        assert!(
+            header.starts_with(&format!(
+                "@1 #work Human(human) attachments=1:1@4/{id}/4: see [Image #1]"
+            )),
+            "{output}"
+        );
+        assert!(
+            !output.contains("sha256="),
+            "delivery carries no full metadata"
+        );
+        let shown = state.retained_show("@1").unwrap();
+        assert!(shown.ends_with(&format!(
+            "\n! attachment 1 artifact={id} name=paste-1.png bytes=4 sha256={} at=4",
+            "a".repeat(64)
+        )));
+        // Full metadata survives a state round trip; delivery text is unchanged.
+        let restored: State =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.retained_show("@1").unwrap(), shown);
+        assert_eq!(state.render_context(&message).unwrap(), shown);
+
+        // Eight attachments, a long channel/reply header: the summary keeps the
+        // whole header within budget and counts what it leaves out.
+        let ids: Vec<String> = (0..8)
+            .map(|i| format!("12345678-1234-4234-8234-12345678901{i}"))
+            .collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let text = (1..=8)
+            .map(attachments::marker)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut message = chat(&text, "with-eight");
+        message.tags.insert("+reply".into(), "x".repeat(128));
+        message.tags.insert(
+            attachments::RESERVED_TAG.into(),
+            attachments_tag(&ids, &text, &"n".repeat(100)),
+        );
+        state.ingest(&message, false);
+        let output = state.read(50);
+        let header = output
+            .lines()
+            .find(|l| l.contains("attachments=8:"))
+            .unwrap();
+        let header = &header[..header.find(": ").unwrap()];
+        assert!(header.len() <= attachments::HEADER_BUDGET, "{header}");
+        let listed = header.matches("@").count() - 1;
+        assert!(
+            listed < 8 && header.ends_with(&format!("+{}", 8 - listed)),
+            "{header}"
+        );
+        let shown = state.retained_show("@2").unwrap();
+        assert_eq!(shown.matches("\n! attachment ").count(), 8);
+
+        // A tag whose span does not hold its marker renders nothing.
+        let mut bad = chat("no marker here", "bad");
+        bad.tags.insert(
+            attachments::RESERVED_TAG.into(),
+            format!("{id}/4/{}/0/x.png", "a".repeat(64)),
+        );
+        state.ingest(&bad, false);
+        assert!(!state.read(50).contains("attachments="));
+        assert!(!state.retained_show("@3").unwrap().contains("! attachment"));
     }
 
     #[test]

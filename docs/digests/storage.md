@@ -1,6 +1,6 @@
 # Storage, transport and server lifecycle
 
-Verification: `59064c6188658bf60131db6afc33ab7bbf45357c` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `59064c6188658bf60131db6afc33ab7bbf45357c`, staged attachments at `cffe0962e3b907b2078f33f821231b2446fef1f5`, and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] Strict TOML configuration validates identifiers, account/channel references,
 resource limits and remote plaintext opt-ins before listeners start. Relative
@@ -47,6 +47,19 @@ Client-only lookalikes never become reserved metadata. The body remains readable
 for older clients. Artifact metadata does not verify media type. [5](#source-5)
 [15](#source-15)
 
+[FACT] Schema 4 adds a `staged` table and artifact owner/msgid columns. Staging,
+on its own HTTP route, needs upload access, stores the bytes for one account and
+folded channel with a 10-minute expiry, never deduplicates, and is never
+announced or downloadable. Upload answers decided before the store carry
+`X-AIRC-Refusal`; a lost actor reply does not.
+Quotas count live rows per account (8, 8 × `max_bytes`) and all stored rows
+server-wide (64 MiB); startup, pruning and bounded sweeps delete expired rows
+with their bytes. A channel PRIVMSG whose `+airc-attach` offsets hold ordered
+`[Image #k]` markers publishes only this account's live rows: one transaction
+stores the message with reserved `airc-artifacts` and moves the rows, after a
+`MAX_TAGS` check; any refusal is a definite FAIL that stores nothing.
+[16](#source-16) [17](#source-17) [18](#source-18) [19](#source-19)
+
 [FACT] Integration tests exercise unauthorized artifact access, upload limits,
 moderation, restart persistence and TLS trust/hostname rejection. A state-actor
 test verifies a full output queue cancels the slow client while a draining peer
@@ -70,3 +83,7 @@ continues receiving. [8](#source-8) [9](#source-9) [10](#source-10)
 14. <a id="source-14"></a> [src/server/core.rs](../../src/server/core.rs#L1589-L1739) — ban queries and persist-before-broadcast mutation.
 
 15. <a id="source-15"></a> [src/server/core.rs](../../src/server/core.rs#L541-L558) — outbound capability filtering; `relay` at L1132–1147, `client_batch` at L1442–1443, `batch_line` at L1498–1502 strip/reject forged metadata; `tests/collaboration.rs:374–457` — atomic announcement fields and restart history, anti-forgery at L1629–1705.
+16. <a id="source-16"></a> [src/store.rs](../../src/store.rs#L199-L341) — `publish`, `commit`, `sweep_staged`, `stage`, `staged`, `published`; schema 4 migration in `open`.
+17. <a id="source-17"></a> [src/server/core.rs](../../src/server/core.rs#L1275-L1350) — attachment `publish` checks, `MAX_TAGS` probe and `refuse_attachments`; `stage` at L2307; `src/server/http.rs` L90–L200: staging route, `refused` markers, lost-reply 503.
+18. <a id="source-18"></a> [src/attachments.rs](../../src/attachments.rs#L1-L210) — tag grammar, bounded offsets, marker positions, reserved encoding, record summary and detail.
+19. <a id="source-19"></a> [tests/collaboration.rs](../../tests/collaboration.rs#L1944-L2370) — publication, refusals, multiline offsets, worst-case tag size, CLI staging, typed-refusal and old-server staging.

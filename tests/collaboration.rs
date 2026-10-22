@@ -1030,9 +1030,9 @@ async fn schema_one_migrates_without_losing_state_and_newer_versions_are_refused
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
-        db.execute_batch("PRAGMA user_version=4;").unwrap();
+        db.execute_batch("PRAGMA user_version=5;").unwrap();
     }
     let error = server::start(fixture.config.clone())
         .await
@@ -1043,7 +1043,7 @@ async fn schema_one_migrates_without_losing_state_and_newer_versions_are_refused
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
@@ -1909,4 +1909,462 @@ async fn artifact_http_rejects_redirects_oversized_and_malformed_replies() {
         );
         task.abort();
     }
+}
+
+/// Stage `body` as `account` in #work: the status and the JSON reply.
+async fn stage(
+    server: &RunningServer,
+    account: &str,
+    name: &str,
+    body: &'static str,
+) -> (u16, serde_json::Value) {
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/v1/channels/%23work/staged",
+            server.artifact_address.unwrap()
+        ))
+        .basic_auth(account, Some(TOKEN))
+        .header("x-airc-filename", name)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or_default())
+}
+
+fn attachment_ids(m: &Message) -> Vec<String> {
+    m.tags["airc-artifacts"]
+        .split(',')
+        .map(|item| item.split('/').next().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn staged_attachments_publish_one_message_once_and_replay() {
+    let mut fixture = Fixture::new();
+    fixture.config.artifacts.as_mut().unwrap().per_channel = 16;
+    let server = fixture.start().await;
+    let mut alice = Peer::login(&server, "alice", true).await;
+    alice.join().await;
+    let mut bob = Peer::login(&server, "bob", true).await;
+    bob.join().await;
+    let mut plain = Peer::login(&server, "human", false).await;
+    plain.join().await;
+    // Identical bytes stage as two artifacts: rows are never deduplicated.
+    let (status, first) = stage(&server, "alice", "paste-a.png", "same").await;
+    assert_eq!(status, 201, "{first}");
+    let (_, second) = stage(&server, "alice", "paste-b.png", "same").await;
+    assert_eq!(first["staged"], true);
+    assert!(
+        first.get("msgid").is_none() && first.get("url").is_none(),
+        "{first}"
+    );
+    let sha = first["sha256"].as_str().unwrap().to_owned();
+    let a = first["id"].as_str().unwrap().to_owned();
+    let b = second["id"].as_str().unwrap().to_owned();
+    assert_ne!(a, b);
+    // Staged bytes are neither announced nor downloadable, even by their owner.
+    let http = reqwest::Client::new();
+    let url = |id: &str| {
+        format!(
+            "http://{}/v1/artifacts/{id}",
+            server.artifact_address.unwrap()
+        )
+    };
+    let owner = http.get(url(&a)).basic_auth("alice", Some(TOKEN));
+    assert_eq!(owner.send().await.unwrap().status(), 404);
+    assert!(
+        alice
+            .history("CHATHISTORY LATEST #work * 100")
+            .await
+            .is_empty()
+    );
+
+    let text = "look [Image #1] and [Image #2]";
+    let send = format!("@+airc-attach={a}@5,{b}@20 PRIVMSG #work :{text}");
+    alice.send(&send).await;
+    let published = bob.until("PRIVMSG").await;
+    assert_eq!(published.params[1], text);
+    assert!(!published.tags.contains_key("+airc-attach"));
+    assert_eq!(
+        published.tags["airc-artifacts"],
+        format!("{a}/4/{sha}/5/paste-a.png,{b}/4/{sha}/20/paste-b.png")
+    );
+    let msgid = alice.until("PRIVMSG").await.tags["msgid"].clone();
+    assert_eq!(published.tags["msgid"], msgid);
+    // Without message-tags: the same text, markers included, and no metadata.
+    let legacy = plain.until("PRIVMSG").await;
+    assert_eq!(legacy.params[1], text);
+    assert!(legacy.tags.is_empty(), "{legacy:?}");
+    for id in [&a, &b] {
+        let download = http.get(url(id)).basic_auth("bob", Some(TOKEN));
+        let download = download.send().await.unwrap();
+        assert_eq!(download.status(), 200);
+        assert_eq!(download.bytes().await.unwrap(), "same");
+    }
+    // A resend never publishes twice; only the owner learns the consuming message.
+    alice.send(&send).await;
+    let consumed = format!("attachments: consumed k=1 msgid={msgid}");
+    assert_eq!(
+        alice.until("FAIL").await.params,
+        ["PRIVMSG", "ATTACHMENTS", "#work", consumed.as_str()]
+    );
+    bob.send(&format!("@+airc-attach={a}@0 PRIVMSG #work :[Image #1]"))
+        .await;
+    assert_eq!(
+        bob.until("FAIL").await.params[3],
+        "attachments: unknown k=1"
+    );
+    // History, also after a restart, holds the one message with its metadata.
+    server.shutdown().await.unwrap();
+    let server = fixture.start().await;
+    let mut alice = Peer::login(&server, "alice", true).await;
+    alice.join().await;
+    let history = alice.history("CHATHISTORY LATEST #work * 100").await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].tags["msgid"], msgid);
+    assert_eq!(
+        history[0].tags["airc-artifacts"],
+        published.tags["airc-artifacts"]
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_refusals_are_definite_store_nothing_and_name_the_index() {
+    let mut fixture = Fixture::new();
+    fixture.config.artifacts.as_mut().unwrap().per_channel = 16;
+    let server = fixture.start().await;
+    let mut alice = Peer::login(&server, "alice", true).await;
+    alice.join().await;
+    let mut bob = Peer::login(&server, "bob", true).await;
+    bob.join().await;
+    let id = |reply: (u16, serde_json::Value)| reply.1["id"].as_str().unwrap().to_owned();
+    let a = id(stage(&server, "alice", "a.png", "aaaa").await);
+    let c = id(stage(&server, "bob", "c.png", "cccc").await);
+    let unknown = "12345678-1234-4234-8234-123456789012";
+    for (refs, text, reason) in [
+        (format!("{a}@2"), "x [Image #2]", "invalid"),
+        (format!("{a}@0"), "[image #1]", "invalid"),
+        (format!("{a}@0,{a}@11"), "[Image #1] [Image #2]", "invalid"),
+        (format!("{c}@0"), "[Image #1]", "unknown k=1"),
+        (
+            format!("{a}@0,{unknown}@11"),
+            "[Image #1] [Image #2]",
+            "unknown k=2",
+        ),
+    ] {
+        alice
+            .send(&format!("@+airc-attach={refs} PRIVMSG #work :{text}"))
+            .await;
+        let fail = alice.until("FAIL").await;
+        assert_eq!(fail.params[3], format!("attachments: {reason}"), "{refs}");
+    }
+    alice
+        .send(&format!("@+airc-attach={a}@0 PRIVMSG bob :[Image #1]"))
+        .await;
+    assert_eq!(
+        alice.until("FAIL").await.params[3],
+        "attachments: channel-only"
+    );
+    assert!(
+        alice
+            .history("CHATHISTORY LATEST #work * 100")
+            .await
+            .is_empty()
+    );
+    // Refusals consumed nothing. A typed look-alike marker stays plain text:
+    // only the listed span is an attachment.
+    let text = "[Image #1] then a literal [Image #1]";
+    alice
+        .send(&format!("@+airc-attach={a}@0 PRIVMSG #work :{text}"))
+        .await;
+    let published = bob.until("PRIVMSG").await;
+    assert_eq!(published.params[1], text);
+    assert_eq!(attachment_ids(&published), [a]);
+    assert!(published.tags["airc-artifacts"].contains("/0/a.png"));
+    alice.until("PRIVMSG").await; // its own echo
+    bob.send(&format!("@+airc-attach={c}@0 PRIVMSG #work :[Image #1]"))
+        .await;
+    assert_eq!(attachment_ids(&alice.until("PRIVMSG").await), [c]);
+    // Neither a NOTICE nor a forged reserved tag carries attachments.
+    alice
+        .send("@airc-artifacts=forged;+airc-attach=x NOTICE #work :[Image #1]")
+        .await;
+    let notice = bob.until("NOTICE").await;
+    assert_eq!(notice.params[1], "[Image #1]");
+    assert!(!notice.tags.contains_key("airc-artifacts"));
+    assert!(!notice.tags.contains_key("+airc-attach"));
+    // Eight live staged rows per account, then a definite 409; others unaffected.
+    for i in 0..8 {
+        assert_eq!(
+            stage(&server, "alice", &format!("q{i}.png"), "q").await.0,
+            201
+        );
+    }
+    let quota = reqwest::Client::new()
+        .post(format!(
+            "http://{}/v1/channels/%23work/staged",
+            server.artifact_address.unwrap()
+        ))
+        .basic_auth("alice", Some(TOKEN))
+        .header("x-airc-filename", "q8.png")
+        .body("q")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(quota.status(), 409);
+    // A typed marker: this refusal was decided before anything was stored.
+    assert_eq!(quota.headers()["x-airc-refusal"], "staging-quota");
+    assert_eq!(stage(&server, "bob", "b.png", "b").await.0, 201);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn multiline_attachment_offsets_use_the_reassembled_text() {
+    let mut fixture = Fixture::new();
+    fixture.config.artifacts.as_mut().unwrap().per_channel = 16;
+    fixture.config.limits.multiline_lines = 8;
+    let server = fixture.start().await;
+    let mut alice = Peer::login_caps(&server, "alice", Some(MULTILINE_CAPS)).await;
+    alice.join().await;
+    let mut bob = Peer::login_caps(&server, "bob", Some(MULTILINE_CAPS)).await;
+    bob.join().await;
+    let mut ids = Vec::new();
+    for name in ["a.png", "b.png", "c.png"] {
+        ids.push(
+            stage(&server, "alice", name, "x").await.1["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    // A marker on line one, one on a later line, one split by a concat boundary.
+    let text = "[Image #1] first\nsecond [Image #2]\nthird [Image #3]";
+    let refs: Vec<String> = (1..=3)
+        .map(|k| {
+            format!(
+                "{}@{}",
+                ids[k - 1],
+                text.find(&format!("[Image #{k}]")).unwrap()
+            )
+        })
+        .collect();
+    let lines = [
+        "@batch=m1 PRIVMSG #work :[Image #1] first",
+        "@batch=m1 PRIVMSG #work :second [Image #2]",
+        "@batch=m1 PRIVMSG #work :third [Ima",
+        "@batch=m1;draft/multiline-concat PRIVMSG #work :ge #3]",
+    ];
+    // Wrong offsets for the reassembled text are a definite batch refusal.
+    alice
+        .send(&format!(
+            "@+airc-attach={}@1 BATCH +m0 draft/multiline #work",
+            ids[0]
+        ))
+        .await;
+    for line in &lines {
+        alice.send(&line.replace("batch=m1", "batch=m0")).await;
+    }
+    alice.send("BATCH -m0").await;
+    let fail = alice.until("FAIL").await;
+    assert_eq!(
+        fail.params,
+        ["BATCH", "ATTACHMENTS", "attachments: invalid"]
+    );
+    alice
+        .send(&format!(
+            "@+airc-attach={} BATCH +m1 draft/multiline #work",
+            refs.join(",")
+        ))
+        .await;
+    for line in lines {
+        alice.send(line).await;
+    }
+    alice.send("BATCH -m1").await;
+    let open = bob.until("BATCH").await;
+    let (open, assembled, concat) = multiline_batch(&mut bob, open).await;
+    assert_eq!(assembled, text);
+    assert_eq!(concat, [false, false, false, true]);
+    assert_eq!(attachment_ids(&open), ids);
+    let offsets: Vec<usize> = open.tags["airc-artifacts"]
+        .split(',')
+        .map(|item| item.split('/').nth(3).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(offsets, [0, 24, 41]);
+    assert_eq!(&text[41..51], "[Image #3]");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn worst_case_attachment_metadata_fits_every_parser_and_the_cli_stages() {
+    let mut fixture = Fixture::new();
+    fixture.config.artifacts.as_mut().unwrap().per_channel = 16;
+    let server = fixture.start().await;
+    let mut alice = Peer::login(&server, "alice", true).await;
+    alice.join().await;
+    let mut bob = Peer::login(&server, "bob", true).await;
+    bob.join().await;
+    // Eight attachments with 100-byte names, a long reply and client tags at
+    // the server's client-tag budget: the relayed and replayed lines parse.
+    let mut refs = Vec::new();
+    let mut text = String::new();
+    for k in 1..=8 {
+        let name = format!("{k}{}.png", "n".repeat(95));
+        let reply = stage(&server, "alice", &name, "0123456789abcdef0123456789abcdef").await;
+        assert_eq!(reply.0, 201, "{}", reply.1);
+        refs.push(format!(
+            "{}@{}",
+            reply.1["id"].as_str().unwrap(),
+            text.len()
+        ));
+        text.push_str(&format!("[Image #{k}] "));
+    }
+    let attach = refs.join(",");
+    let reply = "r".repeat(128);
+    // Estimated client tags: (key + 2 × value + 2) each, at most 2048.
+    let used = [("+airc-attach", attach.len()), ("+reply", reply.len())]
+        .iter()
+        .map(|(k, v)| k.len() + 2 * v + 2)
+        .sum::<usize>();
+    let pad = "p".repeat((2048 - used - "+pad".len() - 2) / 2);
+    alice
+        .send(&format!(
+            "@+airc-attach={attach};+reply={reply};+pad={pad} PRIVMSG #work :{text}"
+        ))
+        .await;
+    let published = bob.until("PRIVMSG").await;
+    assert_eq!(attachment_ids(&published).len(), 8);
+    let line = published.encode().unwrap();
+    let tags = line.split_once(' ').unwrap().0;
+    assert!(tags.len() <= airc::protocol::MAX_TAGS, "{}", tags.len());
+    let history = bob.history("CHATHISTORY LATEST #work * 1").await;
+    assert_eq!(
+        history[0].tags["airc-artifacts"],
+        published.tags["airc-artifacts"]
+    );
+
+    // The CLI stages over HTTP only and reports a definite refusal as such.
+    let config = fixture.client_config(&server, "bob");
+    let path = fixture.dir.path().join("bob.toml");
+    write_private(&path, toml::to_string(&config).unwrap().as_bytes()).unwrap();
+    let args = [
+        "upload",
+        "--config",
+        path.to_str().unwrap(),
+        "--channel",
+        "#work",
+        "--name",
+        "paste-1.png",
+        "--stdin",
+        "--stage",
+    ];
+    let output = artifact_cli(&args, b"png").await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["staged"], true);
+    assert_eq!(result["bytes"], 3);
+    assert!(result.get("url").is_none() && result.get("msgid").is_none());
+    for _ in 0..7 {
+        assert!(artifact_cli(&args, b"png").await.status.success());
+    }
+    let refused = artifact_cli(&args, b"png").await;
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("not staged: HTTP 409"), "{stderr}");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn staging_is_definite_only_with_a_typed_refusal_and_never_announces_on_old_servers() {
+    use axum::{Router, body::Body, http::Response, routing::post};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let fixture = Fixture::new();
+    let token = fixture.dir.path().join("token");
+    write_private(&token, TOKEN.as_bytes()).unwrap();
+    let config = |endpoint: std::net::SocketAddr| -> ClientConfig {
+        toml::from_str(&format!("host = '127.0.0.1'\nport = 1\ntls = false\naccount = 'alice'\nnick = 'alice'\ntoken_file = '{}'\nartifact_url = 'http://{endpoint}'\n", token.display())).unwrap()
+    };
+    let id = "12345678-1234-4234-8234-123456789012";
+    let announced = format!(
+        "{{\"id\":\"{id}\",\"url\":\"http://x/v1/artifacts/{id}\",\"sha256\":\"{}\",\"bytes\":4,\"msgid\":\"{id}\"}}",
+        "a".repeat(64)
+    );
+    for (status, marker, body, definite) in [
+        // A lost actor reply or a proxy failure proves nothing.
+        (503, None, "actor reply lost".to_owned(), false),
+        (
+            503,
+            Some("staging-capacity"),
+            "staging capacity exhausted".to_owned(),
+            true,
+        ),
+        // A damaged marker is not a refusal.
+        (409, Some("Bad Marker!"), "damaged".to_owned(), false),
+        // A long reason is bounded while it is read.
+        (409, Some("staging-quota"), "q".repeat(100_000), true),
+        // A success without `staged` is never taken as a stage.
+        (201, None, announced, false),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let handler = move || {
+            let body = body.clone();
+            async move {
+                let mut reply = Response::builder().status(status);
+                if let Some(marker) = marker {
+                    reply = reply.header("x-airc-refusal", marker);
+                }
+                reply.body(Body::from(body)).unwrap()
+            }
+        };
+        let app = Router::new().route("/v1/channels/{channel}/staged", post(handler));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error =
+            client::stage_bytes(&config(endpoint), "#work", "paste-1.png", b"test".to_vec())
+                .await
+                .unwrap_err();
+        let text = format!("{error:#}");
+        if definite {
+            let prefix = format!("not staged: HTTP {status} {}: ", marker.unwrap());
+            assert!(text.starts_with(&prefix), "{text}");
+            assert!(text.len() <= prefix.len() + 512, "{}", text.len());
+        } else {
+            assert!(text.contains("staging outcome unconfirmed"), "{text}");
+            assert!(!text.starts_with("not staged"), "{text}");
+        }
+        task.abort();
+    }
+    // A server without staging knows only the announcing upload route: the
+    // staging request never reaches it, so nothing is announced or stored.
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let counted = uploads.clone();
+    let app = Router::new().route(
+        "/v1/channels/{channel}/artifacts",
+        post(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { "announced" }
+        }),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let error = client::stage_bytes(&config(endpoint), "#work", "paste-1.png", b"test".to_vec())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("staging outcome unconfirmed")
+            && format!("{error:#}").ends_with("(HTTP 404)"),
+        "{error:#}"
+    );
+    assert_eq!(uploads.load(Ordering::SeqCst), 0);
+    task.abort();
 }

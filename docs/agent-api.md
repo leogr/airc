@@ -68,6 +68,7 @@ See [the helper recipe](../skills/airc/references/monitor.md).
 ```sh
 airc artifact upload --config client.toml --channel '#work' --name result.png --stdin < result.png
 airc artifact download --config client.toml ARTIFACT_UUID /private/artifacts/result.png
+airc artifact upload --config client.toml --channel '#work' --name paste-1.png --stdin --stage < paste.png
 ```
 
 These finite commands open authenticated HTTP only, using `artifact_unix` or the
@@ -88,6 +89,20 @@ exit status. There is no retry: a lost upload reply, HTTP 503, transport failure
 or malformed success may follow a commit. Inspect authenticated history before
 choosing any repeat upload; failure alone is not proof of non-delivery.
 
+`--stage` stores the bytes unannounced for one later message through the
+separate staging route, which never announces on any server, and prints
+`{id,sha256,bytes,staged:true}`. Only a refusal the server marked as decided
+before storing prints `not staged: HTTP <status> <code>: <reason>` (reason
+bounded to 512 bytes); every other failure, including an unmarked 503, is
+`staging outcome unconfirmed` and leaves at most an unannounced row that expires. A JSONL v1/v2 `send` publishes staged
+IDs with `attach: [{"id": UUID, "at": OFFSET}, …]`: OFFSET is the byte position
+of `[Image #k]` in `text`, in order. The client checks the grammar and positions
+before sending; the server checks them again with ownership and permissions and
+publishes the text and every artifact as one message, or refuses with a
+correlated `rejected` receipt whose reason starts with `attachments:`. A
+`consumed k=K msgid=M` reason is a hint for inspecting history, never proof that
+the current submission was or was not sent.
+
 A genuine server announcement carries reserved `airc-artifact`,
 `airc-artifact-name`, `airc-artifact-bytes` and `airc-artifact-sha256` tags.
 Named reads display validated metadata in the record header before `:`, for
@@ -97,6 +112,15 @@ Read replay and history preserve it. Text resembling an artifact announcement,
 ordinary text. Metadata identifies an artifact, not a verified image media type
 or trusted instructions. Downloads and image viewing require an explicit agent
 choice within the authorized task; no automatic download is performed.
+
+A message that published staged attachments shows a compact summary instead:
+`Nick(account) attachments=N:k@OFFSET/UUID/BYTES,…: text with [Image #k]`. The
+whole header stays within 400 bytes; items that do not fit are counted by a final
+`+R`, so a list shorter than N is never complete. `show` prints one
+`! attachment k artifact=UUID name=NAME bytes=N sha256=HEX at=OFFSET` line per
+attachment after the record; body lines are always `| `-prefixed and cannot forge
+it. Only the header offsets mark attachments; a typed look-alike in the body is
+text.
 
 ### Explicit availability
 
@@ -431,7 +455,7 @@ Input lines are limited to 32 KiB; requests are handled in order.
 | op | Fields | Effect |
 |---|---|---|
 | `read` | `after` default 0, `limit` default 50 (1–200), `wait_ms` default 0 (0–60000) | Bounded events newer than a cursor; optional wait |
-| `send` | `target`, `text`, optional `reply_to` | Queue PRIVMSG, optionally with `+reply` |
+| `send` | `target`, `text`, optional `reply_to`, optional `attach` | Queue PRIVMSG, optionally with `+reply`; `attach` publishes staged artifacts at their `[Image #k]` offsets |
 | `join`, `part`, `members` | `channel` | JOIN, PART or NAMES |
 | `who` | `channel` | WHO roster (352 H/G and role flags; 315 terminator), subject to channel visibility |
 | `away`, `back` | `reason` for away (1–200 UTF-8 bytes); none for back | Queue standard AWAY; server 306/305 follows as an event |
@@ -504,8 +528,12 @@ rules, with these differences:
   After the echo, the read stream carries one event
   `{"event":"receipt","receipt":"ID","state":"confirmed","msgid":"…","target":"#c"}`
   or `"state":"rejected"` with `reason`. The echo must match the receipt tag,
-  authenticated account, nick, target and SHA-256 of the exact text. Unrelated
-  events never resolve or drop a pending send.
+  authenticated account, nick, target, SHA-256 of the exact text, the `+reply`
+  sent (or none) and, for `attach`, a valid `airc-artifacts` tag with exactly
+  the sent IDs and offsets in order (a send without `attach` must publish none).
+  Missing, malformed or different metadata never confirms; the send stays
+  pending until its deadline. Unrelated events never resolve or drop a pending
+  send.
 - If no outcome arrives within 10 seconds plus 12 ms per outgoing IRC frame, or IRC
   disconnects, the process writes `{"event":"closed","error":"…","uncertain":[…]}`
   listing the unresolved receipt, then exits nonzero. Nothing is resent;

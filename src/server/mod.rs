@@ -42,6 +42,8 @@ pub(super) enum Event {
         channel: String,
         filename: String,
         data: Vec<u8>,
+        /// Store unannounced for a later message (the staging route).
+        stage: bool,
         reply: oneshot::Sender<Result<serde_json::Value>>,
     },
     Download {

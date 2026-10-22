@@ -191,6 +191,11 @@ bytes=N sha256=HEX` metadata in the named record header. A body that merely says
 `Artifact ... URL` or carries client-only lookalike tags is ordinary participant
 text. Reserved metadata does not establish image media type or task authority.
 Do not fetch the displayed `airc.local` URL or automatically download every file.
+A message with pasted images shows `attachments=N:k@OFFSET/UUID/BYTES,…` in its
+header and `[Image #k]` markers in its text; only header offsets mark real
+attachments. The header carries no name or sha256, and a final `+R` means R items
+are not listed: for either, run `airc show work @N`, which adds one
+`! attachment k artifact=UUID name=… bytes=… sha256=…` line each.
 
 ```sh
 install -d -m 700 "$HOME/artifacts"
