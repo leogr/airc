@@ -4,16 +4,32 @@
 //! (the sink took it) or an explicit drop moves the delivery cursor. Nothing
 //! here replays a pending batch on its own: a restarted consumer is refused
 //! until the operator names the pending ID.
+//!
+//! A receipt-enabled consumer also asks its receiver to report each batch.
+//! Transport acceptance of such a batch starts a hold on later batches until
+//! that exact report, its timeout, or urgency/retention pressure ends it. The
+//! report is a same-user local call: never acceptance, never processing proof.
 
-use super::attention::{Classification, WakeMode};
+use super::{
+    attention::{Classification, WakeMode},
+    storage::SOCKET_PATH_BYTES,
+};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 
 pub(super) const MIN_BYTES: usize = 1024;
 pub(super) const MAX_BYTES: usize = 1024 * 1024;
 pub(super) const DEFAULT_BYTES: usize = 8 * 1024;
 /// Upper bound of `--min-interval`, in seconds.
 pub(super) const MAX_INTERVAL: u64 = 3600;
+/// Upper bound of `--receipt-timeout`, in seconds.
+pub(super) const MAX_RECEIPT_TIMEOUT: u64 = 3600;
+/// Receipt records kept as metadata; the active hold is never evicted.
+pub(super) const CREDITS: usize = 32;
+/// Bytes a receipt-enabled consumer's header and notices must leave for
+/// records within `--max-bytes`; registration is refused otherwise.
+pub(super) const RECORD_ROOM: usize = 256;
 
 #[derive(Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +43,52 @@ pub(super) struct Delivery {
     pub pending: Option<Batch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<Outcome>,
+    /// Accepted receipt-enabled batches, oldest first, without payload. Only the
+    /// newest may still be unreleased: the active hold (version 4).
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub credits: VecDeque<Credit>,
+}
+
+impl Delivery {
+    /// Keep a new record, evicting the oldest released one at the bound.
+    pub fn credit(&mut self, credit: Credit) {
+        if self.credits.len() >= CREDITS
+            && let Some(oldest) = self.credits.iter().position(|c| c.released.is_some())
+        {
+            self.credits.remove(oldest);
+        }
+        self.credits.push_back(credit);
+    }
+
+    /// The record still holding later batches, if any.
+    pub fn hold(&self) -> Option<&Credit> {
+        self.credits.back().filter(|c| c.released.is_none())
+    }
+
+    pub fn hold_mut(&mut self) -> Option<&mut Credit> {
+        self.credits.back_mut().filter(|c| c.released.is_none())
+    }
+
+    /// Bounded, unique, well-formed records; only the newest may be active, and
+    /// none shares the pending batch's ID.
+    pub fn credits_valid(&self) -> bool {
+        let mut ids = HashSet::new();
+        self.credits.len() <= CREDITS
+            && self
+                .credits
+                .iter()
+                .all(|c| c.valid() && ids.insert(c.id.as_str()))
+            && self
+                .credits
+                .iter()
+                .rev()
+                .skip(1)
+                .all(|c| c.released.is_some())
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|batch| !ids.contains(batch.id.as_str()))
+    }
 }
 
 /// Per wake mode, whether an event relevant to it was evicted undelivered.
@@ -89,6 +151,178 @@ pub(super) struct Batch {
     /// full-field header renders verbatim and which carries no settings notice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact: Option<Compact>,
+    /// The receipt its consumer requested; only compact batches carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ReceiptRequest>,
+}
+
+/// What a receipt-enabled batch asks of its receiver, as assembled.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReceiptRequest {
+    /// The worker's canonical state directory, so the printed command reaches
+    /// this store whatever the receiver's HOME or XDG_STATE_HOME.
+    pub store: String,
+    pub session: String,
+    pub scope: String,
+    /// Seconds its accepted batch holds later ones without a report.
+    pub timeout: u64,
+    /// A report that arrived while transport acceptance was still pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received: Option<String>,
+}
+
+impl ReceiptRequest {
+    /// The local notice that every rendering of the batch carries: one
+    /// complete command line, its store path quoted as one shell word.
+    pub fn notice(&self, id: &str) -> String {
+        format!(
+            "! receipt requested: scope={scope} timeout={}s; check the scope, then report receipt once before other work: airc --state-dir {} deliveries {} --mark-received {id} --receipt-scope {scope}\n",
+            self.timeout,
+            shell_word(&self.store),
+            self.session,
+            scope = self.scope,
+        )
+    }
+
+    fn valid(&self) -> bool {
+        valid_session(&self.session)
+            && valid_store(&self.store, &self.session)
+            && validate_scope(&self.scope).is_ok()
+            && (1..=MAX_RECEIPT_TIMEOUT).contains(&self.timeout)
+            && self.received.as_deref().is_none_or(|at| time(at).is_some())
+    }
+}
+
+/// One accepted receipt-enabled batch: metadata only, never its payload.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Credit {
+    pub id: String,
+    pub scope: String,
+    /// Transport acceptance (UTC), which started its hold.
+    pub accepted: String,
+    /// The original hold in seconds and its UTC end.
+    pub timeout: u64,
+    pub deadline: String,
+    /// The receiver's first report, before or after acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received: Option<String>,
+    /// Absent only while this record is the active hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released: Option<Release>,
+}
+
+impl Credit {
+    fn valid(&self) -> bool {
+        let deadline = time(&self.accepted).and_then(|accepted| {
+            accepted
+                .checked_add_signed(chrono::Duration::seconds(i64::try_from(self.timeout).ok()?))
+        });
+        validate_id(&self.id).is_ok()
+            && validate_scope(&self.scope).is_ok()
+            && (1..=MAX_RECEIPT_TIMEOUT).contains(&self.timeout)
+            && deadline.is_some_and(|deadline| time(&self.deadline) == Some(deadline))
+            && self.received.as_deref().is_none_or(|at| time(at).is_some())
+            && self.released.as_ref().is_none_or(|release| {
+                time(&release.at).is_some()
+                    && (release.reason != Reason::Received || self.received.is_some())
+            })
+    }
+
+    /// One ledger line: transport acceptance, receipt and release kept apart.
+    pub fn describe(&self) -> String {
+        format!(
+            "receipt {} scope={} accepted={} deadline={} received={} {}\n",
+            self.id,
+            self.scope,
+            self.accepted,
+            self.deadline,
+            self.received.as_deref().unwrap_or("none"),
+            self.released
+                .as_ref()
+                .map_or("hold=active".into(), |release| {
+                    format!("released={} at={}", release.reason.name(), release.at)
+                })
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Release {
+    pub reason: Reason,
+    pub at: String,
+}
+
+/// Why a hold ended. Only `received` reflects a receiver report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Reason {
+    Received,
+    Expired,
+    Urgent,
+    Pressure,
+}
+
+impl Reason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Expired => "expired",
+            Self::Urgent => "urgent",
+            Self::Pressure => "pressure",
+        }
+    }
+}
+
+/// A receipt scope: one exact lowercase UUID, such as a Codex thread ID.
+pub(super) fn validate_scope(scope: &str) -> Result<()> {
+    ensure!(
+        uuid::Uuid::parse_str(scope).is_ok_and(|uuid| uuid.hyphenated().to_string() == scope),
+        "invalid receipt scope; give the receiver's exact lowercase hyphenated UUID"
+    );
+    Ok(())
+}
+
+/// A saved RFC 3339 timestamp.
+pub(super) fn time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|at| at.with_timezone(&chrono::Utc))
+}
+
+/// A store path a receipt notice can print: absolute, without control or
+/// other non-printing characters, and short enough that its session socket
+/// path keeps the bound `Storage::open` enforces.
+pub(super) fn valid_store(store: &str, session: &str) -> bool {
+    store.starts_with('/')
+        && !store.chars().any(char::is_control)
+        && !store.escape_debug().to_string().contains("\\u{")
+        && store.len() + session.len() + "//client.sock".len() < SOCKET_PATH_BYTES
+}
+
+/// One POSIX shell word for `text`: bare when every byte is unambiguous,
+/// otherwise single-quoted with each `'` written as `'\''`, so nothing in it
+/// is expanded, split or executed.
+pub(super) fn shell_word(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+    {
+        text.into()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+fn valid_session(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
 }
 
 /// What a compact batch keeps so a retry or inspection shows the settings it
@@ -125,8 +359,12 @@ impl Batch {
         } else {
             String::new()
         };
+        let receipt = self
+            .receipt
+            .as_ref()
+            .map_or(String::new(), |request| request.notice(&self.id));
         format!(
-            "{}{}]\n{notice}{}",
+            "{}{}]\n{notice}{receipt}{}",
             self.header,
             if retry { " retry" } else { "" },
             self.records
@@ -137,6 +375,10 @@ impl Batch {
         validate_id(&self.id).is_ok()
             && self.header.len() + self.records.len() <= MAX_BYTES
             && self.compact.as_ref().is_none_or(|c| c.settings.valid())
+            && self
+                .receipt
+                .as_ref()
+                .is_none_or(|request| self.compact.is_some() && request.valid())
     }
 }
 
@@ -167,6 +409,26 @@ pub(super) struct Options {
     pub max_bytes: usize,
     pub min_interval: u64,
     pub wrap: Wrap,
+    /// Requested on each new batch when set; never part of the settings notice.
+    pub receipt: Option<ReceiptOptions>,
+}
+
+/// `subscribe --receipt-timeout/--receipt-scope`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReceiptOptions {
+    pub timeout: u64,
+    pub scope: uuid::Uuid,
+}
+
+impl std::fmt::Display for ReceiptOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "receipt-timeout={} receipt-scope={}",
+            self.timeout,
+            self.scope.hyphenated()
+        )
+    }
 }
 
 impl std::fmt::Display for Options {
@@ -213,6 +475,7 @@ impl Settings {
             max_bytes: self.max_bytes,
             min_interval: self.min_interval,
             wrap: self.wrap,
+            receipt: None,
         }
     }
 
@@ -381,6 +644,7 @@ mod tests {
                 max_bytes: 4096,
                 min_interval: 15,
                 wrap,
+                receipt: None,
             },
         )
     }
@@ -398,6 +662,7 @@ mod tests {
                 settings: settings(Wrap::Bytes(2560)),
                 notice,
             }),
+            receipt: None,
         }
     }
 
@@ -508,6 +773,106 @@ mod tests {
             let resaved = serde_json::to_value(&restored).unwrap();
             assert!(resaved.get("compact").is_none());
         }
+    }
+
+    #[test]
+    fn receipt_requests_need_compact_batches_exact_scopes_and_bounds() {
+        let scope = "019a0000-0000-7000-8000-00000000c0de";
+        let request = || ReceiptRequest {
+            store: "/srv/airc state".into(),
+            session: "space".into(),
+            scope: scope.into(),
+            timeout: 60,
+            received: None,
+        };
+        let mut batch = compact(false);
+        batch.receipt = Some(request());
+        assert!(batch.validate());
+        let notice = request().notice(ID);
+        assert!(notice.ends_with(&format!(
+            "airc --state-dir '/srv/airc state' deliveries space --mark-received {ID} --receipt-scope {scope}\n"
+        )));
+        for rendering in [Rendering::First, Rendering::Retry, Rendering::Inspect] {
+            let text = batch.render(rendering);
+            assert!(text.ends_with(&format!("{notice}{RECORDS}")), "{text}");
+        }
+        let restored: Batch = serde_json::from_slice(&serde_json::to_vec(&batch).unwrap()).unwrap();
+        assert!(restored.validate());
+        let mut value = serde_json::to_value(&batch).unwrap();
+        value["receipt"]["extra"] = true.into();
+        assert!(serde_json::from_value::<Batch>(value).is_err());
+        // A saved legacy batch never carries one.
+        let mut legacy = compact(false);
+        legacy.compact = None;
+        legacy.receipt = Some(request());
+        assert!(!legacy.validate());
+        for invalid in [
+            ReceiptRequest {
+                scope: scope.to_uppercase(),
+                ..request()
+            },
+            ReceiptRequest {
+                scope: scope.replace('-', ""),
+                ..request()
+            },
+            ReceiptRequest {
+                timeout: 0,
+                ..request()
+            },
+            ReceiptRequest {
+                timeout: MAX_RECEIPT_TIMEOUT + 1,
+                ..request()
+            },
+            ReceiptRequest {
+                session: "two words".into(),
+                ..request()
+            },
+            ReceiptRequest {
+                store: "relative".into(),
+                ..request()
+            },
+            ReceiptRequest {
+                store: "/tmp/new\nline".into(),
+                ..request()
+            },
+            ReceiptRequest {
+                store: format!("/{}", "a".repeat(SOCKET_PATH_BYTES)),
+                ..request()
+            },
+            ReceiptRequest {
+                received: Some("yesterday".into()),
+                ..request()
+            },
+        ] {
+            let mut batch = compact(false);
+            batch.receipt = Some(invalid);
+            assert!(!batch.validate());
+        }
+        assert!(validate_scope(scope).is_ok());
+        assert!(validate_scope(ID).is_ok());
+        assert!(validate_scope("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn shell_words_never_expand_split_or_execute() {
+        assert_eq!(shell_word("/srv/airc-state_1.d"), "/srv/airc-state_1.d");
+        assert_eq!(shell_word("/a b"), "'/a b'");
+        assert_eq!(shell_word("/it's"), r"'/it'\''s'");
+        assert_eq!(shell_word("/$(x)`y`"), "'/$(x)`y`'");
+        assert_eq!(shell_word("/é"), "'/é'");
+        assert_eq!(shell_word(""), "''");
+        // A POSIX shell turns each word back into exactly the original bytes.
+        for text in ["/a b", "/it's", "/$(touch pwned)`touch pwned`", "/q\"\\'"] {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &format!("printf %s {}", shell_word(text))])
+                .current_dir(std::env::temp_dir())
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), text);
+        }
+        assert!(valid_store("/srv/a b'c", "space"));
+        assert!(!valid_store("/srv/\u{202e}", "space"));
+        assert!(!valid_store("srv", "space"));
     }
 
     #[test]

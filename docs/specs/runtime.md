@@ -63,6 +63,17 @@ Delivery uses a separate durable cursor and one connection-bound consumer:
 batches are pending before any sink sees them, are accepted only on sink
 success, and are never replayed without an explicit ID. Context lookups have no
 cursor or replay side effects. [8](#source-8)
+
+[FACT] An opt-in receipt hold paces later batches after acceptance until the
+exact batch and scope are reported, a timeout passes, or urgent events or
+retention pressure need a batch. A report is a same-user local call: never
+transport acceptance or processing proof. Holds survive worker restarts; older
+binaries refuse the state and options rather than drop them. [9](#source-9)
+
+[DERIVED] Holding lets events accumulate into fewer batches while a receiver is
+busy, but timeouts and bypasses can still add records and records already
+handed to a sink are never merged, so it is pacing, not a queue bound.
+[9](#source-9)
 They renew bounded idle requests and stop on errors/disconnects. Agent turn
 scheduling remains the harness's responsibility. Status exposes only the worker's
 current registration; optional private handle bookkeeping never proves a wake.
@@ -80,3 +91,4 @@ current registration; optional private handle bookkeeping never proves a wake.
 
 7. <a id="source-7"></a> [Monitor evidence](../digests/monitor.md).
 8. <a id="source-8"></a> [Named delivery](../digests/delivery.md).
+9. <a id="source-9"></a> [Named delivery receipts](../digests/delivery-receipts.md).

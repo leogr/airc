@@ -34,6 +34,7 @@ pub const FEATURES: &[&str] = &[
     "artifact-metadata",
     "named-waiter-status",
     "named-delivery",
+    "named-delivery-receipts",
     "named-show",
     "message-attachments",
 ];

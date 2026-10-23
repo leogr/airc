@@ -10,6 +10,8 @@ use tokio::net::UnixStream;
 
 /// Retained events, the last read and receipts, including JSON escaping.
 const MAX_STATE: u64 = 16 * 1024 * 1024;
+/// A session socket path stays below this many bytes (`sun_path` headroom).
+pub(super) const SOCKET_PATH_BYTES: usize = 100;
 
 pub(super) struct Storage {
     pub dir: PathBuf,
@@ -32,7 +34,7 @@ impl Storage {
         private_dir(&dir, uid)?;
         let store = Self { dir, uid };
         ensure!(
-            store.socket().as_os_str().len() < 100,
+            store.socket().as_os_str().len() < SOCKET_PATH_BYTES,
             "session socket path is too long; choose a shorter --state-dir"
         );
         Ok(store)

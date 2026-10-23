@@ -4,8 +4,8 @@ use super::{
     },
     channels::{Begin, Change, Channels, Request},
     delivery::{
-        self, Batch, Compact, Delivery, Header, Lost, Options, Outcome, Rendering, Settings,
-        prefix, record_reference,
+        self, Batch, Compact, Credit, Delivery, Header, Lost, Options, Outcome, Reason,
+        ReceiptRequest, Release, Rendering, Settings, prefix, record_reference,
     },
     history::{Disposition, Notice},
 };
@@ -35,6 +35,10 @@ const RECEIPT_PREVIEW: usize = 512;
 pub(super) const SEND_TAG: &str = "+airc-send";
 /// Saved-state version written by this release; versions 1 and 2 are read-compatible.
 const VERSION: u8 = 3;
+/// Written once a receipt request is saved, and kept: an older binary then
+/// refuses the state instead of silently dropping an active hold, while state
+/// that never used receipts stays readable by it.
+const RECEIPTS_VERSION: u8 = 4;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +77,14 @@ pub(super) struct State {
     /// consumer registration sets it; only a batch that carries it clears it.
     #[serde(skip)]
     notice_due: bool,
+    /// In memory only: when the active receipt hold ends on this worker's
+    /// clock. Each epoch restores it from the saved UTC deadline.
+    #[serde(skip)]
+    hold_until: Option<Instant>,
+    /// In memory only: this worker's validated canonical state directory, if a
+    /// receipt notice can print it; receipt opt-in is refused without it.
+    #[serde(skip)]
+    receipt_store: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -171,20 +183,31 @@ impl State {
             delivery: None,
             scanned: 0,
             notice_due: false,
+            hold_until: None,
+            receipt_store: None,
         })
     }
 
     pub fn validate(&self) -> Result<()> {
         match (self.version, &self.channels) {
             (1, None) => {}
-            (2 | VERSION, Some(channels)) => channels.validate()?,
+            (2..=RECEIPTS_VERSION, Some(channels)) => channels.validate()?,
             _ => anyhow::bail!("unsupported or malformed session state version"),
         }
         ensure!(
-            self.version == VERSION || self.delivery.is_none(),
-            "delivery state requires session state version {VERSION}"
+            self.version >= 3 || self.delivery.is_none(),
+            "delivery state requires session state version 3"
         );
         if let Some(delivery) = &self.delivery {
+            ensure!(
+                self.version >= RECEIPTS_VERSION
+                    || (delivery.credits.is_empty()
+                        && delivery
+                            .pending
+                            .as_ref()
+                            .is_none_or(|b| b.receipt.is_none())),
+                "delivery receipts require session state version {RECEIPTS_VERSION}"
+            );
             ensure!(
                 delivery.cursor <= self.sequence
                     && delivery.pending.as_ref().is_none_or(|batch| {
@@ -196,7 +219,8 @@ impl State {
                     && delivery
                         .last
                         .as_ref()
-                        .is_none_or(|last| delivery::validate_id(&last.id).is_ok()),
+                        .is_none_or(|last| delivery::validate_id(&last.id).is_ok())
+                    && delivery.credits_valid(),
                 "invalid delivery state"
             );
         }
@@ -227,8 +251,26 @@ impl State {
     }
 
     /// Start this worker's attention clock; call before recording any event.
+    /// A saved active receipt hold resumes on it.
     pub fn begin_epoch(&mut self) {
-        self.clock = Some(Instant::now());
+        let now = Instant::now();
+        self.clock = Some(now);
+        self.restore_hold(chrono::Utc::now(), now);
+    }
+
+    /// Re-arm a saved active hold for the time left until its UTC deadline,
+    /// clamped to [0, its original interval]. This bounds each epoch only:
+    /// time already elapsed plus a wall-clock rollback, or repeated restarts,
+    /// can make its total wall time exceed the interval. Within an epoch only
+    /// the monotonic clock decides.
+    fn restore_hold(&mut self, utc: chrono::DateTime<chrono::Utc>, now: Instant) {
+        let hold = self.delivery.as_ref().and_then(Delivery::hold);
+        self.hold_until = hold.map(|credit| {
+            let left = delivery::time(&credit.deadline)
+                .and_then(|deadline| (deadline - utc).to_std().ok())
+                .unwrap_or_default();
+            now + left.min(Duration::from_secs(credit.timeout))
+        });
     }
 
     fn elapsed(&self) -> Option<Duration> {
@@ -638,8 +680,73 @@ impl State {
                 },
                 pending: None,
                 last: None,
+                credits: VecDeque::new(),
             });
         }
+    }
+
+    /// Keep this worker's canonical state directory for receipt notices when
+    /// it is printable UTF-8; the storage checks that opened it are unchanged.
+    pub fn set_receipt_store(&mut self, root: &std::path::Path) {
+        self.receipt_store = root
+            .to_str()
+            .filter(|root| delivery::valid_store(root, ""))
+            .map(str::to_owned);
+    }
+
+    /// Why a consumer's receipt opt-in cannot be honored, checked before it
+    /// registers or anything changes: the store must print as one complete
+    /// command and every rendering must leave `RECORD_ROOM` bytes for records.
+    pub fn receipt_refusal(&self, session: &str, options: Options) -> Option<String> {
+        let receipt = options.receipt?;
+        let Some(store) = self
+            .receipt_store
+            .as_deref()
+            .filter(|store| delivery::valid_store(store, session))
+        else {
+            return Some(format!(
+                "receipts need a state directory that is an absolute UTF-8 path without control or non-printing characters whose session socket path stays below {} bytes",
+                super::storage::SOCKET_PATH_BYTES
+            ));
+        };
+        let request = receipt_request(store, session, receipt);
+        let reserved = self.reserved(
+            session,
+            options,
+            Some(&request),
+            &uuid::Uuid::nil().to_string(),
+        );
+        (reserved + delivery::RECORD_ROOM > options.max_bytes).then(|| {
+            format!(
+                "the header and notices need {reserved} bytes and {} more must remain for records; raise --max-bytes to at least {}",
+                delivery::RECORD_ROOM,
+                reserved + delivery::RECORD_ROOM
+            )
+        })
+    }
+
+    /// Bytes every rendering of a batch reserves before its records: the widest
+    /// header, the settings notice and any receipt notice.
+    fn reserved(
+        &self,
+        session: &str,
+        options: Options,
+        receipt: Option<&ReceiptRequest>,
+        id: &str,
+    ) -> usize {
+        let header = Header {
+            id,
+            session,
+            events: 0,
+            context: 0,
+            more: false,
+            gap: false,
+        };
+        header.bound()
+            + Settings::new(safe(&self.account), safe(&self.nick), options)
+                .notice()
+                .len()
+            + receipt.map_or(0, |request| request.notice(id).len())
     }
 
     pub fn pending_delivery(&self) -> Option<&Batch> {
@@ -678,7 +785,8 @@ impl State {
     /// delivery cursor within `max_bytes`, header included. Without a relevant
     /// record or gap, only the in-memory scan floor advances and nothing is made.
     /// The settings notice is budgeted in every batch so its retry and its
-    /// inspection, which always show it, fit the same limit.
+    /// inspection, which always show it, fit the same limit; so is the receipt
+    /// notice that every rendering of a receipt-enabled batch carries.
     pub fn prepare_delivery(
         &mut self,
         session: &str,
@@ -692,6 +800,12 @@ impl State {
         let (after, gap) = (delivery.cursor, delivery.lost.any(mode));
         let id = uuid::Uuid::new_v4().to_string();
         let settings = Settings::new(safe(&self.account), safe(&self.nick), options);
+        // Registration refused receipts unless this store prints and fits.
+        let receipt = match (options.receipt, self.receipt_store.as_deref()) {
+            (Some(receipt), Some(store)) => Some(receipt_request(store, session, receipt)),
+            (Some(_), None) => return None,
+            (None, _) => None,
+        };
         let header = Header {
             id: &id,
             session,
@@ -700,7 +814,8 @@ impl State {
             more: false,
             gap,
         };
-        let budget = max_bytes.saturating_sub(header.bound() + settings.notice().len());
+        let reserved = self.reserved(session, options, receipt.as_ref(), &id);
+        let budget = max_bytes.saturating_sub(reserved);
         let mut records = String::new();
         if gap {
             records.push_str("! GAP: undelivered events relevant to this consumer were evicted from the 512-event buffer; context is incomplete.\n");
@@ -765,8 +880,12 @@ impl State {
             header,
             records,
             compact: Some(Compact { settings, notice }),
+            receipt,
         };
         let text = batch.render(Rendering::First);
+        if batch.receipt.is_some() {
+            self.version = RECEIPTS_VERSION;
+        }
         delivery.pending = Some(batch);
         self.notice_due = false;
         Some((id, text))
@@ -774,6 +893,8 @@ impl State {
 
     /// Accept (the sink took it, not proof of processing) or drop the pending
     /// batch named by its exact ID, moving only the delivery cursor past it.
+    /// Accepting a receipt-enabled batch records it and, unless its receiver
+    /// already reported it, starts its hold. Exit 0 is never a receipt.
     pub fn finish_delivery(&mut self, id: &str, kind: &'static str) -> Result<String> {
         let delivery = self.delivery.as_mut().context("no delivery state")?;
         let Some(batch) = delivery.pending.take_if(|batch| batch.id == id) else {
@@ -784,14 +905,133 @@ impl State {
         };
         // The batch reported its own losses; any recorded since are above it.
         delivery.cursor = batch.through;
-        let at = now();
-        let text = format!("{kind} {id} at {at}");
+        let accepted = chrono::Utc::now();
+        let at = stamp(accepted);
+        let mut text = format!("{kind} {id} at {at}");
         delivery.last = Some(Outcome {
             id: id.into(),
             kind: kind.into(),
-            at,
+            at: at.clone(),
         });
+        if kind == "accepted"
+            && let Some(request) = batch.receipt
+        {
+            let deadline = stamp(accepted + chrono::Duration::seconds(request.timeout as i64));
+            let early = request.received.is_some();
+            text.push_str(&if early {
+                "; its receipt was already reported, so nothing is held".into()
+            } else {
+                format!("; later batches are held until its receipt or {deadline}")
+            });
+            delivery.credit(Credit {
+                id: id.into(),
+                scope: request.scope,
+                accepted: at.clone(),
+                timeout: request.timeout,
+                deadline,
+                released: early.then_some(Release {
+                    reason: Reason::Received,
+                    at,
+                }),
+                received: request.received,
+            });
+            if !early {
+                self.hold_until = Some(Instant::now() + Duration::from_secs(request.timeout));
+            }
+        }
         Ok(text)
+    }
+
+    /// Record the receiver's report for this exact batch ID and scope before
+    /// any reply. It is idempotent and never transport acceptance: a pending
+    /// batch stays pending. Only the active hold of that same batch is
+    /// released; a late report for an older batch never releases a newer one.
+    /// Unknown IDs, other scopes and batches without a request change nothing.
+    pub fn mark_received(&mut self, id: &str, scope: &str) -> Result<String> {
+        let unchanged = "nothing was changed";
+        let delivery = self
+            .delivery
+            .as_mut()
+            .with_context(|| format!("no delivery state; {unchanged}"))?;
+        if let Some(batch) = delivery.pending.as_mut().filter(|batch| batch.id == id) {
+            let request = batch
+                .receipt
+                .as_mut()
+                .with_context(|| format!("delivery {id} requested no receipt; {unchanged}"))?;
+            ensure!(
+                request.scope == scope,
+                "delivery {id} requested receipt for another scope; {unchanged}"
+            );
+            let first = request.received.get_or_insert_with(now).clone();
+            return Ok(format!(
+                "received {id} at {first}; its transport acceptance is still pending"
+            ));
+        }
+        let Some(credit) = delivery.credits.iter_mut().find(|credit| credit.id == id) else {
+            anyhow::bail!("no pending or retained receipt-enabled delivery {id}; {unchanged}");
+        };
+        ensure!(
+            credit.scope == scope,
+            "delivery {id} requested receipt for another scope; {unchanged}"
+        );
+        let first = credit.received.get_or_insert_with(now).clone();
+        Ok(match &credit.released {
+            None => {
+                credit.released = Some(Release {
+                    reason: Reason::Received,
+                    at: now(),
+                });
+                self.hold_until = None;
+                format!("received {id} at {first}; its hold is released")
+            }
+            Some(release) => format!(
+                "received {id} at {first}; its hold had already ended: {} at {}",
+                release.reason.name(),
+                release.at
+            ),
+        })
+    }
+
+    /// Whether an accepted batch still holds later ones.
+    pub fn holding(&self) -> bool {
+        self.delivery.as_ref().and_then(Delivery::hold).is_some()
+    }
+
+    /// End the active hold for `reason` (never `received`, which only a report
+    /// records), e.g. when the batch it yields to was just made.
+    pub fn release_hold(&mut self, reason: Reason) {
+        if let Some(credit) = self.delivery.as_mut().and_then(Delivery::hold_mut) {
+            credit.released = Some(Release { reason, at: now() });
+        }
+        self.hold_until = None;
+    }
+
+    /// End an active hold whose deadline passed on this worker's clock, with
+    /// no receipt claimed. A hold without a restored deadline ends at once.
+    pub fn expire_hold(&mut self, now: Instant) -> bool {
+        if !self.holding() || self.hold_until.is_some_and(|until| now < until) {
+            return false;
+        }
+        self.release_hold(Reason::Expired);
+        true
+    }
+
+    /// Whether unread retained events above the delivery floor reach the
+    /// attention engine's own high-water mark.
+    pub fn delivery_pressure(&self) -> bool {
+        let floor = self
+            .delivery
+            .as_ref()
+            .map_or(self.cursor, |d| d.cursor)
+            .max(self.scanned);
+        let (count, bytes) = self
+            .events
+            .iter()
+            .filter(|e| e.sequence > floor)
+            .fold((0, 0), |(count, bytes), e| {
+                (count + 1, bytes + e.text.len())
+            });
+        attention::high_water(count, bytes, RETAIN, RETAIN_BYTES)
     }
 
     /// Forget a batch nobody received: its caller left before any reply byte.
@@ -810,8 +1050,15 @@ impl State {
             return "delivery: unused\n".into();
         };
         let pending = delivery.pending.as_ref().map_or("none".into(), |batch| {
+            let receipt = batch.receipt.as_ref().map_or(String::new(), |request| {
+                format!(
+                    " receipt-scope={} received={}",
+                    request.scope,
+                    request.received.as_deref().unwrap_or("none")
+                )
+            });
             format!(
-                "{} since={} events={}..{}",
+                "{} since={} events={}..{}{receipt}",
                 batch.id,
                 batch.created,
                 batch.after + 1,
@@ -821,10 +1068,39 @@ impl State {
         let last = delivery.last.as_ref().map_or("none".into(), |outcome| {
             format!("{} {}={}", outcome.id, outcome.kind, outcome.at)
         });
-        format!(
+        let mut text = format!(
             "delivery: cursor={} pending={pending} last={last}\n",
             delivery.cursor
-        )
+        );
+        // Receipt holds are local pacing state, never queue depth or processing.
+        if let Some(newest) = delivery.credits.back() {
+            text.push_str(&match &newest.released {
+                None => format!(
+                    "delivery receipt: hold={} scope={} accepted={} deadline={}\n",
+                    newest.id, newest.scope, newest.accepted, newest.deadline
+                ),
+                Some(release) => format!(
+                    "delivery receipt: hold=none last={} released={} at={} received={}\n",
+                    newest.id,
+                    release.reason.name(),
+                    release.at,
+                    newest.received.as_deref().unwrap_or("none")
+                ),
+            });
+        }
+        text
+    }
+
+    /// Every retained receipt record, newest first.
+    pub fn describe_credits(&self) -> String {
+        self.delivery.as_ref().map_or(String::new(), |delivery| {
+            delivery
+                .credits
+                .iter()
+                .rev()
+                .map(Credit::describe)
+                .collect()
+        })
     }
 
     /// Frames for one send: a single PRIVMSG, or one multiline batch when the
@@ -914,7 +1190,7 @@ impl State {
         if self.version == 1 {
             self.channels = Some(Channels::seeded(&config.channels)?);
         }
-        self.version = VERSION;
+        self.version = self.version.max(VERSION);
         if let Some(notice) = self
             .channels_mut()
             .interrupt("the previous worker ended before confirmation")
@@ -1124,7 +1400,25 @@ fn sender(message: &Message) -> (&str, &str) {
 }
 
 fn now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    stamp(chrono::Utc::now())
+}
+
+fn receipt_request(
+    store: &str,
+    session: &str,
+    receipt: delivery::ReceiptOptions,
+) -> ReceiptRequest {
+    ReceiptRequest {
+        store: store.into(),
+        session: session.into(),
+        scope: receipt.scope.hyphenated().to_string(),
+        timeout: receipt.timeout,
+        received: None,
+    }
+}
+
+fn stamp(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 pub(super) fn identity(config: &ClientConfig) -> Result<String> {
@@ -1556,6 +1850,7 @@ mod tests {
     fn delivering() -> State {
         let mut s = state();
         s.begin_epoch();
+        s.set_receipt_store(std::path::Path::new("/srv/airc"));
         s
     }
 
@@ -1569,6 +1864,7 @@ mod tests {
             max_bytes,
             min_interval: 0,
             wrap: delivery::Wrap::Off,
+            receipt: None,
         }
     }
 
@@ -1883,6 +2179,7 @@ mod tests {
             max_bytes: 4096,
             min_interval: 15,
             wrap: delivery::Wrap::Bytes(2560),
+            receipt: None,
         };
         let (id, text) = s.prepare_delivery("trial", first).unwrap();
         assert!(!noted(&text), "{text}");
@@ -1945,6 +2242,7 @@ mod tests {
             max_bytes: delivery::MIN_BYTES,
             min_interval: delivery::MAX_INTERVAL,
             wrap: delivery::Wrap::Unknown,
+            receipt: None,
         };
         let check = |s: &State| {
             let batch = s.pending_delivery().unwrap();
@@ -1982,6 +2280,389 @@ mod tests {
             "{text}"
         );
         check(&s);
+    }
+
+    const SCOPE: &str = "019a0000-0000-7000-8000-00000000c0de";
+    const UNKNOWN: &str = "00000000-0000-4000-8000-000000000000";
+
+    fn receipt_opts(max_bytes: usize, timeout: u64) -> Options {
+        Options {
+            receipt: Some(delivery::ReceiptOptions {
+                timeout,
+                scope: uuid::Uuid::parse_str(SCOPE).unwrap(),
+            }),
+            ..opts(WakeMode::Mentions, max_bytes)
+        }
+    }
+
+    /// A pending receipt-enabled batch for one fresh mention.
+    fn requested(s: &mut State, n: usize) -> String {
+        s.ingest(&chat(&format!("@Alice r{n}"), &format!("r{n}")), false);
+        s.prepare_delivery("trial", receipt_opts(8192, 60))
+            .unwrap()
+            .0
+    }
+
+    fn credit<'a>(s: &'a State, id: &str) -> &'a Credit {
+        let delivery = s.delivery.as_ref().unwrap();
+        delivery.credits.iter().find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn receipt_requests_are_budgeted_and_rendered_in_every_batch() {
+        let mut s = delivering();
+        s.begin_delivery();
+        s.ingest(&chat("@Alice one", "m1"), false);
+        let (id, text) = s.prepare_delivery("trial", receipt_opts(8192, 60)).unwrap();
+        let notice = format!(
+            "! receipt requested: scope={SCOPE} timeout=60s; check the scope, then report receipt once before other work: airc --state-dir /srv/airc deliveries trial --mark-received {id} --receipt-scope {SCOPE}"
+        );
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], format!("[airc id={id} session=trial]"));
+        assert!(lines[1].starts_with("! delivery settings: "), "{text}");
+        assert_eq!(lines[2], notice);
+        assert!(lines[3].contains("@Alice one"), "{text}");
+        let batch = s.pending_delivery().unwrap();
+        for rendering in [Rendering::First, Rendering::Retry, Rendering::Inspect] {
+            assert_eq!(batch.render(rendering).matches(&notice).count(), 1);
+        }
+        assert!(
+            s.describe_delivery()
+                .contains(&format!(" receipt-scope={SCOPE} received=none last="))
+        );
+        s.finish_delivery(&id, "accepted").unwrap();
+        // The notice is reserved like the settings notice. With the longest
+        // store the smallest byte bound accepts, every rendering of a full
+        // batch still fits; one more quoted byte is refused at registration.
+        let options = receipt_opts(delivery::MIN_BYTES, delivery::MAX_RECEIPT_TIMEOUT);
+        let store = |n: usize| format!("/{}", "'".repeat(n));
+        let longest = (1..100)
+            .rev()
+            .find(|&n| {
+                let mut s = delivering();
+                s.set_receipt_store(std::path::Path::new(&store(n)));
+                s.receipt_refusal("trial", options).is_none()
+            })
+            .unwrap();
+        let mut s = delivering();
+        s.set_receipt_store(std::path::Path::new(&store(longest + 1)));
+        let refused = s.receipt_refusal("trial", options).unwrap();
+        assert!(refused.contains("raise --max-bytes"), "{refused}");
+        s.set_receipt_store(std::path::Path::new(&store(longest)));
+        s.begin_delivery();
+        for n in 0..12 {
+            s.ingest(
+                &chat(&format!("@Alice {n} {}", "x".repeat(150)), &format!("m{n}")),
+                false,
+            );
+        }
+        let (id, text) = s.prepare_delivery("trial", options).unwrap();
+        assert!(flag(header_of(&text), "more"), "{text}");
+        assert!(text.contains(&format!(
+            "--state-dir '/{}' deliveries",
+            "'\\''".repeat(longest)
+        )));
+        let batch = s.pending_delivery().unwrap();
+        for rendering in [Rendering::First, Rendering::Retry, Rendering::Inspect] {
+            let rendered = batch.render(rendering);
+            assert!(rendered.len() <= delivery::MIN_BYTES, "{}", rendered.len());
+            assert!(rendered.contains(&format!("--mark-received {id} ")));
+        }
+        // A retry renders the saved store, not a later worker's.
+        s.set_receipt_store(std::path::Path::new("/elsewhere"));
+        assert!(
+            s.pending_delivery()
+                .unwrap()
+                .render(Rendering::Retry)
+                .contains(&format!("--state-dir '/{}'", "'\\''".repeat(longest)))
+        );
+        // Without a request nothing changes: no notice, no saved request.
+        let mut s = delivering();
+        s.begin_delivery();
+        s.ingest(&chat("@Alice plain", "p1"), false);
+        let (_, text) = s
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+            .unwrap();
+        assert!(!text.contains("receipt"), "{text}");
+        let saved = serde_json::to_value(&s).unwrap();
+        assert!(saved["delivery"]["pending"].get("receipt").is_none());
+        assert!(saved["delivery"].get("credits").is_none());
+    }
+
+    #[test]
+    fn receipt_opt_in_is_refused_without_a_printable_store_or_room() {
+        let options = receipt_opts(8192, 60);
+        let mut s = state();
+        s.begin_epoch();
+        // No store recorded, relative, control or non-printing characters, or
+        // a session socket path at the Storage::open bound.
+        assert!(s.receipt_refusal("trial", options).is_some());
+        for root in ["relative/store", "/tmp/a\nb", "/tmp/a\u{202e}b"] {
+            s.set_receipt_store(std::path::Path::new(root));
+            assert!(s.receipt_refusal("trial", options).is_some(), "{root:?}");
+        }
+        // The socket path STORE/trial/client.sock must stay below 100 bytes.
+        let store = |n: usize| format!("/{}", "a".repeat(n - 1));
+        let limit = 100 - "/trial/client.sock".len();
+        s.set_receipt_store(std::path::Path::new(&store(limit)));
+        assert!(s.receipt_refusal("trial", options).is_some());
+        s.set_receipt_store(std::path::Path::new(&store(limit - 1)));
+        assert!(s.receipt_refusal("trial", options).is_none());
+        // Spaces, apostrophes and shell syntax are supported, quoted.
+        s.set_receipt_store(std::path::Path::new("/tmp/a b'c$(x)`y`"));
+        assert!(s.receipt_refusal("trial", options).is_none());
+        assert!(
+            s.receipt_refusal("trial", opts(WakeMode::Mentions, 8192))
+                .is_none()
+        );
+        let refused = s
+            .receipt_refusal("trial", receipt_opts(delivery::MIN_BYTES, 60))
+            .is_none();
+        assert!(refused, "a short quoted store fits the smallest bound");
+    }
+
+    #[test]
+    fn receipts_never_accept_and_release_only_their_own_hold() {
+        let mut s = delivering();
+        s.begin_delivery();
+        let a = requested(&mut s, 1);
+        let cursor = s.delivery.as_ref().unwrap().cursor;
+        let other = "019a0000-0000-7000-8000-00000000beef";
+        let refused = s.mark_received(&a, other).unwrap_err().to_string();
+        assert!(refused.contains("another scope") && refused.contains("nothing was changed"));
+        assert!(s.mark_received(UNKNOWN, SCOPE).is_err());
+        assert!(
+            s.pending_delivery()
+                .unwrap()
+                .receipt
+                .as_ref()
+                .unwrap()
+                .received
+                .is_none()
+        );
+        // An early report is recorded on the pending batch, which stays pending.
+        let early = s.mark_received(&a, SCOPE).unwrap();
+        assert!(
+            early.contains("transport acceptance is still pending"),
+            "{early}"
+        );
+        assert_eq!(s.mark_received(&a, SCOPE).unwrap(), early, "idempotent");
+        assert_eq!(s.pending_delivery().unwrap().id, a);
+        assert_eq!(s.delivery.as_ref().unwrap().cursor, cursor);
+        // Its acceptance then holds nothing.
+        let accepted = s.finish_delivery(&a, "accepted").unwrap();
+        assert!(accepted.contains("nothing is held"), "{accepted}");
+        assert!(!s.holding() && s.hold_until.is_none());
+        let first = credit(&s, &a);
+        assert_eq!(first.released.as_ref().unwrap().reason, Reason::Received);
+        assert_eq!(first.released.as_ref().unwrap().at, first.accepted);
+        // Acceptance without a report holds later batches.
+        let b = requested(&mut s, 2);
+        let accepted = s.finish_delivery(&b, "accepted").unwrap();
+        assert!(accepted.contains("later batches are held"), "{accepted}");
+        assert!(s.holding() && s.hold_until.is_some());
+        assert!(
+            s.describe_delivery()
+                .contains(&format!("delivery receipt: hold={b} scope={SCOPE} "))
+        );
+        // A bypass ends B's hold; C's hold then ignores B's late report.
+        s.release_hold(Reason::Pressure);
+        let c = requested(&mut s, 3);
+        s.finish_delivery(&c, "accepted").unwrap();
+        let late = s.mark_received(&b, SCOPE).unwrap();
+        assert!(late.contains("already ended: pressure"), "{late}");
+        assert!(s.holding());
+        assert!(credit(&s, &b).received.is_some());
+        assert_eq!(
+            credit(&s, &b).released.as_ref().unwrap().reason,
+            Reason::Pressure
+        );
+        // C's own report releases it, once.
+        assert!(
+            s.mark_received(&c, SCOPE)
+                .unwrap()
+                .contains("hold is released")
+        );
+        assert!(!s.holding() && s.hold_until.is_none());
+        let repeated = s.mark_received(&c, SCOPE).unwrap();
+        assert!(repeated.contains("already ended: received"), "{repeated}");
+        // A reverted or dropped batch leaves no receipt to report.
+        let d = requested(&mut s, 4);
+        s.mark_received(&d, SCOPE).unwrap();
+        s.revert_delivery(&d);
+        assert!(s.mark_received(&d, SCOPE).is_err());
+        let e = requested(&mut s, 5);
+        s.finish_delivery(&e, "dropped").unwrap();
+        assert!(s.mark_received(&e, SCOPE).is_err() && !s.holding());
+        // A batch assembled without a request never takes a report or holds.
+        s.ingest(&chat("@Alice plain", "p1"), false);
+        let (f, _) = s
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+            .unwrap();
+        let refused = s.mark_received(&f, SCOPE).unwrap_err().to_string();
+        assert!(refused.contains("requested no receipt"), "{refused}");
+        s.finish_delivery(&f, "accepted").unwrap();
+        assert!(!s.holding());
+        let ledger = s.describe_credits();
+        assert_eq!(ledger.lines().count(), 3, "{ledger}");
+        assert!(ledger.lines().all(|line| line.contains(" released=")));
+        let restored: State = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        restored.validate().unwrap();
+    }
+
+    #[test]
+    fn holds_expire_on_the_monotonic_clock_and_restore_clamped_across_restarts() {
+        let mut s = delivering();
+        s.begin_delivery();
+        let a = requested(&mut s, 1);
+        s.finish_delivery(&a, "accepted").unwrap();
+        let until = s.hold_until.unwrap();
+        assert!(!s.expire_hold(until - Duration::from_millis(1)) && s.holding());
+        let saved = serde_json::to_vec(&s).unwrap();
+        let deadline = delivery::time(&credit(&s, &a).deadline).unwrap();
+        let now = Instant::now();
+        let mut restarted: State = serde_json::from_slice(&saved).unwrap();
+        restarted.validate().unwrap();
+        // The time left until the saved deadline...
+        restarted.restore_hold(deadline - chrono::Duration::seconds(20), now);
+        assert_eq!(restarted.hold_until, Some(now + Duration::from_secs(20)));
+        // ...never more than the original interval after the clock moved back...
+        restarted.restore_hold(deadline - chrono::Duration::hours(1), now);
+        assert_eq!(restarted.hold_until, Some(now + Duration::from_secs(60)));
+        // ...and nothing once it moved past the deadline.
+        restarted.restore_hold(deadline + chrono::Duration::seconds(1), now);
+        assert_eq!(restarted.hold_until, Some(now));
+        assert!(restarted.expire_hold(now) && !restarted.expire_hold(now));
+        let expired = credit(&restarted, &a);
+        assert!(expired.received.is_none());
+        assert_eq!(expired.released.as_ref().unwrap().reason, Reason::Expired);
+        // A late report is still kept apart from the expiry.
+        let late = restarted.mark_received(&a, SCOPE).unwrap();
+        assert!(late.contains("already ended: expired"), "{late}");
+        // A hold with no restored deadline ends instead of holding forever.
+        let mut unrestored: State = serde_json::from_slice(&saved).unwrap();
+        assert!(unrestored.holding() && unrestored.expire_hold(Instant::now()));
+        // The original epoch expires at its own monotonic deadline.
+        assert!(s.expire_hold(until) && !s.holding());
+    }
+
+    #[test]
+    fn the_receipt_ledger_is_bounded_and_strictly_validated() {
+        let mut s = delivering();
+        s.begin_delivery();
+        let total = delivery::CREDITS + 3;
+        let mut ids = Vec::new();
+        for n in 0..total {
+            let id = requested(&mut s, n);
+            s.finish_delivery(&id, "accepted").unwrap();
+            if n + 1 < total {
+                s.release_hold(Reason::Expired);
+            }
+            ids.push(id);
+        }
+        let delivery = s.delivery.as_ref().unwrap();
+        assert_eq!(delivery.credits.len(), delivery::CREDITS);
+        assert_eq!(delivery.credits.front().unwrap().id, ids[3]);
+        assert_eq!(delivery.hold().unwrap().id, ids[total - 1]);
+        assert!(s.mark_received(&ids[0], SCOPE).is_err(), "evicted");
+        s.release_hold(Reason::Urgent);
+        let pending = requested(&mut s, total);
+        s.validate().unwrap();
+        let value = serde_json::to_value(&s).unwrap();
+        // Malformed saved state is refused, never reset.
+        let refused = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = value.clone();
+            edit(&mut v);
+            serde_json::from_value::<State>(v)
+                .ok()
+                .is_none_or(|state| state.validate().is_err())
+        };
+        assert!(!refused(&|_| {}));
+        assert!(refused(&|v| {
+            let copy = v["delivery"]["credits"][0].clone();
+            v["delivery"]["credits"][1] = copy;
+        }));
+        assert!(refused(&|v| {
+            let copy = v["delivery"]["credits"][1].clone();
+            v["delivery"]["credits"].as_array_mut().unwrap().push(copy);
+        }));
+        assert!(refused(&|v| {
+            v["delivery"]["credits"][0]["released"] = serde_json::Value::Null;
+        }));
+        assert!(refused(&|v| {
+            let accepted = v["delivery"]["credits"][0]["accepted"].clone();
+            v["delivery"]["credits"][0]["deadline"] = accepted;
+        }));
+        assert!(refused(&|v| {
+            v["delivery"]["credits"][0]["scope"] = SCOPE.to_uppercase().into();
+        }));
+        assert!(refused(
+            &|v| v["delivery"]["credits"][0]["timeout"] = 0.into()
+        ));
+        assert!(refused(
+            &|v| v["delivery"]["credits"][0]["extra"] = true.into()
+        ));
+        assert!(refused(&|v| {
+            v["delivery"]["credits"][0]["released"]["reason"] = "received".into();
+        }));
+        assert!(refused(&|v| {
+            v["delivery"]["credits"][0]["id"] = pending.as_str().into();
+        }));
+        // Version-3 state cannot carry receipts; versions above 4 are refused.
+        assert!(refused(&|v| v["version"] = 3.into()));
+        assert!(refused(&|v| v["version"] = 5.into()));
+    }
+
+    #[test]
+    fn version_three_delivery_state_upgrades_without_retrofitting_receipts() {
+        let mut s = delivering();
+        s.begin_delivery();
+        s.ingest(&chat("@Alice legacy", "l1"), false);
+        let (id, text) = s
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+            .unwrap();
+        let mut v3 = serde_json::to_value(&s).unwrap();
+        v3["version"] = 3.into();
+        let mut legacy: State = serde_json::from_value(v3).unwrap();
+        legacy.validate().unwrap();
+        legacy.begin_epoch();
+        legacy.set_receipt_store(std::path::Path::new("/srv/airc"));
+        legacy.upgrade(&config()).unwrap();
+        assert_eq!(legacy.version, VERSION);
+        // Its pending batch keeps its rendering and takes no receipt.
+        let batch = legacy.pending_delivery().unwrap();
+        assert_eq!(batch.render(Rendering::First), text);
+        assert!(legacy.mark_received(&id, SCOPE).is_err());
+        legacy.finish_delivery(&id, "accepted").unwrap();
+        assert!(!legacy.holding());
+        legacy.validate().unwrap();
+        // Only a saved receipt request moves it to version 4, for good.
+        assert_eq!(legacy.version, VERSION);
+        let requested = requested(&mut legacy, 1);
+        assert_eq!(legacy.version, RECEIPTS_VERSION);
+        legacy.revert_delivery(&requested);
+        legacy.upgrade(&config()).unwrap();
+        assert_eq!(legacy.version, RECEIPTS_VERSION);
+        legacy.validate().unwrap();
+    }
+
+    #[test]
+    fn retention_pressure_uses_the_attention_high_water_above_the_delivery_floor() {
+        let mut s = delivering();
+        s.begin_delivery();
+        let mark = RETAIN - RETAIN / 4;
+        for n in 1..mark {
+            s.ingest(&chat(&format!("chatter {n}"), &format!("c{n}")), false);
+        }
+        assert!(!s.delivery_pressure());
+        s.ingest(&chat("chatter last", "c-last"), false);
+        assert!(s.delivery_pressure());
+        // Irrelevant traffic alone makes no batch; scanning it clears the pressure.
+        assert!(
+            s.prepare_delivery("trial", opts(WakeMode::Mentions, 8192))
+                .is_none()
+        );
+        assert!(!s.delivery_pressure());
     }
 
     #[test]

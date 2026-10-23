@@ -286,6 +286,18 @@ impl fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+/// Retention pressure: unread retained events at ceil(3 * capacity / 4) of
+/// either bound, without multiplication overflow. Only UNREAD retained events
+/// count; an old full transcript cannot force busy polling.
+pub(super) fn high_water(
+    unread: usize,
+    unread_bytes: usize,
+    capacity: usize,
+    byte_capacity: usize,
+) -> bool {
+    unread >= capacity - capacity / 4 || unread_bytes >= byte_capacity - byte_capacity / 4
+}
+
 /// Evaluate without consuming anything, allocating, or depending on an active
 /// waiter. Work is bounded by `capacity + 1` stamps. A read advances only the
 /// caller's cursor; recomputing from its remaining events preserves later alerts.
@@ -364,10 +376,12 @@ pub(super) fn readiness(
         return Err(SnapshotError::InvalidSequence);
     }
     gap |= unread_count == 0 && snapshot.sequence > snapshot.cursor;
-    // ceil(3 * capacity / 4), without multiplication overflow. Only UNREAD
-    // retained events count; an old full transcript cannot force busy polling.
-    let high_water = unread_count >= snapshot.capacity - snapshot.capacity / 4
-        || unread_bytes >= snapshot.byte_capacity - snapshot.byte_capacity / 4;
+    let high_water = high_water(
+        unread_count,
+        unread_bytes,
+        snapshot.capacity,
+        snapshot.byte_capacity,
+    );
     if critical || gap || high_water || restored_relevant {
         return Ok(Readiness::Ready);
     }

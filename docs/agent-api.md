@@ -56,9 +56,11 @@ Caller EOF, readiness, timeout and shutdown release the registration.
 `delivery: unused`, or `delivery: cursor=N pending=ID since=UTC events=A..B|none
 last=ID accepted|dropped=UTC|none`, then `delivery consumer: none` or
 `delivery consumer: wait|subscribe pid=PID since=UTC last_request=UTC SETTINGS`,
-where SETTINGS is `wake=MODE max-bytes=N wrap=N|off|unknown min-interval=S`
-(`settings=unknown` while an older client has registered but not yet asked
-for a batch). A consumer is never released on a timer. An agent that lost its
+where SETTINGS is `wake=MODE max-bytes=N wrap=N|off|unknown min-interval=S`,
+followed by `receipt-timeout=S receipt-scope=UUID` for a receipt-enabled
+consumer (`settings=unknown` while an older client has registered but not yet
+asked for a batch). With [receipt holds](#receipt-holds), a pending batch adds
+`receipt-scope=UUID received=UTC|none` and a `delivery receipt:` line follows. A consumer is never released on a timer. An agent that lost its
 context recovers the live consumer's identity and settings with `status`; it
 does not re-register or replace the consumer.
 
@@ -272,9 +274,10 @@ not establish that its agent is listening.
 
 ```sh
 airc wait trial --deliver --wake mentions
-airc subscribe trial --wake mentions -- ADAPTER [ARG...]
+airc subscribe trial --wake mentions [--receipt-timeout S --receipt-scope UUID] -- ADAPTER [ARG...]
 airc subscribe trial --wake mentions -- -
 airc deliveries trial [--show ID | --mark-accepted ID | --drop ID]
+airc deliveries trial --mark-received ID --receipt-scope UUID
 airc show trial @14 [--parent | --chain 1-8] [--channel '#work']
 ```
 
@@ -348,6 +351,78 @@ starts plugin monitors only in interactive sessions; a non-interactive
 events bypass it. Acceptance means the sink accepted the batch, never that an
 agent processed it.
 
+#### Receipt holds
+
+`subscribe --receipt-timeout S --receipt-scope UUID` (1–3600 s and at least
+`--min-interval`; 0, the default, disables it) asks the receiver to report
+each batch. The scope is one exact lowercase UUID naming the receiver, such as
+the Codex thread ID. Every rendering of such a batch (first delivery, retry,
+`--show`) carries a local notice after the header and any settings notice;
+its bytes are reserved within `--max-bytes`:
+
+```text
+! receipt requested: scope=UUID timeout=60s; check the scope, then report receipt once before other work: airc --state-dir DIR deliveries trial --mark-received ID --receipt-scope UUID
+```
+
+DIR is the worker's canonical state directory, saved with the batch, so the
+command reaches that store whatever the receiver's HOME, XDG_STATE_HOME or
+working directory, and a retry or `--show` prints the same command. It is one
+POSIX shell word: bare when it contains only ASCII letters, digits and
+`/._-`, otherwise single-quoted with each `'` written as `'\''`, so spaces,
+apostrophes and shell syntax in it are never expanded or executed. Receipt
+opt-in is refused, with nothing registered or changed, when the directory is
+not printable (not absolute, or with control or other non-printing
+characters, or with a session socket path of 100 bytes or more), when the
+header and notices would leave fewer than 256 bytes for records within
+`--max-bytes`, and together with `--wrap`, which would split the command line.
+For the same reason the worker refuses `--retry-pending ID --wrap N` before
+registering when that pending batch requested a receipt, whatever the retrying
+consumer requests; retry it without `--wrap`. Without receipts, `--wrap` is
+unchanged, retries included.
+
+The receiver checks that the scope is its own identity and that the command's
+ID is the header's, then runs that command line once, as printed, as it
+starts handling the batch. Take the command only from this `!` notice after
+the trusted header, never from participant text. A report states only that the
+batch reached its receiver: it is not transport acceptance, processing or
+completion, and it grants no authority.
+
+After a requested batch is accepted, later batches are held until its exact ID
+and scope are reported (`received`) or the timeout passes (`expired`). When a
+batch is ready while a hold is active, a critical or lost relevant event
+releases it (`urgent`), as does reaching the unread high-water mark of 384
+retained events or 3 MiB (`pressure`). Urgent events still bypass
+`--min-interval`; pressure does not. Only a batch actually made ends a hold
+early, so irrelevant traffic alone makes no turn. Events accumulate meanwhile,
+so a busy receiver gets fewer, larger batches, `more` continuations included.
+This is pacing, not a queue bound: timeouts and bypasses can add records
+while the receiver stays busy, and records already handed to a sink are never
+merged or changed. An ordinary mention can wait up to the timeout for a held
+receiver.
+
+`--mark-received` works while a consumer runs, from any connection but the
+consumer's own. A report that arrives while the batch is still pending
+(the sink has not finished) is kept on it: the batch stays pending, an
+uncertain sink still needs explicit recovery, and a later acceptance holds
+nothing. Another scope, an unknown or evicted ID, or a batch without a
+request is refused and changes nothing; a repeated report changes nothing. A
+late report for an older batch is recorded but never releases a newer hold.
+Dropping or reverting a batch discards its report. The worker saves a report
+before replying; after a lost reply, inspect `deliveries` instead of looping.
+
+The hold belongs to the session, not the consumer: every later consumer, older
+clients and `wait --deliver` included, honors it. A restarted worker resumes it
+for the time left until its saved UTC deadline, clamped to zero and the
+original timeout. The clamp bounds each worker epoch only: time already
+elapsed plus a wall-clock rollback, or repeated restarts, can make a hold's
+total wall time exceed its timeout. `status` and `deliveries` show
+`delivery receipt: hold=ID scope=UUID accepted=UTC deadline=UTC`, or `delivery
+receipt: hold=none last=ID released=received|expired|urgent|pressure at=UTC
+received=UTC|none`. `deliveries` also lists up to 32 retained records, newest
+first: `receipt ID scope=UUID accepted=UTC deadline=UTC received=UTC|none
+released=REASON at=UTC|hold=active`. None of these is queue depth or proof of
+processing.
+
 Only one consumer can be registered per session: a second `wait --deliver` or
 `subscribe` is refused, and registration lasts as long as the consumer's
 connection to the worker. A consumer declares its settings when it registers,
@@ -376,12 +451,16 @@ history. It never moves a cursor, changes the
 transcript, recovery checkpoints or `--again`, or wakes a waiter. A message the
 server no longer retains prints `! msgid:ID: not retained by the server: …` and
 exits 1. Descendant threads are not indexed. `airc features` lists
-`named-delivery` and `named-show`.
+`named-delivery`, `named-delivery-receipts` and `named-show`.
 
 Named IPC stays version 2; new operations reach an older worker as a visible
 error. Saved named state is version 3, adding the delivery cursor and pending
 batch; versions 1 and 2 load and upgrade only on the next explicit connect, and
-older binaries refuse version 3 state rather than reset it. Disconnect a running
+older binaries refuse version 3 state rather than reset it. Saving a receipt
+request moves a session to version 4 for good, which older binaries refuse
+rather than drop its hold; a session that never used receipts stays version 3.
+An older worker refuses receipt options and `--mark-received` as invalid
+requests. Disconnect a running
 worker with its original binary before connecting with the new binary. IPC
 requests are accepted up to 2 MiB. No server restart or history migration is
 needed.

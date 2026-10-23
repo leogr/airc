@@ -32,7 +32,8 @@ checks once. Exit 0 signals readiness; timeout/runtime failures exit 1 with
 visible diagnostics. Caller EOF releases the waiter. IPC version 2 requires an
 old worker's explicit disconnect before upgrade; saved state version 2 adds
 channel state (see [channel controls](named-channels.md)), version 3 adds the
-separate delivery cursor (see [delivery](delivery.md)), and older versions
+separate delivery cursor (see [delivery](delivery.md)), version 4 is written
+only once a [receipt request](delivery-receipts.md) is saved, and older versions
 upgrade on explicit connect. Worker-observed registration status and optional handle bookkeeping are covered
 by [monitor evidence](monitor.md). Harness wakeups are outside this CLI. [1](#source-1) [2](#source-2)
 [6](#source-6) [8](#source-8)

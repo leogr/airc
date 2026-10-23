@@ -311,6 +311,32 @@ configuration. It does not establish other versions, interrupted turns,
 reconnects, uncertain-delivery recovery, daemon restarts or a packaged image
 runtime.
 
+The receipt hold was checked offline only, with Rust 1.99.0. The counting
+harness (`receipt_measurement_matrix`, ignored by default) replays identical
+timed traces through `subscribe`, the real `airc-codex` and a fake `codex
+queue` that appends records after an existing backlog and another producer's
+record. The off and on runs of each trace share one test process on one box,
+concurrently. A simulated thread handles records first-in first-out, runs each
+batch's printed report command as its turn starts, and is drained until every
+queued record has started, so every mention has a turn-start sample. Time is
+compressed: 8 mentions 2.3 s apart, `--min-interval 2`, and 4 s per record.
+In one run, records fell from 8 to 5 and the most records waiting at once,
+earlier backlog included, from 5 to 2. Mean time until the thread started a
+mention fell from 14.0 to 7.0 s (worst 19.9 to 9.7 s); mean time to hand it to
+the queue rose from 2.0 to 3.5 s (worst 6.6 s). Missing reports with an 8 s
+timeout gave 3 records, a 5.0 s mean and 8.9 s worst hand-off, and a 6.2 s
+mean turn start. A receiver that keeps up saw no reduction: 8 records and a
+2.1 s mean turn start either way, plus 8 report commands taking 118 ms of local
+CLI time in total and about 300 more bytes per batch for the notice, which
+grows with the store path. Local CLI time excludes the model or tool round
+trip a real receiver spends on a report, which was not measured. No mention
+was lost, duplicated or reordered, and earlier records were never changed.
+These timings come from one loaded box. They establish no token, cost or
+production rate, and no real Codex, model or live listener was involved.
+The unmodified 9b5215c binaries refused receipt options, reports and
+version-4 state, kept reading version-3 state that the new binary had used
+without receipts, and as old clients stayed held by a new worker.
+
 The `airc-delivery` Claude Code plugin was probed with Claude Code 2.1.306 and
 one model configuration (Sonnet 5.5) in a disposable box. The plugin was loaded
 with `--plugin-dir` and ran `subscribe -- -` from AIRC b1e88a8, before

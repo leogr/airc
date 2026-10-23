@@ -8,7 +8,7 @@ use airc::{
 };
 use serde_json::json;
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
     process::{Output, Stdio},
     time::Duration,
@@ -2336,5 +2336,1523 @@ async fn subscribe_wrap_splits_long_stdout_lines_into_continuations() {
         "{joined}"
     );
     subscriber.kill().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+
+const SCOPE: &str = "019a0000-0000-7000-8000-00000000c0de";
+
+/// A `subscribe` child of this fixture's session with `args` before `--`.
+fn subscriber(f: &Fixture, args: &[&str], adapter: &[&str]) -> tokio::process::Child {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+        .arg("--state-dir")
+        .arg(&f.root)
+        .args(["subscribe", "trial"])
+        .args(args)
+        .arg("--")
+        .args(adapter)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+async fn contents(path: PathBuf) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Each delivered batch in an appended sink file, from its header on.
+fn batches(text: &str) -> Vec<&str> {
+    let starts: Vec<_> = text.match_indices("[airc id=").map(|(at, _)| at).collect();
+    starts
+        .iter()
+        .zip(starts.iter().skip(1).chain([&text.len()]))
+        .map(|(&from, &to)| &text[from..to])
+        .collect()
+}
+
+/// A deliberately constructed report, for refusals only; a receiver's real
+/// report is the notice's printed command, run by `run_notice`.
+async fn report(f: &Fixture, id: &str, scope: &str) -> Output {
+    f.cli(&[
+        "deliveries",
+        "trial",
+        "--mark-received",
+        id,
+        "--receipt-scope",
+        scope,
+    ])
+    .await
+}
+
+/// The command a batch's receipt notice prints, exactly as printed.
+fn notice_command(batch: &str) -> String {
+    batch
+        .lines()
+        .find_map(|line| line.strip_prefix("! receipt requested: "))
+        .and_then(|line| line.split_once(" before other work: "))
+        .map(|(_, command)| command.to_string())
+        .expect("receipt notice")
+}
+
+/// Run a printed command verbatim through `sh -c`, as a receiver would: a
+/// clean environment whose HOME, XDG_STATE_HOME and working directory differ
+/// from the worker's, with `airc` found on PATH.
+async fn run_printed(command: &str, base: &std::path::Path) -> Output {
+    let bin = base.join("bin");
+    let elsewhere = base.join("elsewhere");
+    if !bin.exists() {
+        std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_airc"), bin.join("airc")).unwrap();
+        std::fs::create_dir_all(elsewhere.join("home")).unwrap();
+    }
+    timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new("sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", elsewhere.join("home"))
+            .env("XDG_STATE_HOME", elsewhere.join("xdg"))
+            .current_dir(&elsewhere)
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+async fn run_notice(f: &Fixture, batch: &str) -> Output {
+    run_printed(&notice_command(batch), f.dir.path()).await
+}
+
+#[tokio::test]
+async fn receipt_holds_batch_events_until_the_exact_report() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    // Receipt mode is explicit and validated before anything registers.
+    let upper = SCOPE.to_uppercase();
+    for (args, expected) in [
+        (vec!["--receipt-timeout", "30"], "go together"),
+        (vec!["--receipt-scope", SCOPE], "go together"),
+        (
+            vec![
+                "--receipt-timeout",
+                "5",
+                "--min-interval",
+                "6",
+                "--receipt-scope",
+                SCOPE,
+            ],
+            "at least --min-interval",
+        ),
+        (
+            vec!["--receipt-timeout", "3601", "--receipt-scope", SCOPE],
+            "1–3600 seconds",
+        ),
+        (
+            vec!["--receipt-timeout", "30", "--receipt-scope", &upper],
+            "lowercase",
+        ),
+    ] {
+        let mut argv = vec!["subscribe", "trial"];
+        argv.extend(&args);
+        argv.extend(["--", "-"]);
+        let refused = f.cli(&argv).await;
+        assert!(
+            !refused.status.success() && text(&refused).contains(expected),
+            "{args:?}: {}",
+            text(&refused)
+        );
+    }
+    assert!(
+        f.ok(&["status", "trial"])
+            .await
+            .contains("delivery consumer: none")
+    );
+    let out = f.dir.path().join("batches");
+    let mut child = subscriber(
+        &f,
+        &[
+            "--wake",
+            "mentions",
+            "--receipt-timeout",
+            "60",
+            "--receipt-scope",
+            SCOPE,
+        ],
+        &["sh", "-c", "cat >> \"$0\"", out.to_str().unwrap()],
+    );
+    let status = eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: subscribe"),
+    )
+    .await;
+    assert!(
+        status.contains(&format!(
+            "min-interval=0 receipt-timeout=60 receipt-scope={SCOPE}\n"
+        )),
+        "{status}"
+    );
+    send(&mut human, "@alice one").await;
+    let first = eventually(|| contents(out.clone()), |s| s.contains("@alice one")).await;
+    let id = delivery_id(&first);
+    let root = std::fs::canonicalize(&f.root).unwrap();
+    assert!(
+        first.contains(&format!(
+            "report receipt once before other work: airc --state-dir {} deliveries trial --mark-received {id} --receipt-scope {SCOPE}\n",
+            root.display()
+        )),
+        "{first}"
+    );
+    // Transport acceptance starts the hold; later mentions accumulate.
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains(&format!("delivery receipt: hold={id} scope={SCOPE} ")),
+    )
+    .await;
+    send(&mut human, "@alice two").await;
+    send(&mut human, "@alice three").await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(batches(&contents(out.clone()).await).len(), 1);
+    // Another scope, an unknown ID or a missing scope release nothing.
+    let other = "019a0000-0000-7000-8000-00000000beef";
+    let refused = report(&f, &id, other).await;
+    assert!(
+        !refused.status.success() && text(&refused).contains("another scope"),
+        "{}",
+        text(&refused)
+    );
+    let unknown = report(&f, "00000000-0000-4000-8000-000000000000", SCOPE).await;
+    assert!(text(&unknown).contains("no pending or retained receipt-enabled delivery"));
+    let bare = f
+        .cli(&["deliveries", "trial", "--mark-received", &id])
+        .await;
+    assert!(!bare.status.success());
+    assert!(
+        f.ok(&["deliveries", "trial"])
+            .await
+            .contains(&format!("hold={id} "))
+    );
+    // The exact report releases it once; the held mentions arrive together.
+    let received = run_notice(&f, &first).await;
+    assert!(
+        text(&received).contains("its hold is released"),
+        "{}",
+        text(&received)
+    );
+    let all = eventually(|| contents(out.clone()), |s| batches(s).len() == 2).await;
+    let second = batches(&all)[1];
+    let next = delivery_id(second);
+    assert!(
+        second.starts_with(&format!(
+            "[airc id={next} session=trial events=2]\n! receipt requested: "
+        )),
+        "{second}"
+    );
+    assert!(second.contains("@alice two") && second.contains("@alice three"));
+    assert_eq!(all.matches("! delivery settings: ").count(), 1, "{all}");
+    let again = run_notice(&f, &first).await;
+    assert!(
+        text(&again).contains("already ended: received"),
+        "{}",
+        text(&again)
+    );
+    let ledger = eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains(&format!("delivery receipt: hold={next} ")),
+    )
+    .await;
+    assert!(
+        ledger.contains(&format!("receipt {next} scope={SCOPE} accepted="))
+            && ledger.contains(" received=none hold=active")
+            && ledger.contains(&format!("receipt {id} scope={SCOPE} accepted="))
+            && ledger.contains(" released=received at="),
+        "{ledger}"
+    );
+    // The hold outlives its consumer: a later consumer without receipt
+    // settings, and a restarted worker, still honor it.
+    child.kill().await.unwrap();
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: none"),
+    )
+    .await;
+    send(&mut human, "@alice four").await;
+    let held = f
+        .cli(&[
+            "wait",
+            "trial",
+            "--deliver",
+            "--wake",
+            "mentions",
+            "--timeout",
+            "4",
+        ])
+        .await;
+    assert!(text(&held).contains("wait timed out"), "{}", text(&held));
+    f.ok(&["disconnect", "trial"]).await;
+    f.connect(&server).await;
+    assert!(
+        f.ok(&["status", "trial"])
+            .await
+            .contains(&format!("delivery receipt: hold={next} "))
+    );
+    let released = run_notice(&f, second).await;
+    assert!(
+        text(&released).contains("its hold is released"),
+        "{}",
+        text(&released)
+    );
+    let delivered = f
+        .ok(&[
+            "wait",
+            "trial",
+            "--deliver",
+            "--wake",
+            "mentions",
+            "--timeout",
+            "8",
+        ])
+        .await;
+    assert!(
+        delivered.contains("@alice four") && !delivered.contains("receipt requested"),
+        "{delivered}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receipt_holds_expire_without_claiming_receipt() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    let _child = subscriber(
+        &f,
+        &[
+            "--wake",
+            "mentions",
+            "--receipt-timeout",
+            "3",
+            "--receipt-scope",
+            SCOPE,
+        ],
+        &["sh", "-c", "cat >> \"$0\"", out.to_str().unwrap()],
+    );
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: subscribe"),
+    )
+    .await;
+    send(&mut human, "@alice one").await;
+    let first = eventually(|| contents(out.clone()), |s| s.contains("@alice one")).await;
+    let accepted = Instant::now();
+    let id = delivery_id(&first);
+    send(&mut human, "@alice two").await;
+    eventually(|| contents(out.clone()), |s| s.contains("@alice two")).await;
+    assert!(accepted.elapsed() >= Duration::from_millis(2500));
+    let ledger = f.ok(&["deliveries", "trial"]).await;
+    assert!(
+        ledger.contains(&format!("receipt {id} scope={SCOPE} "))
+            && ledger.contains(" received=none released=expired at="),
+        "{ledger}"
+    );
+    // A late report is kept apart from the expiry and releases nothing newer.
+    let late = run_notice(&f, &first).await;
+    assert!(
+        text(&late).contains("already ended: expired"),
+        "{}",
+        text(&late)
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn urgent_events_and_retention_pressure_bypass_only_the_receipt_hold() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    let _child = subscriber(
+        &f,
+        &[
+            "--wake",
+            "mentions",
+            "--min-interval",
+            "3",
+            "--receipt-timeout",
+            "600",
+            "--receipt-scope",
+            SCOPE,
+        ],
+        &["sh", "-c", "cat >> \"$0\"", out.to_str().unwrap()],
+    );
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: subscribe"),
+    )
+    .await;
+    send(&mut human, "@alice one").await;
+    let first = eventually(|| contents(out.clone()), |s| s.contains("@alice one")).await;
+    let accepted = Instant::now();
+    let held = delivery_id(&first);
+    // Retention pressure (384 unread retained events) ends the hold, but not
+    // the ordinary minimum interval.
+    send(&mut human, "@alice two").await;
+    for n in 0..400 {
+        send(&mut human, &format!("chatter {n}")).await;
+    }
+    let all = eventually(|| contents(out.clone()), |s| batches(s).len() == 2).await;
+    assert!(accepted.elapsed() >= Duration::from_millis(2500));
+    let second = batches(&all)[1];
+    assert!(
+        second.contains("@alice two") && !second.contains("chatter"),
+        "{second}"
+    );
+    let ledger = f.ok(&["deliveries", "trial"]).await;
+    assert!(
+        ledger.contains(&format!("receipt {held} scope={SCOPE} "))
+            && ledger.contains(" received=none released=pressure at="),
+        "{ledger}"
+    );
+    // A critical event ends the next hold at once, interval included.
+    let next = delivery_id(second);
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains(&format!("delivery receipt: hold={next} ")),
+    )
+    .await;
+    human
+        .outbound
+        .send(vec![Message::new("KICK", ["#work", "alice", "stop"])])
+        .await
+        .unwrap();
+    let kicked = Instant::now();
+    let all = eventually(|| contents(out.clone()), |s| batches(s).len() == 3).await;
+    assert!(kicked.elapsed() < Duration::from_secs(3));
+    assert!(batches(&all)[2].contains("removed by KICK"), "{all}");
+    let ledger = f.ok(&["deliveries", "trial"]).await;
+    assert!(
+        ledger.contains(&format!("receipt {next} scope={SCOPE} "))
+            && ledger.contains(" released=urgent at="),
+        "{ledger}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn early_receipts_never_accept_or_repair_an_uncertain_sink() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    // The receiver runs each batch's printed command, verbatim and from a
+    // clean environment, while the sink still runs; the second sink then fails.
+    run_printed("true", f.dir.path()).await;
+    let adapter = r#"cat > "$0.last"; cat "$0.last" >> "$0"; cmd=$(sed -n 's/^! receipt requested: .* before other work: //p' "$0.last"); (cd "$2" && env -i PATH="$1" HOME="$2/home" XDG_STATE_HOME="$2/xdg" sh -c "$cmd") >> "$0.reports"; test -e "$0.fail" && exit 7; exit 0"#;
+    let path = format!("{}:/usr/bin:/bin", f.dir.path().join("bin").display());
+    let elsewhere = f.dir.path().join("elsewhere");
+    let argv = [
+        "sh",
+        "-c",
+        adapter,
+        out.to_str().unwrap(),
+        &path,
+        elsewhere.to_str().unwrap(),
+    ];
+    let options = [
+        "--wake",
+        "mentions",
+        "--receipt-timeout",
+        "600",
+        "--receipt-scope",
+        SCOPE,
+    ];
+    let mut child = subscriber(&f, &options, &argv);
+    send(&mut human, "@alice one").await;
+    let first = eventually(|| contents(out.clone()), |s| s.contains("@alice one")).await;
+    let id = delivery_id(&first);
+    let reports = eventually(
+        || contents(out.with_extension("reports")),
+        |s| s.contains("transport acceptance is still pending"),
+    )
+    .await;
+    assert!(reports.contains(&format!("received {id} at ")), "{reports}");
+    // Reported before acceptance: nothing is held afterwards.
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| {
+            s.contains(&format!(
+                "delivery receipt: hold=none last={id} released=received"
+            ))
+        },
+    )
+    .await;
+    std::fs::write(out.with_extension("fail"), "").unwrap();
+    send(&mut human, "@alice two").await;
+    let ended = timeout(Duration::from_secs(15), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!ended.success());
+    let all = contents(out.clone()).await;
+    let pending = delivery_id(batches(&all)[1]);
+    // The report is kept, but the batch stays pending and uncertain.
+    let status = f.ok(&["deliveries", "trial"]).await;
+    assert!(
+        status.contains(&format!("pending={pending} "))
+            && status.contains(&format!("receipt-scope={SCOPE} received=20")),
+        "{status}"
+    );
+    let shown = f.ok(&["deliveries", "trial", "--show", &pending]).await;
+    assert!(
+        shown.contains(&format!("--mark-received {pending} ")),
+        "{shown}"
+    );
+    let restart = subscriber(&f, &options, &["sh", "-c", "cat >/dev/null"])
+        .wait_with_output()
+        .await
+        .unwrap();
+    assert!(text(&restart).contains(&format!("delivery {pending} pending since")));
+    // Explicit operator acceptance records the early receipt and holds nothing.
+    let accepted = f
+        .ok(&["deliveries", "trial", "--mark-accepted", &pending])
+        .await;
+    assert!(accepted.contains("nothing is held"), "{accepted}");
+    assert!(
+        f.ok(&["deliveries", "trial"])
+            .await
+            .contains(&format!("hold=none last={pending} released=received"))
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_report_that_cannot_be_saved_is_never_confirmed() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    let mut child = subscriber(
+        &f,
+        &[
+            "--wake",
+            "mentions",
+            "--receipt-timeout",
+            "600",
+            "--receipt-scope",
+            SCOPE,
+        ],
+        &["sh", "-c", "cat >> \"$0\"", out.to_str().unwrap()],
+    );
+    send(&mut human, "@alice one").await;
+    let first = eventually(|| contents(out.clone()), |s| s.contains("@alice one")).await;
+    let id = delivery_id(&first);
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains(&format!("delivery receipt: hold={id} ")),
+    )
+    .await;
+    let dir = f.root.join("trial");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(dir.join("probe"), "").is_ok() {
+        // Privileged runs ignore directory modes; nothing can be proven here.
+        let _ = std::fs::remove_file(dir.join("probe"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let lost = run_notice(&f, &first).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !lost.status.success() && !text(&lost).contains("hold is released"),
+        "{}",
+        text(&lost)
+    );
+    let _ = timeout(Duration::from_secs(15), child.wait())
+        .await
+        .unwrap();
+    // The worker stopped instead of replying; the saved hold is unreported.
+    eventually(
+        || async { text(&f.cli(&["status", "trial"]).await) },
+        |s| s.contains("stopped;"),
+    )
+    .await;
+    f.connect(&server).await;
+    assert!(
+        f.ok(&["deliveries", "trial"])
+            .await
+            .contains(&format!("receipt {id} scope={SCOPE} accepted=")),
+    );
+    assert!(
+        f.ok(&["deliveries", "trial"])
+            .await
+            .contains(" received=none hold=active")
+    );
+    let saved = run_notice(&f, &first).await;
+    assert!(
+        text(&saved).contains("its hold is released"),
+        "{}",
+        text(&saved)
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receipt_ipc_is_strict_for_old_and_new_peers() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    f.connect(&server).await;
+    // Unknown consumer fields are refused, as older workers refuse receipt
+    // settings; an older client's registration keeps receipts off.
+    let refused = raw_ipc(
+        &f,
+        json!({"op": "consume", "kind": "subscribe", "settings": {
+            "wake": "mentions", "max_bytes": 8192, "min_interval": 0,
+            "receipt": {"timeout": 60, "scope": SCOPE, "extra": true}}}),
+    )
+    .await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    let refused = raw_ipc(
+        &f,
+        json!({"op": "mark_received", "id": "00000000-0000-4000-8000-000000000000",
+            "scope": SCOPE.to_uppercase()}),
+    )
+    .await;
+    assert!(
+        refused["ok"] == false && refused["text"].as_str().unwrap().contains("lowercase"),
+        "{refused}"
+    );
+    let refused = raw_ipc(
+        &f,
+        json!({"op": "mark_received", "id": "00000000-0000-4000-8000-000000000000",
+            "scope": SCOPE}),
+    )
+    .await;
+    assert!(
+        refused["text"]
+            .as_str()
+            .unwrap()
+            .contains("no delivery state; nothing was changed"),
+        "{refused}"
+    );
+    let features = text(&f.cli(&["features"]).await);
+    assert!(
+        features.contains("\"named-delivery-receipts\""),
+        "{features}"
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+/// Stand-in for `codex queue`: appends each message as one record of a
+/// thread queue, stamped with the wall clock, and confirms it like codex-cli.
+const FAKE_QUEUE: &str = r#"#!/bin/sh
+[ "$1" = queue ] && [ "$2" = --thread ] && [ "$4" = --message ] || exit 2
+n=$(cat "$QUEUE/next"); echo $((n + 1)) > "$QUEUE/next"
+name=$(printf '%06d' "$n")
+date +%s%N > "$QUEUE/$name.at"
+printf '%s' "$5" > "$QUEUE/.$name"
+mv "$QUEUE/.$name" "$QUEUE/$name.airc"
+echo "Queued message $n for thread $3."
+"#;
+/// Records queued before the run: an earlier AIRC batch and another producer's.
+const BACKLOG: [(&str, &str); 2] = [
+    (
+        "000001.airc",
+        "[airc id=00000000-0000-4000-8000-0000000000aa session=trial]\n@0 #work human(human): @alice earlier\n",
+    ),
+    ("000002.other", "another producer's queued message\n"),
+];
+
+#[derive(Clone, Copy)]
+struct Trace {
+    /// Mentions, `spacing` apart, with `chatter` unaddressed lines after each.
+    mentions: usize,
+    spacing: Duration,
+    chatter: usize,
+    /// How long the receiver works on each record before taking the next.
+    work: Duration,
+    /// Whether the receiver reports each requested receipt as a turn starts.
+    reports: bool,
+    /// Keep the receiver going until it has started every queued record, so
+    /// each mention has a turn-start age; otherwise those ages are censored.
+    drain: bool,
+}
+
+struct Run {
+    records: usize,
+    invocations: usize,
+    payload: usize,
+    reports: usize,
+    report_ms: u128,
+    max_waiting: usize,
+    handoff_ms: (u128, u128),
+    /// Turn-start age mean/max, only when every mention has a sample.
+    turn_ms: Option<(u128, u128)>,
+    turn_samples: usize,
+}
+
+fn ns(at: std::time::SystemTime) -> u128 {
+    at.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+}
+
+/// Replay one trace against a fresh server and session with a receiving
+/// thread that handles one queued record at a time.
+async fn replay(trace: Trace, receipt: Option<u64>) -> Run {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let queue = f.dir.path().join("queue");
+    std::fs::create_dir(&queue).unwrap();
+    for (name, text) in BACKLOG {
+        std::fs::write(queue.join(name), text).unwrap();
+    }
+    std::fs::write(queue.join("next"), "3").unwrap();
+    let codex = f.dir.path().join("codex");
+    std::fs::write(&codex, FAKE_QUEUE).unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut args = vec!["--wake", "mentions", "--min-interval", "2"];
+    let timeout_text = receipt.map(|t| t.to_string()).unwrap_or_default();
+    if receipt.is_some() {
+        args.extend(["--receipt-timeout", &timeout_text, "--receipt-scope", SCOPE]);
+    }
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+        .arg("--state-dir")
+        .arg(&f.root)
+        .args(["subscribe", "trial"])
+        .args(&args)
+        .args([
+            "--",
+            env!("CARGO_BIN_EXE_airc-codex"),
+            "--thread",
+            SCOPE,
+            "--codex",
+        ])
+        .arg(&codex)
+        .env("QUEUE", &queue)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: subscribe"),
+    )
+    .await;
+    // The receiving thread: FIFO over the whole queue, one record at a time.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let receiver = {
+        let (queue, done, base) = (queue.clone(), done.clone(), f.dir.path().to_path_buf());
+        let progress = progress.clone();
+        async move {
+            let mut started = Vec::new();
+            let (mut reports, mut report_ms) = (0, 0);
+            let mut next = 1;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let name = format!("{next:06}");
+                let Some(path) = ["airc", "other"]
+                    .map(|kind| queue.join(format!("{name}.{kind}")))
+                    .into_iter()
+                    .find(|path| path.exists())
+                else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                };
+                started.push((next, ns(std::time::SystemTime::now())));
+                progress.store(next, std::sync::atomic::Ordering::Relaxed);
+                let record = std::fs::read_to_string(&path).unwrap();
+                if trace.reports && record.contains("\n! receipt requested: ") {
+                    let begun = Instant::now();
+                    let output = run_printed(&notice_command(&record), &base).await;
+                    assert!(output.status.success(), "{}", text(&output));
+                    report_ms += begun.elapsed().as_millis();
+                    reports += 1;
+                }
+                let end = Instant::now() + trace.work;
+                while Instant::now() < end && !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                next += 1;
+            }
+            (started, reports, report_ms)
+        }
+    };
+    let receiver = tokio::spawn(receiver);
+    let mut sent = Vec::new();
+    for k in 0..trace.mentions {
+        sent.push(ns(std::time::SystemTime::now()));
+        send(&mut human, &format!("@alice m{k:02}")).await;
+        for n in 0..trace.chatter {
+            send(&mut human, &format!("chatter {k} {n}")).await;
+        }
+        tokio::time::sleep(trace.spacing).await;
+    }
+    // Every mention reaches the queue exactly once, in order, after the backlog.
+    let mention = |k: usize| format!("human(human): @alice m{k:02}\n");
+    let appended = || {
+        let mut names: Vec<_> = std::fs::read_dir(&queue)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".airc") && n.as_str() > "000002")
+            .collect();
+        names.sort();
+        names
+    };
+    timeout(Duration::from_secs(90), async {
+        loop {
+            let last = mention(trace.mentions - 1);
+            if appended()
+                .iter()
+                .any(|n| contents_sync(&queue.join(n)).contains(&last))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every mention reaches the queue");
+    if trace.drain {
+        // Every queued record, backlog included, reaches the receiver.
+        let last = 2 + appended().len();
+        timeout(Duration::from_secs(180), async {
+            while progress.load(std::sync::atomic::Ordering::Relaxed) < last {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the receiver starts every queued record");
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (started, reports, report_ms) = receiver.await.unwrap();
+    child.kill().await.unwrap();
+    for (name, text) in BACKLOG {
+        assert_eq!(contents_sync(&queue.join(name)), text, "{name} changed");
+    }
+    let names = appended();
+    let mut expected = 0;
+    let (mut payload, mut handoff, mut turn) = (0, Vec::new(), Vec::new());
+    let mut queued_at = Vec::new();
+    for name in &names {
+        let record = contents_sync(&queue.join(name));
+        let stem = name.trim_end_matches(".airc");
+        let at: u128 = contents_sync(&queue.join(format!("{stem}.at")))
+            .trim()
+            .parse()
+            .unwrap();
+        let number: usize = stem.parse().unwrap();
+        queued_at.push((number, at));
+        payload += record.len();
+        let start = started.iter().find(|(n, _)| *n == number).map(|(_, t)| *t);
+        for (k, &when) in sent.iter().enumerate() {
+            let count = record.matches(&mention(k)).count();
+            if count > 0 {
+                assert_eq!((count, k), (1, expected), "{record}");
+                expected += 1;
+                handoff.push((at - when) / 1_000_000);
+                if let Some(start) = start {
+                    turn.push((start - when) / 1_000_000);
+                }
+            }
+        }
+    }
+    assert_eq!(expected, trace.mentions, "every mention once, in order");
+    if trace.drain {
+        assert_eq!(turn.len(), trace.mentions, "one turn-start age per mention");
+    }
+    // Waiting records: queued (backlog included) but not yet started.
+    let mut max_waiting = 0;
+    for &(_, at) in &queued_at {
+        let waiting = queued_at
+            .iter()
+            .filter(|&&(n, queued)| {
+                queued <= at
+                    && started
+                        .iter()
+                        .find(|(s, _)| *s == n)
+                        .is_none_or(|(_, t)| *t > at)
+            })
+            .count()
+            + BACKLOG
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    started
+                        .iter()
+                        .find(|(s, _)| *s == i + 1)
+                        .is_none_or(|(_, t)| *t > at)
+                })
+                .count();
+        max_waiting = max_waiting.max(waiting);
+    }
+    let invocations = contents_sync(&queue.join("next"))
+        .trim()
+        .parse::<usize>()
+        .unwrap()
+        - 3;
+    let stats = |v: &[u128]| {
+        (
+            v.iter().sum::<u128>() / v.len().max(1) as u128,
+            v.iter().copied().max().unwrap_or(0),
+        )
+    };
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+    Run {
+        records: names.len(),
+        invocations,
+        payload,
+        reports,
+        report_ms,
+        max_waiting,
+        handoff_ms: stats(&handoff),
+        turn_ms: trace.drain.then(|| stats(&turn)),
+        turn_samples: turn.len(),
+    }
+}
+
+fn contents_sync(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// One JSON line per run. Off and on runs of a trace share one test process
+/// and box, concurrently; times are compressed and every party is a mock.
+/// Report-call times are local CLI time only, never model or tool round trips.
+fn measured(name: &str, mode: &str, trace: Trace, run: &Run) {
+    let turn = match run.turn_ms {
+        Some((mean, max)) => json!({"mean_ms": mean, "max_ms": max, "samples": run.turn_samples}),
+        None => json!({"censored": true, "samples": run.turn_samples}),
+    };
+    println!(
+        "MEASURE {}",
+        json!({
+            "trace": name, "mode": mode, "mentions": trace.mentions,
+            "spacing_ms": trace.spacing.as_millis(), "chatter": trace.chatter,
+            "work_ms": trace.work.as_millis(), "receiver_reports": trace.reports,
+            "drained": trace.drain, "sink_invocations": run.invocations,
+            "queue_records": run.records, "payload_bytes": run.payload,
+            "local_report_calls": run.reports, "local_report_cli_ms_total": run.report_ms,
+            "local_report_cli_ms_mean": run.report_ms / run.reports.max(1) as u128,
+            "max_waiting_records": run.max_waiting,
+            "handoff_age_ms_mean": run.handoff_ms.0, "handoff_age_ms_max": run.handoff_ms.1,
+            "turn_start_age": turn,
+        })
+    );
+}
+
+/// A busy receiver that reports each batch as its turn starts: the same
+/// trace makes fewer queue records with receipts, losing and reordering
+/// nothing, and the earlier backlog and other producer's record stay as they were.
+#[tokio::test]
+async fn receipt_credit_reduces_records_queued_for_a_busy_receiver() {
+    let trace = Trace {
+        mentions: 8,
+        spacing: Duration::from_millis(2300),
+        chatter: 0,
+        work: Duration::from_secs(4),
+        reports: true,
+        drain: false,
+    };
+    let (off, on) = tokio::join!(replay(trace, None), replay(trace, Some(30)));
+    measured("delayed-receiver", "off", trace, &off);
+    measured("delayed-receiver", "receipt-30s", trace, &on);
+    assert_eq!(off.invocations, off.records);
+    assert_eq!(on.invocations, on.records);
+    assert_eq!(off.reports, 0);
+    assert!(
+        on.reports >= on.records - 1,
+        "{} of {}",
+        on.reports,
+        on.records
+    );
+    assert!(
+        on.records < off.records && on.max_waiting < off.max_waiting,
+        "on {}/{} off {}/{}",
+        on.records,
+        on.max_waiting,
+        off.records,
+        off.max_waiting
+    );
+}
+
+/// The full matrix for the published measurement: run explicitly with
+/// `cargo test --test named_sessions receipt_measurement -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "measurement matrix; several minutes"]
+async fn receipt_measurement_matrix() {
+    let base = Trace {
+        mentions: 8,
+        spacing: Duration::from_millis(2300),
+        chatter: 0,
+        work: Duration::from_secs(4),
+        reports: true,
+        drain: true,
+    };
+    let traces = [
+        (
+            "prompt-receiver",
+            Trace {
+                work: Duration::from_millis(200),
+                ..base
+            },
+            30,
+        ),
+        ("delayed-receiver", base, 30),
+        (
+            "absent-receipts",
+            Trace {
+                reports: false,
+                ..base
+            },
+            8,
+        ),
+        (
+            "pressure",
+            Trace {
+                mentions: 3,
+                chatter: 200,
+                reports: false,
+                ..base
+            },
+            600,
+        ),
+    ];
+    for (name, trace, timeout) in traces {
+        let (off, on) = tokio::join!(replay(trace, None), replay(trace, Some(timeout)));
+        measured(name, "off", trace, &off);
+        measured(name, &format!("receipt-{timeout}s"), trace, &on);
+    }
+}
+
+#[tokio::test]
+async fn an_acceptance_that_cannot_be_saved_starts_no_hold() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let dir = f.root.join("trial");
+    let out = f.dir.path().join("batches");
+    // The sink takes the batch, then the session directory becomes read-only
+    // before the worker can save its acceptance and hold.
+    let mut child = subscriber(
+        &f,
+        &[
+            "--wake",
+            "mentions",
+            "--receipt-timeout",
+            "600",
+            "--receipt-scope",
+            SCOPE,
+        ],
+        &[
+            "sh",
+            "-c",
+            "cat >> \"$0\"; chmod 500 \"$1\"",
+            out.to_str().unwrap(),
+            dir.to_str().unwrap(),
+        ],
+    );
+    send(&mut human, "@alice one").await;
+    let ended = timeout(Duration::from_secs(15), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if std::fs::metadata(dir.join("state.json")).is_ok_and(|m| m.uid() == 0) {
+        return; // A privileged run ignores directory modes.
+    }
+    assert!(!ended.success());
+    let id = delivery_id(&contents(out.clone()).await);
+    eventually(
+        || async { text(&f.cli(&["status", "trial"]).await) },
+        |s| s.contains("stopped;"),
+    )
+    .await;
+    f.connect(&server).await;
+    let status = f.ok(&["deliveries", "trial"]).await;
+    assert!(
+        status.contains(&format!("pending={id} ")) && !status.contains("delivery receipt:"),
+        "{status}"
+    );
+    let early = run_notice(&f, &contents(out.clone()).await).await;
+    assert!(
+        text(&early).contains("transport acceptance is still pending"),
+        "{}",
+        text(&early)
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+/// Connect `trial` with `--state-dir STORE` as given (possibly relative) from
+/// `cwd`, then address the canonical store for everything else.
+async fn connect_at(f: &mut Fixture, server: &RunningServer, store: &str, cwd: &std::path::Path) {
+    let config = f.path(server);
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+        .args(["--state-dir", store, "connect", "trial", "--config"])
+        .arg(&config)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    f.root = std::fs::canonicalize(cwd.join(store)).unwrap();
+}
+
+/// A receipt-enabled subscriber writing batches to `out`, once registered.
+async fn receipt_subscriber(
+    f: &Fixture,
+    out: &std::path::Path,
+    extra: &[&str],
+) -> tokio::process::Child {
+    let mut args = vec![
+        "--wake",
+        "mentions",
+        "--receipt-timeout",
+        "600",
+        "--receipt-scope",
+        SCOPE,
+    ];
+    args.extend(extra);
+    let child = subscriber(
+        f,
+        &args,
+        &["sh", "-c", "cat >> \"$0\"", out.to_str().unwrap()],
+    );
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: subscribe"),
+    )
+    .await;
+    child
+}
+
+#[tokio::test]
+async fn printed_report_commands_reach_hostile_relative_stores_from_any_environment() {
+    let mut f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    // A relative store name with spaces, an apostrophe and literal shell syntax.
+    let store = "st o'r $(touch inj1) `touch inj2`";
+    let base = f.dir.path().to_path_buf();
+    connect_at(&mut f, &server, store, &base).await;
+    assert!(f.root.is_absolute() && f.root.ends_with(store));
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    let _child = receipt_subscriber(&f, &out, &[]).await;
+    send(&mut human, "@alice one").await;
+    let first = eventually(|| contents(out.clone()), |s| s.contains("@alice one")).await;
+    let id = delivery_id(&first);
+    let command = notice_command(&first);
+    assert_eq!(
+        command,
+        format!(
+            "airc --state-dir '{}' deliveries trial --mark-received {id} --receipt-scope {SCOPE}",
+            f.root.display().to_string().replace('\'', r"'\''")
+        )
+    );
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains(&format!("delivery receipt: hold={id} ")),
+    )
+    .await;
+    // Another store or an unknown ID changes nothing; nothing is guessed.
+    let elsewhere = f.dir.path().join("other-store");
+    let wrong = run_printed(
+        &command.replace(
+            &format!("'{}'", f.root.display().to_string().replace('\'', r"'\''")),
+            &elsewhere.display().to_string(),
+        ),
+        f.dir.path(),
+    )
+    .await;
+    assert!(
+        !wrong.status.success() && text(&wrong).contains("is stopped"),
+        "{}",
+        text(&wrong)
+    );
+    let unknown = run_printed(
+        &command.replace(&id, "00000000-0000-4000-8000-000000000000"),
+        f.dir.path(),
+    )
+    .await;
+    assert!(
+        text(&unknown).contains("no pending or retained"),
+        "{}",
+        text(&unknown)
+    );
+    assert!(
+        f.ok(&["deliveries", "trial"])
+            .await
+            .contains(&format!("hold={id} "))
+    );
+    // The genuine command, from another HOME/XDG and directory, records the
+    // exact ID and scope; no shell syntax in the path ever ran.
+    let reported = run_notice(&f, &first).await;
+    assert!(
+        text(&reported).contains(&format!("received {id} at ")),
+        "{}",
+        text(&reported)
+    );
+    let ledger = f.ok(&["deliveries", "trial"]).await;
+    assert!(
+        ledger.contains(&format!("receipt {id} scope={SCOPE} "))
+            && ledger.contains("released=received"),
+        "{ledger}"
+    );
+    for dir in [
+        f.dir.path().to_path_buf(),
+        f.dir.path().join("elsewhere"),
+        f.root.clone(),
+    ] {
+        for sentinel in ["inj1", "inj2"] {
+            assert!(!dir.join(sentinel).exists(), "{}", dir.display());
+        }
+    }
+    let mut elsewhere: Vec<_> = std::fs::read_dir(f.dir.path().join("elsewhere"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    elsewhere.sort();
+    assert_eq!(elsewhere, ["home"]);
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn printed_report_commands_keep_a_default_store_when_xdg_changes() {
+    let mut f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    // The worker's store is the default under one XDG_STATE_HOME ...
+    let xdg = f.dir.path().join("xdg");
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+        .args(["connect", "trial", "--config"])
+        .arg(f.path(&server))
+        .env("XDG_STATE_HOME", &xdg)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    f.root = std::fs::canonicalize(xdg.join("airc")).unwrap();
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    let _child = receipt_subscriber(&f, &out, &[]).await;
+    send(&mut human, "@alice one").await;
+    let first = eventually(|| contents(out.clone()), |s| s.contains("@alice one")).await;
+    assert!(
+        notice_command(&first).starts_with(&format!(
+            "airc --state-dir {} deliveries trial ",
+            f.root.display()
+        )),
+        "{first}"
+    );
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains("delivery receipt: hold="),
+    )
+    .await;
+    // ... and the receiver runs with another one.
+    let reported = run_notice(&f, &first).await;
+    assert!(
+        text(&reported).contains("its hold is released"),
+        "{}",
+        text(&reported)
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receipt_opt_in_is_refused_with_wrap_or_without_room_and_changes_nothing() {
+    // The longest all-apostrophe store whose socket path stays below 100
+    // bytes, under a short fixed base: its quoted notice cannot fit 1024 bytes.
+    let short = tempfile::Builder::new()
+        .prefix("r")
+        .rand_bytes(4)
+        .tempdir_in("/tmp")
+        .unwrap();
+    let store = "'".repeat(99 - short.path().as_os_str().len() - 1 - "/trial/client.sock".len());
+    let mut f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    connect_at(&mut f, &server, &store, short.path()).await;
+    assert_eq!(f.root.join("trial/client.sock").as_os_str().len(), 99);
+    let before = f.ok(&["deliveries", "trial"]).await;
+    assert!(before.starts_with("delivery: unused\n"), "{before}");
+    let base = [
+        "subscribe",
+        "trial",
+        "--receipt-timeout",
+        "60",
+        "--receipt-scope",
+        SCOPE,
+    ];
+    for (extra, expected) in [
+        (vec!["--wrap", "480"], "cannot be combined with --wrap"),
+        (vec!["--max-bytes", "1024"], "raise --max-bytes"),
+    ] {
+        let mut argv = base.to_vec();
+        argv.extend(&extra);
+        argv.extend(["--", "-"]);
+        let refused = f.cli(&argv).await;
+        assert!(
+            !refused.status.success() && text(&refused).contains(expected),
+            "{extra:?}: {}",
+            text(&refused)
+        );
+        assert_eq!(f.ok(&["deliveries", "trial"]).await, before);
+    }
+    // The worker refuses the same registrations itself, before any change.
+    for settings in [
+        json!({"wake": "mentions", "max_bytes": 8192, "min_interval": 0, "wrap": 480,
+            "receipt": {"timeout": 60, "scope": SCOPE}}),
+        json!({"wake": "mentions", "max_bytes": 1024, "min_interval": 0,
+            "receipt": {"timeout": 60, "scope": SCOPE}}),
+    ] {
+        let refused = raw_ipc(
+            &f,
+            json!({"op": "consume", "kind": "subscribe", "settings": settings}),
+        )
+        .await;
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(f.ok(&["deliveries", "trial"]).await, before);
+    }
+    // Default-off wrapping is unchanged, and a large enough bound fits.
+    let out = f.dir.path().join("batches");
+    let mut plain = subscriber(&f, &["--wrap", "480"], &["sh", "-c", "cat >/dev/null"]);
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("wrap=480 min-interval=0\n"),
+    )
+    .await;
+    plain.kill().await.unwrap();
+    eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: none"),
+    )
+    .await;
+    let _child = receipt_subscriber(&f, &out, &["--max-bytes", "2048"]).await;
+    send(&mut human, "@alice one").await;
+    let first = eventually(|| contents(out.clone()), |s| s.contains("@alice one")).await;
+    assert!(first.len() <= 2048);
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains("delivery receipt: hold="),
+    )
+    .await;
+    let reported = run_notice(&f, &first).await;
+    assert!(
+        text(&reported).contains("its hold is released"),
+        "{}",
+        text(&reported)
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reports_need_a_connection_other_than_the_consumers() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    f.connect(&server).await;
+    let stream = UnixStream::connect(f.root.join("trial/client.sock"))
+        .await
+        .unwrap();
+    let mut stream = BufReader::new(stream);
+    let mut exchange = async |operation: serde_json::Value| {
+        stream
+            .get_mut()
+            .write_all(format!("{}\n", json!({"version": 2, "operation": operation})).as_bytes())
+            .await
+            .unwrap();
+        let line = timeout(Duration::from_secs(15), read_line(&mut stream, 1 << 20))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    let registered = exchange(json!({"op": "consume", "kind": "subscribe", "settings": {
+        "wake": "mentions", "max_bytes": 8192, "min_interval": 0,
+        "receipt": {"timeout": 60, "scope": SCOPE}}}))
+    .await;
+    assert_eq!(registered["ok"], true, "{registered}");
+    let id = "00000000-0000-4000-8000-000000000000";
+    let own = exchange(json!({"op": "mark_received", "id": id, "scope": SCOPE})).await;
+    assert!(
+        own["text"]
+            .as_str()
+            .unwrap()
+            .contains("a consumer connection only delivers and accepts"),
+        "{own}"
+    );
+    let separate = raw_ipc(&f, json!({"op": "mark_received", "id": id, "scope": SCOPE})).await;
+    assert!(
+        separate["text"]
+            .as_str()
+            .unwrap()
+            .contains("no pending or retained"),
+        "{separate}"
+    );
+    drop(stream);
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pending_receipt_batch_is_never_retried_wrapped() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    // A receipt-enabled sink fails, leaving its batch pending and uncertain.
+    let failing = subscriber(
+        &f,
+        &[
+            "--wake",
+            "mentions",
+            "--receipt-timeout",
+            "600",
+            "--receipt-scope",
+            SCOPE,
+        ],
+        &["sh", "-c", "cat >> \"$0\"; exit 7", out.to_str().unwrap()],
+    );
+    send(&mut human, "@alice one").await;
+    let ended = timeout(Duration::from_secs(15), failing.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!ended.status.success());
+    let first = contents(out.clone()).await;
+    let pending = delivery_id(&first);
+    let before = f.ok(&["deliveries", "trial"]).await;
+    assert!(before.contains(&format!("pending={pending} ")), "{before}");
+    let shown = f.ok(&["deliveries", "trial", "--show", &pending]).await;
+    // A wrapped retry without receipt options of its own is refused by the
+    // worker before registering; nothing reaches a sink or changes.
+    let refused = timeout(
+        Duration::from_secs(15),
+        subscriber(
+            &f,
+            &["--retry-pending", &pending, "--wrap", "64"],
+            &["sh", "-c", "cat >> \"$0\"", out.to_str().unwrap()],
+        )
+        .wait_with_output(),
+    )
+    .await
+    .expect("a wrapped retry of a receipt batch is refused, not served")
+    .unwrap();
+    assert!(
+        !refused.status.success()
+            && text(&refused).contains(&format!(
+                "pending delivery {pending} requests a receipt; retry it without --wrap"
+            )),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(contents(out.clone()).await, first, "no sink call");
+    assert_eq!(f.ok(&["deliveries", "trial"]).await, before);
+    assert_eq!(
+        f.ok(&["deliveries", "trial", "--show", &pending]).await,
+        shown
+    );
+    // An unwrapped retry delivers the saved command, which reports the
+    // original ID and scope to the original store.
+    let _retry = subscriber(
+        &f,
+        &["--retry-pending", &pending],
+        &["sh", "-c", "cat >> \"$0\"", out.to_str().unwrap()],
+    );
+    let all = eventually(|| contents(out.clone()), |s| batches(s).len() == 2).await;
+    let retried = batches(&all)[1];
+    assert!(
+        retried.starts_with(&format!("[airc id={pending} session=trial retry]\n")),
+        "{retried}"
+    );
+    assert_eq!(notice_command(retried), notice_command(&first));
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains(&format!("delivery receipt: hold={pending} scope={SCOPE} ")),
+    )
+    .await;
+    let reported = run_notice(&f, retried).await;
+    assert!(
+        text(&reported).contains(&format!("received {pending} at "))
+            && text(&reported).contains("hold is released"),
+        "{}",
+        text(&reported)
+    );
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pending_batch_without_a_receipt_still_retries_wrapped() {
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let out = f.dir.path().join("batches");
+    let failing = subscriber(
+        &f,
+        &["--wake", "mentions"],
+        &["sh", "-c", "cat >> \"$0\"; exit 7", out.to_str().unwrap()],
+    );
+    send(&mut human, &format!("@alice {}", "x".repeat(150))).await;
+    timeout(Duration::from_secs(15), failing.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let pending = delivery_id(&contents(out.clone()).await);
+    let _retry = subscriber(
+        &f,
+        &["--retry-pending", &pending, "--wrap", "64"],
+        &["sh", "-c", "cat >> \"$0\"", out.to_str().unwrap()],
+    );
+    let all = eventually(|| contents(out.clone()), |s| batches(s).len() == 2).await;
+    let retried = batches(&all)[1];
+    assert!(retried.starts_with(&format!("[airc id={pending} session=trial retry]\n")));
+    assert!(
+        retried.lines().skip(1).all(|line| line.len() <= 64),
+        "{retried}"
+    );
+    assert!(retried.contains("\n| "), "{retried}");
+    eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| s.contains("pending=none") && s.contains(&format!("last={pending} accepted=")),
+    )
+    .await;
+    f.ok(&["disconnect", "trial"]).await;
     server.shutdown().await.unwrap();
 }

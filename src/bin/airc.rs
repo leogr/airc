@@ -84,6 +84,17 @@ enum Command {
         /// continuation lines (64–65536), for sinks that cut long lines.
         #[arg(long)]
         wrap: Option<usize>,
+        /// Ask the receiver to report each batch (deliveries --mark-received)
+        /// and hold later batches after acceptance until that report, this
+        /// many seconds (1–3600, at least --min-interval), urgent events or
+        /// retention pressure. 0 (default) disables it. Cannot be combined
+        /// with --wrap. Not a queue cap or processing proof.
+        #[arg(long, default_value_t = 0)]
+        receipt_timeout: u64,
+        /// The exact lowercase UUID each report must name, such as the
+        /// receiving Codex thread ID; required with --receipt-timeout.
+        #[arg(long)]
+        receipt_scope: Option<String>,
         /// Adapter argv, or `-` for stdout.
         #[arg(last = true, required = true)]
         adapter: Vec<String>,
@@ -116,6 +127,13 @@ enum Command {
         /// Skip it undelivered; its events stay readable with read.
         #[arg(long, group = "action")]
         drop: Option<String>,
+        /// Report that the receiver got this exact batch (with --receipt-scope).
+        /// Allowed while a consumer runs; it accepts and replays nothing.
+        #[arg(long, group = "action", requires = "receipt_scope")]
+        mark_received: Option<String>,
+        /// The scope that the batch's receipt notice names.
+        #[arg(long, requires = "mark_received")]
+        receipt_scope: Option<String>,
     },
     /// Send once and wait for the server's correlated echo. Never retries.
     /// Text with newlines is sent as one multiline message when supported.
@@ -303,6 +321,7 @@ async fn run(args: Args) -> Result<()> {
                         retry: retry_pending,
                         sink_timeout: 60,
                         wrap: None,
+                        receipt: None,
                     };
                     sessions::deliver(
                         &root,
@@ -320,8 +339,19 @@ async fn run(args: Args) -> Result<()> {
                     sink_timeout,
                     retry_pending,
                     wrap,
+                    receipt_timeout,
+                    receipt_scope,
                     adapter,
                 } => {
+                    let receipt = match (receipt_timeout, receipt_scope) {
+                        (0, None) => None,
+                        (timeout @ 1.., Some(scope)) => {
+                            Some(sessions::ReceiptSettings { timeout, scope })
+                        }
+                        _ => anyhow::bail!(
+                            "--receipt-timeout SECONDS and --receipt-scope UUID go together"
+                        ),
+                    };
                     let options = sessions::DeliverOptions {
                         wake,
                         max_bytes,
@@ -330,6 +360,7 @@ async fn run(args: Args) -> Result<()> {
                         retry: retry_pending,
                         sink_timeout,
                         wrap,
+                        receipt,
                     };
                     let sink = if adapter == ["-"] {
                         sessions::Sink::Stdout { once: false }
@@ -362,10 +393,16 @@ async fn run(args: Args) -> Result<()> {
                     show,
                     mark_accepted,
                     drop,
+                    mark_received,
+                    receipt_scope,
                 } => {
-                    let operation = match (show, mark_accepted, drop) {
-                        (_, Some(id), _) => Operation::Accept { id },
-                        (_, _, Some(id)) => Operation::DropPending { id },
+                    let operation = match (show, mark_accepted, drop, mark_received) {
+                        (_, Some(id), ..) => Operation::Accept { id },
+                        (_, _, Some(id), _) => Operation::DropPending { id },
+                        (.., Some(id)) => Operation::MarkReceived {
+                            id,
+                            scope: receipt_scope.unwrap_or_default(),
+                        },
                         (show, ..) => Operation::Deliveries { show },
                     };
                     sessions::call(&root, &session, operation).await?
