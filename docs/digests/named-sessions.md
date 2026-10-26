@@ -43,9 +43,10 @@ notices. Typing and routine setup numerics do not end waits. Only one normal
 reader waits; the persisted cursor and last batch precede the reply. `--again`
 returns that batch even when stopped, until the next normal read replaces it.
 Overflow reports GAP. The pinned Rust Unicode tables escape nonprinting text;
-identity distinguishes nickname and server account. Up to 512 local reply
-references map to server msgids. Unrecognized reply IDs have a distinct `msgid:`
-prefix and a visible 128-character display cap. [2](#source-2) [4](#source-4)
+identity distinguishes nickname and server account. Up to 512 retained msgids
+deduplicate replay; records name messages by shared `m:` reference, or `msgid:`
+with a visible 128-character cap ([references](message-references.md)).
+[2](#source-2) [4](#source-4)
 
 [FACT] Send preparation is durable before queueing; only one send awaits
 confirmation. A unique client tag is matched together with authenticated account,

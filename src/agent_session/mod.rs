@@ -3,6 +3,7 @@ mod attention;
 mod channels;
 mod delivery;
 mod history;
+mod reference;
 mod state;
 mod storage;
 
@@ -365,42 +366,26 @@ impl ShowWalk {
         mut next: Option<(String, Option<String>)>,
     ) -> ShowStep {
         while let Some((reference, channel)) = next.take() {
-            let (local, msgid) = if reference.starts_with('@') {
-                (
-                    state.retained_show(&reference),
-                    state.resolve_reference(&reference).ok(),
-                )
-            } else {
-                let msgid = reference.strip_prefix("msgid:").unwrap_or(&reference);
-                if msgid.ends_with("…[truncated]") {
-                    self.note = Some(format!(
-                        "{reference}: the reply ID was truncated in the record and cannot be fetched"
-                    ));
+            let msgid = match reference::resolve(&reference) {
+                Ok(msgid) => msgid,
+                Err(e) => {
+                    self.note = Some(format!("{reference}: {e}"));
                     break;
                 }
-                let local = state
-                    .local_reference(msgid)
-                    .and_then(|r| state.retained_show(&r));
-                (local, Some(msgid.to_string()))
             };
-            match (local, msgid, channel) {
-                (Some(text), ..) => next = self.push(text),
-                (None, Some(msgid), Some(channel)) if crate::protocol::valid_channel(&channel) => {
+            match (state.retained_show(&msgid), channel) {
+                (Some(text), _) => next = self.push(text),
+                (None, Some(channel)) if crate::protocol::valid_channel(&channel) => {
                     return ShowStep::Fetch { channel, msgid };
                 }
-                (None, Some(_), Some(target)) => {
+                (None, Some(target)) => {
                     self.note = Some(format!(
                         "{reference} is no longer retained locally and was a private message to {target}; private messages have no server history"
                     ));
                 }
-                (None, Some(_), None) => {
+                (None, None) => {
                     self.note = Some(format!(
                         "{reference} is no longer retained locally; give --channel to fetch it from server history"
-                    ));
-                }
-                (None, None, _) => {
-                    self.note = Some(format!(
-                        "{reference} is unknown to this session; its reference expired"
                     ));
                 }
             }
@@ -418,9 +403,22 @@ impl ShowWalk {
             return None;
         }
         let (channel, reply) = state::record_links(&text);
-        let parent = (self.remaining > 0)
-            .then(|| reply.map(|r| (r.to_string(), channel.map(str::to_string))))
-            .flatten();
+        let parent = match reply {
+            Some(reply) if self.remaining > 0 && !reference::shareable(reply) => {
+                self.note = Some(if reply == reference::UNAVAILABLE {
+                    "the message this record replies to is no longer known to this session".into()
+                } else {
+                    format!(
+                        "{reply}: the reply ID is cut or escaped in the record and cannot be fetched"
+                    )
+                });
+                None
+            }
+            Some(reply) if self.remaining > 0 => {
+                Some((reply.to_string(), channel.map(str::to_string)))
+            }
+            _ => None,
+        };
         self.remaining = self.remaining.saturating_sub(1);
         self.bytes += text.len();
         self.records.push(text);
@@ -1021,12 +1019,17 @@ fn validate(operation: &Operation) -> Result<()> {
         );
         ensure!(!again || *wait == 0, "--again cannot wait");
     }
-    if let Operation::Send { text, .. } = operation {
+    if let Operation::Send { text, reply, .. } = operation {
         ensure!(
             text.len() <= crate::multiline::CLIENT_MAX_BYTES,
             "message exceeds {} bytes; share larger content as an artifact",
             crate::multiline::CLIENT_MAX_BYTES
         );
+        if let Some(reply) = reply
+            && let Err(e) = reference::resolve(reply)
+        {
+            bail!("not sent: --reply {e}");
+        }
     }
     if let Some(request) = operation.control() {
         request.validate()?;
@@ -1083,8 +1086,9 @@ fn validate(operation: &Operation) -> Result<()> {
                 && channel
                     .as_deref()
                     .is_none_or(crate::protocol::valid_channel),
-            "show needs @N or a msgid, an optional valid --channel and --chain 1–{SHOW_DEPTH}"
+            "show needs an m: reference or a msgid, an optional valid --channel and --chain 1–{SHOW_DEPTH}"
         );
+        reference::resolve(reference)?;
     }
     match operation {
         Operation::Accept { id }
@@ -1383,7 +1387,7 @@ async fn serve(
                             ShowStep::Fetch { channel, msgid } => match state.begin_lookup(&channel, &msgid) {
                                 Ok(()) => showing = Some(WaitingShow { until: Instant::now() + SHOW_TIMEOUT, msgid, walk, reply: call.reply }),
                                 Err(e) => {
-                                    walk.note = Some(format!("msgid:{msgid}: {e}"));
+                                    walk.note = Some(format!("{}: {e}", reference::present(&msgid)));
                                     let _ = call.reply.send(walk.finish());
                                 }
                             },
@@ -1519,14 +1523,15 @@ async fn serve(
                         Some(text) => pending.walk.push(text),
                         None => {
                             pending.walk.note = Some(format!(
-                                "msgid:{}: the server returned no message record",
-                                pending.msgid
+                                "{}: the server returned no message record",
+                                reference::present(&pending.msgid)
                             ));
                             None
                         }
                     },
                     Err(e) => {
-                        pending.walk.note = Some(format!("msgid:{}: {e}", pending.msgid));
+                        pending.walk.note =
+                            Some(format!("{}: {e}", reference::present(&pending.msgid)));
                         None
                     }
                 };
@@ -1538,7 +1543,8 @@ async fn serve(
                         match state.begin_lookup(&channel, &msgid) {
                             Ok(()) => showing = Some(WaitingShow { msgid, ..pending }),
                             Err(e) => {
-                                pending.walk.note = Some(format!("msgid:{msgid}: {e}"));
+                                pending.walk.note =
+                                    Some(format!("{}: {e}", reference::present(&msgid)));
                                 let _ = pending.reply.send(pending.walk.finish());
                             }
                         }
@@ -1553,8 +1559,8 @@ async fn serve(
         {
             let mut pending = showing.take().unwrap();
             pending.walk.note = Some(format!(
-                "msgid:{}: the history lookup did not finish in time",
-                pending.msgid
+                "{}: the history lookup did not finish in time",
+                reference::present(&pending.msgid)
             ));
             let _ = pending.reply.send(pending.walk.finish());
         }
@@ -1884,6 +1890,45 @@ mod tests {
     }
 
     #[test]
+    fn show_and_reply_refuse_local_numbers_before_any_request() {
+        let show = |reference: &str| {
+            validate(&Operation::Show {
+                reference: reference.into(),
+                channel: None,
+                depth: 0,
+            })
+        };
+        let send = |reply: &str| {
+            validate(&Operation::Send {
+                target: "#work".into(),
+                text: "x".into(),
+                reply: Some(reply.into()),
+            })
+        };
+        let local = show("@3").unwrap_err().to_string();
+        assert!(
+            local.contains("not message references") && local.contains("m: reference"),
+            "{local}"
+        );
+        let reply = send("@1").unwrap_err().to_string();
+        assert!(reply.starts_with("not sent: --reply local @N"), "{reply}");
+        for invalid in ["@", "m:Ej5FZ-ibQtOkVkJmFBdAAB", "m:short", "msgid:"] {
+            assert!(
+                show(invalid).is_err() && send(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        for valid in [
+            "m:Ej5FZ-ibQtOkVkJmFBdAAA",
+            "msgid:123e4567-e89b-42d3-a456-426614174000",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "opaque-1",
+        ] {
+            assert!(show(valid).is_ok() && send(valid).is_ok(), "{valid}");
+        }
+    }
+
+    #[test]
     fn private_ancestors_are_never_fetched_from_channel_history() {
         let config = ClientConfig {
             host: "localhost".into(),
@@ -1905,18 +1950,22 @@ mod tests {
         let mut dm = crate::protocol::Message::new("PRIVMSG", ["Alice", "hi"]);
         dm.prefix = Some("Human!human@airc".into());
         dm.tags.insert("account".into(), "human".into());
-        dm.tags.insert("msgid".into(), "dm1".into());
+        dm.tags.insert(
+            "msgid".into(),
+            "123e4567-e89b-42d3-a456-426614174000".into(),
+        );
         dm.tags.insert("+reply".into(), "gone".into());
         state.ingest(&dm, false);
         let mut walk = walk(1);
-        let ShowStep::Done(response) = walk.advance(&mut state, Some(("@1".into(), None))) else {
+        let reference = "m:Ej5FZ-ibQtOkVkJmFBdAAA".to_string();
+        let ShowStep::Done(response) = walk.advance(&mut state, Some((reference, None))) else {
             panic!("a private ancestor must not trigger a channel history lookup");
         };
         assert!(response.ok);
         assert!(
-            response
-                .text
-                .starts_with("context @1 Alice Human(human) reply=msgid:gone: hi\n"),
+            response.text.starts_with(
+                "context m:Ej5FZ-ibQtOkVkJmFBdAAA Alice Human(human) reply=msgid:gone: hi\n"
+            ),
             "{}",
             response.text
         );

@@ -669,7 +669,7 @@ mod tests {
             seen.insert(format!("id-{n}"));
             state.ingest(&m, true);
         }
-        assert!(state.resolve_reference("@1").is_err());
+        assert!(!state.remembered_ids().contains("id-0"));
         while state.has_unread() {
             state.read(200);
         }

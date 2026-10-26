@@ -315,7 +315,8 @@ mod tests {
     #[test]
     fn batch_bounds_and_shape() {
         for marker in ["[airc id=", "[airc delivery id="] {
-            let batch = format!("{marker}x session=space]\n@1 #space a(b): hi\n");
+            let batch =
+                format!("{marker}x session=space]\nm:Ej5FZ-ibQtOkVkJmFBdAAA #space a(b): hi\n");
             assert_eq!(read_batch(batch.as_bytes()).unwrap(), batch);
         }
         let exact = format!(
@@ -326,7 +327,7 @@ mod tests {
         let over = format!("{exact}y");
         assert!(read_batch(over.as_bytes()).unwrap_err().contains("exceeds"));
         assert!(read_batch(&b""[..]).is_err());
-        assert!(read_batch(&b"@1 #space a(b): no header"[..]).is_err());
+        assert!(read_batch(&b"m:Ej5FZ-ibQtOkVkJmFBdAAA #space a(b): no header"[..]).is_err());
         assert!(read_batch(&b"[airc session=space]\n| [airc id=x]"[..]).is_err());
         assert!(read_batch(&b"[airc \0"[..]).unwrap_err().contains("NUL"));
         assert!(
@@ -355,7 +356,9 @@ mod tests {
     #[test]
     fn header_id_must_match_the_announced_delivery() {
         for marker in ["[airc ", "[airc delivery "] {
-            let batch = format!("{marker}id=6f1c session=space]\n@1 #space a(b): id=6f1c\n");
+            let batch = format!(
+                "{marker}id=6f1c session=space]\nm:Ej5FZ-ibQtOkVkJmFBdAAA #space a(b): id=6f1c\n"
+            );
             assert!(check_delivery_id(&batch, None).is_ok());
             assert!(check_delivery_id(&batch, Some("6f1c")).is_ok());
             assert!(check_delivery_id(&batch, Some("6f1d")).is_err());

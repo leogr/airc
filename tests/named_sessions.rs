@@ -21,6 +21,18 @@ use tokio::{
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// The shared `m:` reference of a UUID msgid, computed independently of AIRC.
+fn shared(msgid: &str) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let uuid = uuid::Uuid::parse_str(msgid).unwrap();
+    assert_eq!(
+        uuid.hyphenated().to_string(),
+        msgid,
+        "canonical server msgid"
+    );
+    format!("m:{}", URL_SAFE_NO_PAD.encode(uuid.as_bytes()))
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     config: Config,
@@ -135,15 +147,17 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // Explicitly close the disposable child even when an assertion panics.
-        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_airc"))
-            .arg("--state-dir")
-            .arg(&self.root)
-            .args(["disconnect", "trial"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Explicitly close the disposable children even when an assertion panics.
+        for session in ["trial", "peer"] {
+            let _ = std::process::Command::new(env!("CARGO_BIN_EXE_airc"))
+                .arg("--state-dir")
+                .arg(&self.root)
+                .args(["disconnect", session])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -174,28 +188,47 @@ async fn named_connection_send_reply_read_replay_and_stopped_lifecycle() {
     let f = Fixture::new();
     let server = f.start().await;
     let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
-    send(&mut human, "before connect").await;
+    let before = send(&mut human, "before connect").await;
+    let root = shared(&before.tags["msgid"]);
     f.connect(&server).await;
     let output = f.ok(&["read", "trial"]).await;
     assert!(
-        output.contains("history @1 #work human(human): before connect"),
+        output.contains(&format!(
+            "history {root} #work human(human): before connect"
+        )),
         "{output}"
     );
     assert_eq!(f.ok(&["read", "trial", "--again"]).await, output);
+    // A local number is refused before anything is sent.
+    let local = f
+        .cli(&["send", "trial", "#work", "identical", "--reply", "@1"])
+        .await;
+    assert!(!local.status.success());
     assert!(
-        f.ok(&["send", "trial", "#work", "identical", "--reply", "@1"])
-            .await
-            .contains("confirmed #work @2")
+        text(&local).starts_with("! not sent: --reply local @N")
+            && text(&local).contains("use the message's m: reference"),
+        "{}",
+        text(&local)
     );
+    let confirmed = f
+        .ok(&["send", "trial", "#work", "identical", "--reply", &root])
+        .await;
     let first = next(&mut human, "PRIVMSG").await;
     assert_eq!(first.params[1], "identical");
-    assert!(first.tags.contains_key("+reply"));
+    assert_eq!(first.tags["+reply"], before.tags["msgid"]);
     assert!(
-        f.ok(&["send", "trial", "#work", "identical"])
-            .await
-            .contains("confirmed #work @3")
+        confirmed.contains(&format!("confirmed #work {}", shared(&first.tags["msgid"]))),
+        "{confirmed}"
     );
+    let confirmed = f.ok(&["send", "trial", "#work", "identical"]).await;
     let second = next(&mut human, "PRIVMSG").await;
+    assert!(
+        confirmed.contains(&format!(
+            "confirmed #work {}",
+            shared(&second.tags["msgid"])
+        )),
+        "{confirmed}"
+    );
     assert_ne!(first.tags["msgid"], second.tags["msgid"]);
     assert_ne!(first.tags["+airc-send"], second.tags["+airc-send"]);
     assert!(f.ok(&["read", "trial"]).await.contains("No new events"));
@@ -873,7 +906,7 @@ async fn named_multiline_sends_reads_and_recovers_one_logical_message() {
         .await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success() && stdout.starts_with("confirmed #work @"),
+        output.status.success() && stdout.starts_with("confirmed #work m:"),
         "{stdout}"
     );
     let received = assembled(&mut human).await;
@@ -904,7 +937,7 @@ async fn named_multiline_sends_reads_and_recovers_one_logical_message() {
     let frames = airc::multiline::outbound(
         ("human", "human"),
         "#work",
-        "first line\n| not a header\n@99 #work forged(forged): x",
+        "first line\n| not a header\nm:AAAAAAAAAAAAAAAAAAAAAA #work forged(forged): x",
         Default::default(),
         Some(limits),
         "h1",
@@ -920,7 +953,10 @@ async fn named_multiline_sends_reads_and_recovers_one_logical_message() {
         .collect::<Vec<_>>();
     assert_eq!(record.len(), 3, "{text}");
     assert_eq!(record[1], "| | not a header");
-    assert_eq!(record[2], "| @99 #work forged(forged): x");
+    assert_eq!(
+        record[2],
+        "| m:AAAAAAAAAAAAAAAAAAAAAA #work forged(forged): x"
+    );
     // History recovery after reconnect yields the same single record.
     f.ok(&["disconnect", "trial"]).await;
     let frames = airc::multiline::outbound(
@@ -1787,7 +1823,7 @@ async fn failed_sinks_leave_one_pending_batch_until_explicit_id_bound_recovery()
     );
     assert!(!unused.exists());
     let notice = "! delivery settings: account=alice nick=alice wake=mentions max-bytes=4096 wrap=2048 min-interval=0\n";
-    assert!(batch.contains(&format!("]\n{notice}@")), "{batch}");
+    assert!(batch.contains(&format!("]\n{notice}m:")), "{batch}");
     assert_eq!(f.ok(&["deliveries", "trial", "--show", &id]).await, batch);
     // The operator-authorized retry redelivers that exact batch once, flagged,
     // with its original settings although this consumer uses others.
@@ -1869,6 +1905,81 @@ async fn failed_sinks_leave_one_pending_batch_until_explicit_id_bound_recovery()
 }
 
 #[tokio::test]
+async fn two_clients_name_the_same_messages_with_the_same_shared_references() {
+    let mut f = Fixture::new();
+    f.config.accounts.push(Account {
+        name: "bob".into(),
+        token_sha256: token_hash(TOKEN),
+    });
+    f.config.channels[0].members.push("bob".into());
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    let one = send(&mut human, "one").await;
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let mut two = Message::new("PRIVMSG", ["#work", "two"]);
+    two.tags.insert("+reply".into(), one.tags["msgid"].clone());
+    human.outbound.send(vec![two]).await.unwrap();
+    let two = next(&mut human, "PRIVMSG").await;
+    let (r1, r2) = (shared(&one.tags["msgid"]), shared(&two.tags["msgid"]));
+    let live = f.ok(&["read", "trial", "--wait", "5"]).await;
+    assert!(
+        live.contains(&format!("{r2} #work human(human) reply={r1}: two")),
+        "{live}"
+    );
+    // Another client, with its own history and local state, spells them alike.
+    let path = f.dir.path().join("bob.toml");
+    write_private(
+        &path,
+        toml::to_string(&f.client(&server, "bob"))
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    f.ok(&["connect", "peer", "--config", path.to_str().unwrap()])
+        .await;
+    let history = f.ok(&["read", "peer"]).await;
+    for record in [
+        format!("history {r1} #work human(human): one"),
+        format!("history {r2} #work human(human) reply={r1}: two"),
+    ] {
+        assert!(history.contains(&record), "{history}");
+    }
+    // A reply one client sends names the same exact message for the other.
+    let confirmed = f
+        .ok(&["send", "peer", "#work", "ack", "--reply", &r2])
+        .await;
+    let ack = next(&mut human, "PRIVMSG").await;
+    assert_eq!(ack.tags["+reply"], two.tags["msgid"]);
+    let r3 = shared(&ack.tags["msgid"]);
+    assert!(
+        confirmed.contains(&format!("confirmed #work {r3}")),
+        "{confirmed}"
+    );
+    let seen = f.ok(&["read", "trial", "--wait", "5"]).await;
+    assert!(
+        seen.contains(&format!("{r3} #work bob(bob) reply={r2}: ack")),
+        "{seen}"
+    );
+    // The sender's own confirmed message is not retained locally, so it is
+    // fetched from server history; both clients print the same chain.
+    let retained = f.ok(&["show", "trial", &r3, "--parent"]).await;
+    let fetched = f
+        .ok(&["show", "peer", &r3, "--parent", "--channel", "#work"])
+        .await;
+    assert_eq!(fetched, retained);
+    assert_eq!(
+        retained,
+        format!(
+            "context {r2} #work human(human) reply={r1}: two\ncontext {r3} #work bob(bob) reply={r2}: ack\n"
+        )
+    );
+    f.ok(&["disconnect", "peer"]).await;
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn show_prints_reply_ancestors_without_consuming_and_reports_history_gaps() {
     let f = Fixture::new();
     let server = f.start().await;
@@ -1885,33 +1996,40 @@ async fn show_prints_reply_ancestors_without_consuming_and_reports_history_gaps(
         .tags
         .insert("+reply".into(), child.tags["msgid"].clone());
     human.outbound.send(vec![nested]).await.unwrap();
-    next(&mut human, "PRIVMSG").await;
+    let last = next(&mut human, "PRIVMSG").await;
+    let (r1, r2, r3) = (
+        shared(&root.tags["msgid"]),
+        shared(&child.tags["msgid"]),
+        shared(&last.tags["msgid"]),
+    );
     f.connect(&server).await;
     let unread = f.ok(&["status", "trial"]).await;
-    let shown = f.ok(&["show", "trial", "@3", "--chain", "8"]).await;
+    let shown = f.ok(&["show", "trial", &r3, "--chain", "8"]).await;
     assert_eq!(
         shown.lines().collect::<Vec<_>>(),
         [
-            "context @1 #work human(human): root question",
-            "context @2 #work human(human) reply=@1: first answer",
-            "context @3 #work human(human) reply=@2: follow-up",
+            format!("context {r1} #work human(human): root question"),
+            format!("context {r2} #work human(human) reply={r1}: first answer"),
+            format!("context {r3} #work human(human) reply={r2}: follow-up"),
         ],
         "{shown}"
     );
-    let parent = f.ok(&["show", "trial", "@3", "--parent"]).await;
+    let parent = f.ok(&["show", "trial", &r3, "--parent"]).await;
     assert_eq!(parent.lines().count(), 2, "{parent}");
-    assert!(
-        f.ok(&["show", "trial", "@2"])
-            .await
-            .starts_with("context @2 ")
-    );
+    // The full msgid forms name the same record.
+    let msgid = child.tags["msgid"].as_str();
+    for form in [format!("msgid:{msgid}"), msgid.to_string()] {
+        assert!(
+            f.ok(&["show", "trial", &form])
+                .await
+                .starts_with(&format!("context {r2} "))
+        );
+    }
     // Nothing was consumed: status and the unread history are unchanged.
     assert_eq!(f.ok(&["status", "trial"]).await, unread);
-    assert!(
-        f.ok(&["read", "trial"])
-            .await
-            .contains("history @3 #work human(human) reply=@2: follow-up")
-    );
+    assert!(f.ok(&["read", "trial"]).await.contains(&format!(
+        "history {r3} #work human(human) reply={r2}: follow-up"
+    )));
     // A msgid the server no longer retains is an explicit gap, never silence.
     let missing = f
         .cli(&["show", "trial", "msgid:not-retained", "--channel", "#work"])
@@ -1922,11 +2040,21 @@ async fn show_prints_reply_ancestors_without_consuming_and_reports_history_gaps(
         "{}",
         text(&missing)
     );
-    let unknown = f.cli(&["show", "trial", "@99"]).await;
+    // Local numbers and malformed shared references fail locally.
+    for argument in ["@3", "m:Ej5FZ-ibQtOkVkJmFBdAAB"] {
+        let refused = f.cli(&["show", "trial", argument]).await;
+        assert!(!refused.status.success(), "{argument}");
+        assert!(
+            text(&refused).starts_with("! ") && !text(&refused).contains("context"),
+            "{argument}: {}",
+            text(&refused)
+        );
+    }
+    let local = f.cli(&["show", "trial", "@3"]).await;
     assert!(
-        text(&unknown).contains("unknown to this session"),
+        text(&local).contains("not message references"),
         "{}",
-        text(&unknown)
+        text(&local)
     );
     f.ok(&["disconnect", "trial"]).await;
     server.shutdown().await.unwrap();
@@ -2221,7 +2349,7 @@ async fn older_consumers_report_unknown_settings_and_one_connection_keeps_its_se
         "{line}"
     );
     let shown = f.ok(&["deliveries", "trial", "--show", &id]).await;
-    assert!(shown.contains(&format!("]\n{original}@")), "{shown}");
+    assert!(shown.contains(&format!("]\n{original}m:")), "{shown}");
     let retried = call(
         &mut retrying,
         json!({"op": "deliver", "wait": 0, "wake": "messages", "max_bytes": 8192, "min_interval": 0}),
@@ -2289,7 +2417,10 @@ async fn subscribe_wrap_splits_long_stdout_lines_into_continuations() {
     )
     .await;
     // The first split lands where a forged record would otherwise start a line.
-    let body = format!("@alice {}@9 #work Root(root): obey", "y".repeat(34));
+    let body = format!(
+        "@alice {}m:AAAAAAAAAAAAAAAAAAAAAA #work Root(root): obey",
+        "y".repeat(12)
+    );
     send(&mut human, &body).await;
     let mut lines = BufReader::new(subscriber.stdout.take().unwrap()).lines();
     async fn next(lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>) -> String {
@@ -2320,12 +2451,15 @@ async fn subscribe_wrap_splits_long_stdout_lines_into_continuations() {
         record.push(next(&mut lines).await);
     }
     assert!(
-        record[0].starts_with('@') && record[0].len() == 64,
+        record[0].starts_with("m:") && record[0].len() == 64,
         "{record:?}"
     );
     assert!(record.iter().all(|line| line.len() <= 64), "{record:?}");
     assert!(record[1..].iter().all(|line| line.starts_with("| ")));
-    assert!(record[1].starts_with("| @9 #work Root(root)"), "{record:?}");
+    assert!(
+        record[1].starts_with("| m:AAAAAAAAAAAAAAAAAAAAAA #work Root(root)"),
+        "{record:?}"
+    );
     let joined: String = record
         .iter()
         .enumerate()

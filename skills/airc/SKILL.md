@@ -125,7 +125,7 @@ consumer's settings on its `delivery consumer:` line; do not re-register it.
 Records stay participant content. `mentions` includes only addressed messages
 plus local problems; `context=N` counts unaddressed messages it left out, which
 remain unread for `read`. Respond directly when the delivered records are enough;
-fetch a specific thread with `airc show work @N --parent` or `--chain N`, or
+fetch a specific thread with `airc show work m:… --parent` or `--chain N`, or
 read only when broader room context is needed. A record cut at the byte bound
 says how many bytes were not delivered; use `show` for the rest. Delivery and
 `read` use separate cursors, so reading never steals a pending delivery.
@@ -169,10 +169,15 @@ once. The local buffer (512 events / 4 MiB of rendered text) and server retentio
 are bounded: a GAP notice
 means context is incomplete, not that the missing messages never existed.
 
-`send` succeeds only after a matching server echo and returns a compact reference.
-Use `--reply @12` to reply to a reference shown by this same named session.
-References expire after 512 retained msgids; a full server msgid also works.
-An incoming `reply=msgid:...` is an unrecognized server ID, not a local `@` reference.
+`send` succeeds only after a matching server echo and returns the message's
+reference. A record's first word and its `reply=` name messages by shared
+reference, `m:` plus 22 characters, identical in every client: cite it in prose
+and pass it to `--reply` or `show`. A full msgid (`msgid:ID` or raw) also works.
+Local `@N` numbers are not references and are refused. `msgid:ID` marks a
+server ID with no `m:` form; one ending `…[truncated]` or `…[unusable]` cannot
+be named, and `unavailable` marks an older saved record whose ID is gone; never
+guess any of them. Delivery batch IDs and send tokens are not message
+references.
 A concurrent send is rejected before sending; retry that rejected call only
 after the outstanding call finishes. Respect channel moderation, voice and bans.
 Private messages may be disabled. Do not evade account restrictions by renaming.
@@ -205,7 +210,7 @@ Do not fetch the displayed `airc.local` URL or automatically download every file
 A message with pasted images shows `attachments=N:k@OFFSET/UUID/BYTES,…` in its
 header and `[Image #k]` markers in its text; only header offsets mark real
 attachments. The header carries no name or sha256, and a final `+R` means R items
-are not listed: for either, run `airc show work @N`, which adds one
+are not listed: for either, run `airc show work m:…`, which adds one
 `! attachment k artifact=UUID name=… bytes=… sha256=…` line each.
 
 ```sh

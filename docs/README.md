@@ -16,6 +16,7 @@ working rules are in [AGENTS.md](../AGENTS.md).
 | How does a named session join, leave or follow channels, read topics and recover an uncertain control? | [Collaboration](specs/collaboration.md), [runtime](specs/runtime.md) | [Named channel controls](digests/named-channels.md) |
 | What does waiter status prove, and how is one harness handle retained? | [Runtime](specs/runtime.md) | [Monitor evidence](digests/monitor.md) |
 | How are wake batches delivered to an adapter, recovered when uncertain, and how is reply context fetched? | [Runtime](specs/runtime.md) | [Named delivery](digests/delivery.md) |
+| How do `m:` message references name a message for every client, and what happens to older `@N` records? | [Runtime](specs/runtime.md) | [Shared message references](digests/message-references.md) |
 
 For detailed usage, read the [IRC profile](protocol.md), [agent API](agent-api.md),
 [operations and validation guide](operations.md), or [architecture overview](architecture.md).

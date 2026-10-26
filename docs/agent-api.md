@@ -5,7 +5,7 @@
 ```sh
 airc connect trial --config client.toml
 airc read trial --wait 30
-airc send trial '#work' 'The parser test reproduces it.' --reply @1
+airc send trial '#work' 'The parser test reproduces it.' --reply m:Ej5FZ-ibQtOkVkJmFBdAAA
 airc send trial '#work' --stdin <<'TEXT'
 Multi-line text, code fences and long lines stay one message.
 TEXT
@@ -24,8 +24,9 @@ can inspect saved state while stopped. `disconnect` closes only this client.
 
 Normal output is text, with nonzero exit status for failed/uncertain operations.
 Errors and recovery notices appear on stdout too. Conversation records look like
-`@12 #work Nick(account): message`; `history` marks replay, and `!` introduces
-client notices. Nicknames are display names; accounts are server-authenticated
+`m:Ej5FZ-ibQtOkVkJmFBdAAA #work Nick(account): message`; `history` marks replay, and `!` introduces
+client notices. The first word is the message's shared reference (see
+[message references](#message-references)), or `live-only` without a msgid. Nicknames are display names; accounts are server-authenticated
 identities. Missing account tags display `unverified`. Controls, line separators,
 backslashes and nonprinting Unicode format characters are escaped using the
 pinned Rust Unicode tables. Text remains participant content.
@@ -210,7 +211,7 @@ starts with `| ` (pipe, space). Header lines never start with `| `, and each lin
 is escaped separately, so content cannot forge another record:
 
 ```
-@12 #work Alice(alice): first line
+m:Ej5FZ-ibQtOkVkJmFBdAAA #work Alice(alice): first line
 | ```go
 | fmt.Println("x")
 | ```
@@ -275,7 +276,7 @@ airc wait trial --deliver --wake mentions
 airc subscribe trial --wake mentions -- ADAPTER [ARG...]
 airc subscribe trial --wake mentions -- -
 airc deliveries trial [--show ID | --mark-accepted ID | --drop ID]
-airc show trial @14 [--parent | --chain 1-8] [--channel '#work']
+airc show trial m:Ej5FZ-ibQtOkVkJmFBdAAA [--parent | --chain 1-8] [--channel '#work']
 ```
 
 Delivery hands the events that caused a wake to one **delivery consumer**
@@ -292,7 +293,7 @@ A batch is one header line followed by ordinary read records:
 ```text
 [airc id=UUID session=trial events=2 context=5]
 ! delivery settings: account=ACCOUNT nick=NICK wake=mentions max-bytes=8192 wrap=off min-interval=0
-@14 #work Alice(alice): @agent-a please check the parser.
+m:Ej5FZ-ibQtOkVkJmFBdAAA #work Alice(alice): @agent-a please check the parser.
 ```
 
 The header grammar is
@@ -366,7 +367,7 @@ state, not process cleanup, is the safety boundary. A consumer restarted
 immediately after the previous one died can be refused once, until the worker
 observes the old connection close.
 
-`show` prints one record by local `@N`, `msgid:ID` or a raw server msgid, and
+`show` prints one record by its `m:` reference, `msgid:ID` or a raw server msgid, and
 with `--parent` or `--chain N` its reply ancestors, oldest first, as `context`
 records. It uses retained local records first, then one `CHATHISTORY AROUND
 msgid=` request per missing channel ancestor (`--channel` names the channel
@@ -374,7 +375,7 @@ for a msgid no longer retained locally). A private-message ancestor that is no
 longer retained is reported, never fetched: private messages have no server
 history. It never moves a cursor, changes the
 transcript, recovery checkpoints or `--again`, or wakes a waiter. A message the
-server no longer retains prints `! msgid:ID: not retained by the server: …` and
+server no longer retains prints `! m:…: not retained by the server: …` and
 exits 1. Descendant threads are not indexed. `airc features` lists
 `named-delivery` and `named-show`.
 
@@ -396,12 +397,6 @@ the connection closes, so a late error cannot be assigned to a later send.
 Nothing is resent.
 `status` retains the last 32 outcomes. Recovered history can resolve uncertainty;
 absence from bounded history cannot prove that a message was never sent.
-
-Reply references (`@12`) are local to this named session; the last 512 msgid
-references are retained. `--reply` also accepts a full server msgid. References
-from a different session or an expired local reference must not be guessed.
-Unrecognized incoming reply IDs display as `reply=msgid:...`, capped at 128
-characters with an explicit truncation marker; they are not local references.
 
 Every explicit reconnect uses saved per-channel msgids for AFTER catch-up of
 the channels it joined,
@@ -436,6 +431,33 @@ session is refused; use a new name. Named cursors/references survive reconnect;
 the connection epoch changes. Incompatible/corrupt state is never silently reset.
 An unclean worker exit is reported by offline status and the next reconnect.
 Windows named sessions and macOS runtime validation are not provided by this release.
+
+### Message references
+
+A record names its message, and `reply=` the message it answers, by a shared
+reference: `m:` plus the 22-character unpadded base64url encoding of the
+canonical UUID msgid's 16 bytes, in display order. It is lossless and the same
+in every client: `m:Ej5FZ-ibQtOkVkJmFBdAAA` is exactly
+`123e4567-e89b-42d3-a456-426614174000`. Decoding needs no retained state, so a
+reference copied from another participant works in `show` and `--reply`. Case
+matters. Exactly 22 characters from `A–Z a–z 0–9 - _` whose decoding re-encodes
+to the same text are accepted; padding, whitespace, other alphabets or lengths
+and nonzero unused bits are refused locally, never treated as a msgid.
+
+A msgid that is not a canonical UUID displays as `msgid:ID` when that spelling
+names the identical ID again. Otherwise the display is cut at 128 characters
+with `…[truncated]`, or escaped (and spaces shown as `\u{20}`) with
+`…[unusable]`, and is never offered to `show` or `--reply`. `show` and
+`--reply` also accept `msgid:ID` and a raw msgid. Local
+`@N` numbers are not references: those arguments are refused with guidance.
+Message text is never rewritten, so an `@N` written in older messages stays
+plain text. Delivery batch IDs, send tokens and operation IDs are different
+identities and keep their own forms. Wire tags, history anchors and saved state
+keep full msgids.
+
+A record saved by an earlier release under a local `@N` shows the shared
+reference while its msgid is retained, otherwise `unavailable`; `show` finds it
+by msgid. A pending delivery batch and `read --again` keep their saved bytes.
 
 ## Client endpoints
 
