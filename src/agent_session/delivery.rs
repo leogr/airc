@@ -12,6 +12,7 @@
 
 use super::{
     attention::{Classification, WakeMode},
+    reference,
     storage::SOCKET_PATH_BYTES,
 };
 use anyhow::{Result, ensure};
@@ -608,12 +609,12 @@ pub(super) fn wrap(text: &str, limit: usize) -> String {
     out
 }
 
-/// The local `@N` that starts a rendered message record, if it has one.
+/// The shared reference that starts a rendered message record, if it has one
+/// that `show` can take.
 pub(super) fn record_reference(text: &str) -> Option<&str> {
     let text = text.strip_prefix("history ").unwrap_or(text);
     let token = text.split(' ').next()?;
-    (token.len() > 1 && token.starts_with('@') && token[1..].bytes().all(|b| b.is_ascii_digit()))
-        .then_some(token)
+    reference::shareable(token).then_some(token)
 }
 
 #[cfg(test)]
@@ -880,8 +881,27 @@ mod tests {
         assert_eq!(prefix("aé", 2), "a");
         assert_eq!(prefix("aé", 3), "aé");
         assert_eq!(prefix("abc", 9), "abc");
-        assert_eq!(record_reference("@12 #work A(a): x"), Some("@12"));
-        assert_eq!(record_reference("history @3 #work A(a): x"), Some("@3"));
+        let shared = "m:Ej5FZ-ibQtOkVkJmFBdAAA";
+        assert_eq!(
+            record_reference(&format!("{shared} #work A(a): x")),
+            Some(shared)
+        );
+        assert_eq!(
+            record_reference(&format!("history {shared} #work A(a): x")),
+            Some(shared)
+        );
+        assert_eq!(
+            record_reference("msgid:id-3 #work A(a): x"),
+            Some("msgid:id-3")
+        );
+        // Neither an older local number nor an unusable token is offered to show.
+        assert_eq!(record_reference("@12 #work A(a): x"), None);
+        assert_eq!(record_reference("unavailable #work A(a): x"), None);
+        assert_eq!(
+            record_reference("m:Ej5FZ-ibQtOkVkJmFBdAAB #work A(a): x"),
+            None
+        );
+        assert_eq!(record_reference("msgid:x…[truncated] #work A(a): x"), None);
         assert_eq!(record_reference("live-only #work A(a): x"), None);
         assert_eq!(record_reference("! GAP"), None);
         assert!(validate_id("00000000-0000-4000-8000-000000000000").is_ok());

@@ -40,9 +40,10 @@ target/debug/airc status work
 target/debug/airc disconnect work
 ```
 
-Reads show compact messages with nick/account identity and local reply references.
-`read work --again` replays the last batch after lost output; `send --reply @1`
-replies to a displayed reference. Send success requires a correlated server echo;
+Reads show compact messages with nick/account identity and shared `m:` message
+references, which name the same message in every client. `read work --again`
+replays the last batch after lost output; `send --reply m:…` replies to a
+displayed reference. Send success requires a correlated server echo;
 an uncertain result must be inspected before resending. Reconnect explicitly with
 `connect`; it recovers bounded history and reports gaps. Named sessions require Unix.
 The original `airc --config FILE` JSONL interface remains available for advanced

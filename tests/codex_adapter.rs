@@ -11,7 +11,7 @@ const THREAD: &str = "0199a3b2-6c1d-7e00-8f00-123456789abc";
 /// A compact header: omitted counters and bare flags, then the settings notice.
 const BATCH: &str = "[airc id=6f1c session=space context=2 more retry]\n\
 ! delivery settings: account=worker nick=worker wake=mentions max-bytes=8192 wrap=off min-interval=0\n\
-@3 #space root(acct) reply=@2: @worker «ünïcode» `$(touch pwned)` \"q\"\n\
+m:Ej5FZ-ibQtOkVkJmFBdAAA #space root(acct) reply=m:ABEiM0RVZneImaq7zN3u_w: @worker «ünïcode» `$(touch pwned)` \"q\"\n\
 | second line; $HOME stays literal\n";
 /// A batch saved by an earlier release, with every field and the old marker.
 const LEGACY: &str = "[airc delivery id=6f1c session=space account=worker nick=worker wake=mentions events=1 context=2 bytes=80 more=yes gap=no retry=yes]\n\
@@ -144,7 +144,7 @@ fn refuses_before_spawning_codex() {
     let oversize = format!("{BATCH}{}", "x".repeat(64 * 1024));
     for input in [
         oversize.as_bytes(),
-        b"@3 #space no header\n",
+        b"m:Ej5FZ-ibQtOkVkJmFBdAAA #space no header\n",
         b"",
         b"[airc \xff",
     ] {

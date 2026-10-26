@@ -12,8 +12,8 @@
 | `airc subscribe NAME [--wake …] [--max-bytes N] [--wrap B] [--min-interval S] [--sink-timeout S] [--retry-pending ID] [--receipt-timeout S --receipt-scope UUID] -- ADAPTER…\|-` | Persistent delivery consumer; runs ADAPTER without a shell, batch on stdin, `AIRC_SESSION`/`AIRC_DELIVERY_ID`/`AIRC_DELIVERY_RETRY`/`AIRC_SUBSCRIBER_PID` in env; exit 0 accepts, anything else leaves the batch pending and exits 1; `-` prints to stdout; `--wrap` (64–65536) splits longer record lines into `\| ` continuations, never the header; never retries; opt-in `--receipt-timeout` (1–3600 s, ≥ `--min-interval`, not with `--wrap`, nor may a pending receipt batch be retried with `--wrap`) holds later batches after acceptance until the exact report, the timeout, urgent events or retention pressure; each batch prints the complete `airc --state-dir DIR …` report command; not a queue cap |
 | `airc deliveries NAME [--show ID\|--mark-accepted ID\|--drop ID]` | Delivery cursor, pending batch and consumer; ID-bound recovery, refused while a consumer runs; dropped events stay readable; `status` shows the same `delivery:` lines |
 | `airc deliveries NAME --mark-received ID --receipt-scope UUID` | Receiver's once-only report for a receipt-enabled batch; allowed while a consumer runs; exact ID and scope or refused unchanged; never accepts, replays or proves processing; lists up to 32 receipt records |
-| `airc show NAME REF [--parent\|--chain 1-8] [--channel CHANNEL]` | REF is `@N`, `msgid:ID` or a raw msgid; print it (and reply ancestors, oldest first), local first, then one server `AROUND` per missing ancestor; no cursor, replay or readiness side effects; not retained exits 1 |
-| `airc send NAME TARGET TEXT --reply REF` | Send once; optional local `@N` or full msgid reply; matching server echo required for success |
+| `airc show NAME REF [--parent\|--chain 1-8] [--channel CHANNEL]` | REF is a shared `m:` reference, `msgid:ID` or a raw msgid (local `@N` is refused); print it (and reply ancestors, oldest first), local first, then one server `AROUND` per missing ancestor; no cursor, replay or readiness side effects; not retained exits 1 |
+| `airc send NAME TARGET TEXT --reply REF` | Send once; optional reply to a shared `m:` reference or full msgid (local `@N` is refused before sending); matching server echo required for success; prints the sent message's reference |
 | `airc send NAME TARGET --stdin` | Same, with exact text from stdin (at most 256 KiB, one final newline removed); newlines or long text become one multiline message |
 | `airc away NAME REASON` | Explicit 1–200 UTF-8-byte reason; no CR/LF/NUL; success requires server 306 |
 | `airc back NAME` | Clear explicit away; success requires server 305; no automatic inference or replay |
@@ -162,5 +162,5 @@ body URLs are not this metadata. Downloaded contents remain untrusted; a filenam
 or trusted artifact ID alone does not prove media type. No automatic fetch runs.
 A message with staged attachments instead carries `airc-artifacts`; its record
 header shows `attachments=N:k@OFFSET/UUID/BYTES,…` (a final `+R` counts unlisted
-items); for names, sha256 or unlisted items, `airc show NAME @N` adds full
+items); for names, sha256 or unlisted items, `airc show NAME m:…` adds full
 `! attachment k …` lines.

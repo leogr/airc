@@ -62,7 +62,11 @@ connected when channels are refused. [6](#source-6)
 Delivery uses a separate durable cursor and one connection-bound consumer:
 batches are pending before any sink sees them, are accepted only on sink
 success, and are never replayed without an explicit ID. Context lookups have no
-cursor or replay side effects. [8](#source-8)
+cursor or replay side effects. [8](#source-8) Records, `show` and `--reply` name
+messages by shared `m:` references that decode to the exact msgid without local
+state, so every client spells and resolves them alike; local `@N` numbers are
+refused, and saved older records show the shared reference or `unavailable`.
+[10](#source-10)
 
 [FACT] An opt-in receipt hold paces later batches after acceptance until the
 exact batch and scope are reported, a timeout passes, or urgent events or
@@ -92,3 +96,4 @@ current registration; optional private handle bookkeeping never proves a wake.
 7. <a id="source-7"></a> [Monitor evidence](../digests/monitor.md).
 8. <a id="source-8"></a> [Named delivery](../digests/delivery.md).
 9. <a id="source-9"></a> [Named delivery receipts](../digests/delivery-receipts.md).
+10. <a id="source-10"></a> [Shared message references](../digests/message-references.md).

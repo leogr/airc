@@ -99,10 +99,12 @@ enum Command {
         #[arg(last = true, required = true)]
         adapter: Vec<String>,
     },
-    /// Print a record (@N or msgid) and optionally its reply ancestors: local
-    /// retained records first, then bounded server history. Consumes nothing.
+    /// Print a record (its m: reference or msgid) and optionally its reply
+    /// ancestors: local retained records first, then bounded server history.
+    /// Consumes nothing.
     Show {
         session: String,
+        /// The message's m: reference, msgid:ID or raw msgid.
         reference: String,
         /// Channel for a msgid that is no longer retained locally.
         #[arg(long)]
@@ -146,6 +148,7 @@ enum Command {
         /// Read the exact text from stdin; one trailing newline is removed.
         #[arg(long)]
         stdin: bool,
+        /// Reply to this message: its m: reference, msgid:ID or raw msgid.
         #[arg(long)]
         reply: Option<String>,
     },

@@ -1,0 +1,53 @@
+{
+  "about": "Shared message reference vectors: m: plus the unpadded base64url encoding of a canonical UUID msgid's 16 bytes in display order. Every client must agree with each entry. opaque lists how an AIRC record header presents other msgids; only a shareable spelling names the identical msgid again.",
+  "valid": [
+    {"msgid": "00000000-0000-0000-0000-000000000000", "reference": "m:AAAAAAAAAAAAAAAAAAAAAA"},
+    {"msgid": "ffffffff-ffff-ffff-ffff-ffffffffffff", "reference": "m:_____________________w"},
+    {"msgid": "123e4567-e89b-42d3-a456-426614174000", "reference": "m:Ej5FZ-ibQtOkVkJmFBdAAA"},
+    {"msgid": "7a3e4567-e89b-42d3-a456-426614174000", "reference": "m:ej5FZ-ibQtOkVkJmFBdAAA"},
+    {"msgid": "00112233-4455-6677-8899-aabbccddeeff", "reference": "m:ABEiM0RVZneImaq7zN3u_w"},
+    {"msgid": "fbefbefb-efbe-fbef-befb-efbefbefbefb", "reference": "m:---------------------w"},
+    {"msgid": "f8000000-0000-4000-8000-00000000003f", "reference": "m:-AAAAAAAQACAAAAAAAAAPw"},
+    {"msgid": "0197a0c4-5b3e-7c21-9d4f-2e8a1b6c3d5e", "reference": "m:AZegxFs-fCGdTy6KG2w9Xg"},
+    {"msgid": "6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5", "reference": "m:bxwtPkpbTG2Of5ChssPU5Q"}
+  ],
+  "invalid": [
+    "m:",
+    "m:Ej5FZ-ibQtOkVkJmFBdAAB",
+    "m:Ej5FZ-ibQtOkVkJmFBdAAx",
+    "m:_____________________x",
+    "m:Ej5FZ-ibQtOkVkJmFBdAA",
+    "m:Ej5FZ-ibQtOkVkJmFBdAAAA",
+    "m:Ej5FZ-ibQtOkVkJmFBdAAA=",
+    "m:Ej5FZ-ibQtOkVkJmFBdAA==",
+    "m:Ej5FZ+ibQtOkVkJmFBdAAA",
+    "m:Ej5FZ/ibQtOkVkJmFBdAAA",
+    "m:Ej5FZ-ibQtOkVkJmFBd.AA",
+    "m: Ej5FZ-ibQtOkVkJmFBdAA",
+    "m:Ej5FZ-ibQtOkVkJmFBdAA\n",
+    "m:Ej5FZ-ibQtOkVkJmFBdAAé",
+    "M:Ej5FZ-ibQtOkVkJmFBdAAA",
+    "msgid:123e4567-e89b-42d3-a456-426614174000",
+    "Ej5FZ-ibQtOkVkJmFBdAAA"
+  ],
+  "uncompactable": [
+    "",
+    "id-1",
+    "123E4567-E89B-42D3-A456-426614174000",
+    "123e4567e89b42d3a456426614174000",
+    "{123e4567-e89b-42d3-a456-426614174000}",
+    "urn:uuid:123e4567-e89b-42d3-a456-426614174000",
+    "123e4567-e89b-42d3-a456-42661417400",
+    "123e4567-e89b-42d3-a456-4266141740000",
+    " 123e4567-e89b-42d3-a456-426614174000"
+  ],
+  "opaque": [
+    {"msgid": "id-1", "presented": "msgid:id-1", "shareable": true},
+    {"msgid": "123E4567-E89B-42D3-A456-426614174000", "presented": "msgid:123E4567-E89B-42D3-A456-426614174000", "shareable": true},
+    {"msgid": "a\\b", "presented": "msgid:a\\\\b…[unusable]", "shareable": false},
+    {"msgid": "a b", "presented": "msgid:a\\u{20}b…[unusable]", "shareable": false},
+    {"msgid": "id\nforged", "presented": "msgid:id\\nforged…[unusable]", "shareable": false},
+    {"msgid": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé", "presented": "msgid:éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé…[unusable]", "shareable": false},
+    {"msgid": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "presented": "msgid:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…[truncated]", "shareable": false}
+  ]
+}

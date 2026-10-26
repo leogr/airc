@@ -1,6 +1,6 @@
 # Named delivery and context lookup
 
-Verification: `9b5215ccc61ac235fa52f1f7211927d9d35d5f1f` and accompanying changes.
+Verification: `19db126da853896fb81d9eed2cb0295436955b5a` and accompanying changes.
 
 [FACT] Named state version 3 has an optional delivery record: a separate
 cursor, loss summary, one pending batch at most and the last outcome; opt-in
@@ -52,12 +52,13 @@ accepts; any other outcome leaves the batch pending and ends `subscribe` with
 exit 1. Only the direct child is killed; its descendants are not.
 [4](#source-4) [7](#source-7)
 
-[FACT] `show` resolves `@N`, `msgid:ID` or a raw msgid and walks up to eight
-reply ancestors through retained records, else one correlated `CHATHISTORY
-AROUND <channel> msgid=<id> 1` per missing channel ancestor, claimed only by
-its requesting show; private ancestors are reported, never fetched. Lookups
-never enter the transcript or checkpoints, are refused while history is
-quarantined, report unretained messages and run one at a time.
+[FACT] `show` resolves an `m:` [reference](message-references.md) or msgid
+and walks up to eight reply ancestors through retained records, else one
+correlated `CHATHISTORY AROUND <channel> msgid=<id> 1` per missing channel
+ancestor, claimed only by its requesting show; private ancestors are
+reported, never fetched. Lookups never enter the transcript or checkpoints, are
+refused while history is quarantined, report unretained messages and run one at
+a time.
 [3](#source-3) [5](#source-5) [8](#source-8)
 
 [FACT] `@all`/`@here` match only as standalone words outside backtick spans.
@@ -89,18 +90,18 @@ fakes; the operations guide records live checks. [6](#source-6) [7](#source-7) [
 
 ## Sources
 
-1. <a id="source-1"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L664-L1104) — delivery methods; `VERSION`, `notice_due`, `upgrade` at L37, L79, L1189–1201.
-2. <a id="source-2"></a> [src/agent_session/delivery.rs](../../src/agent_session/delivery.rs#L1-L938) — batch, `Compact`, `Settings`, `Rendering`, header, `wrap`, tests.
-3. <a id="source-3"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1330-L1472) — `serve` delivery and show operations; `revert_delivery` call at L1696.
-4. <a id="source-4"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L320-L365) — consumer status and refusals; `ConsumerSettings` at L190–207; `deliver` and `run_sink` at L762–1032.
+1. <a id="source-1"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L697-L1138) — delivery methods; `VERSION`, `notice_due`, `upgrade` at L39, L81, L1223–1235.
+2. <a id="source-2"></a> [src/agent_session/delivery.rs](../../src/agent_session/delivery.rs#L1-L958) — batch, `Compact`, `Settings`, `Rendering`, header, `wrap`, tests.
+3. <a id="source-3"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1334-L1476) — `serve` delivery and show operations; `revert_delivery` call at L1702.
+4. <a id="source-4"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L321-L366) — consumer status and refusals; `ConsumerSettings` at L191–208; `deliver` and `run_sink` at L760–1030.
 5. <a id="source-5"></a> [src/agent_session/history.rs](../../src/agent_session/history.rs#L127-L151) — lookups; AROUND request at L210; test at L792.
-6. <a id="source-6"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L1850-L2283) — delivery unit tests.
-7. <a id="source-7"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1622-L1870) — delivery regressions; `subscribe` and consumer-settings tests at L1936 and L2069.
-8. <a id="source-8"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1872-L1934) — show regression; `ShowWalk` and `claim_lookup` in `src/agent_session/mod.rs` at L372–489.
+6. <a id="source-6"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L2131-L2565) — delivery unit tests.
+7. <a id="source-7"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1658-L1906) — delivery regressions; `subscribe` and consumer-settings tests at L2064 and L2197.
+8. <a id="source-8"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1983-L2061) — show regression; `ShowWalk` and `claim_lookup` in `src/agent_session/mod.rs` at L373–487.
 9. <a id="source-9"></a> [src/agent_session/attention.rs](../../src/agent_session/attention.rs#L153-L175) — `broadcast`; test `only_explicit_bounded_all_and_here_broadcast` at L602.
 10. <a id="source-10"></a> [src/bin/airc-codex.rs](../../src/bin/airc-codex.rs#L1-L294) — adapter bounds, checks, queue call, receipts.
 11. <a id="source-11"></a> [tests/codex_adapter.rs](../../tests/codex_adapter.rs#L1-L218) — fake-`codex` tests; unit tests in `src/bin/airc-codex.rs` from L295.
-12. <a id="source-12"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L729-L744) — `DeliverOptions::wrap`; checked at L795–802, applied at L881–884.
+12. <a id="source-12"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L727-L742) — `DeliverOptions::wrap`; checked at L793–800, applied at L879–882.
 13. <a id="source-13"></a> [integrations/claude-plugin/scripts/airc-delivery](../../integrations/claude-plugin/scripts/airc-delivery#L1-L41) — launcher, run by `monitors/monitors.json`.
 14. <a id="source-14"></a> [tests/claude_plugin.rs](../../tests/claude_plugin.rs#L1-L238) — launcher tests with a fake `airc`.
-15. <a id="source-15"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2261-L2340) — `subscribe_wrap_splits_long_stdout_lines_into_continuations`.
+15. <a id="source-15"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2389-L2474) — `subscribe_wrap_splits_long_stdout_lines_into_continuations`.

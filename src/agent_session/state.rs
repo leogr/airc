@@ -8,6 +8,7 @@ use super::{
         ReceiptRequest, Release, Rendering, Settings, prefix, record_reference,
     },
     history::{Disposition, Notice},
+    reference,
 };
 use crate::{
     attachments,
@@ -19,6 +20,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
@@ -102,6 +104,8 @@ struct Event {
     observed: Option<Duration>,
 }
 
+/// A retained msgid. Its number is internal: records saved by an earlier
+/// release were headed by `@N`, and it maps them back to their msgid.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reference {
@@ -313,41 +317,80 @@ impl State {
         self.sequence
     }
 
-    fn reference(&mut self, msgid: &str) -> String {
-        if let Some(r) = self.references.iter().find(|r| r.msgid == msgid) {
-            return format!("@{}", r.number);
+    /// Retain a msgid for deduplication and return its shared reference.
+    fn remember(&mut self, msgid: &str) -> String {
+        if !self.references.iter().any(|r| r.msgid == msgid) {
+            self.next_reference += 1;
+            self.references.push_back(Reference {
+                number: self.next_reference,
+                msgid: msgid.into(),
+            });
+            if self.references.len() > RETAIN {
+                self.references.pop_front();
+            }
         }
-        self.next_reference += 1;
-        self.references.push_back(Reference {
-            number: self.next_reference,
-            msgid: msgid.into(),
-        });
-        if self.references.len() > RETAIN {
-            self.references.pop_front();
-        }
-        format!("@{}", self.next_reference)
+        reference::present(msgid)
     }
 
-    pub fn resolve_reference(&self, reference: &str) -> Result<String> {
-        if let Some(n) = reference.strip_prefix('@') {
-            let number: u64 = n.parse()?;
-            return self
-                .references
-                .iter()
-                .find(|r| r.number == number)
-                .map(|r| r.msgid.clone())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("reply reference has expired or belongs to another session")
-                });
+    /// The shared reference of a message an earlier release saved as `@N`,
+    /// while its msgid is retained; never a guess.
+    fn legacy(&self, number: u64) -> String {
+        self.references
+            .iter()
+            .find(|r| r.number == number)
+            .map_or_else(
+                || reference::UNAVAILABLE.into(),
+                |r| reference::present(&r.msgid),
+            )
+    }
+
+    /// An event as presented now. Records and send notices saved by an earlier
+    /// release named messages by local `@N`; they show the shared reference
+    /// instead, or `unavailable`. Their message text is never changed, and a
+    /// pending batch or `read --again` keeps its saved bytes.
+    fn shown<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if let Some(rest) = text.strip_prefix("! recovered send ")
+            && let Some((head, number)) = rest.rsplit_once(": confirmed @")
+            && let Some(number) = local_number(number)
+        {
+            return Cow::Owned(format!(
+                "! recovered send {head}: confirmed {}",
+                self.legacy(number)
+            ));
         }
-        ensure!(
-            !reference.is_empty()
-                && reference.len() <= 128
-                && !reference.chars().any(char::is_whitespace)
-                && !reference.chars().any(char::is_control),
-            "invalid reply reference"
-        );
-        Ok(reference.into())
+        // A history record, or the notice that omits an oversized record.
+        let (label, rest) = ["history ", "! "]
+            .into_iter()
+            .find_map(|label| Some((label, text.strip_prefix(label)?)))
+            .unwrap_or(("", text));
+        let Some((token, after)) = rest.split_once(' ') else {
+            return Cow::Borrowed(text);
+        };
+        let Some(number) = local_number(token.strip_prefix('@').unwrap_or("")) else {
+            return Cow::Borrowed(text);
+        };
+        let mut out = format!("{label}{} ", self.legacy(number));
+        let line = after.split('\n').next().unwrap_or("");
+        let head = line.find(": ").unwrap_or(line.len());
+        // The header's reply word follows the target and sender words.
+        let reply = after[..head]
+            .match_indices(' ')
+            .nth(1)
+            .map(|(at, _)| at + 1)
+            .and_then(|at| {
+                let word = after[at..head].split(' ').next()?;
+                let number = local_number(word.strip_prefix("reply=@")?)?;
+                Some((at, at + word.len(), number))
+            });
+        match reply {
+            Some((start, end, number)) => {
+                out.push_str(&after[..start]);
+                out.push_str(&format!("reply={}", self.legacy(number)));
+                out.push_str(&after[end..]);
+            }
+            None => out.push_str(after),
+        }
+        Cow::Owned(out)
     }
 
     pub fn remembered_ids(&self) -> HashSet<String> {
@@ -387,7 +430,7 @@ impl State {
                 let reference = message
                     .tags
                     .get("msgid")
-                    .map(|id| self.reference(id))
+                    .map(|id| self.remember(id))
                     .unwrap_or("live-only".into());
                 if let Some(id) = message.tags.get("msgid") {
                     self.own.push_back(id.clone());
@@ -489,37 +532,19 @@ impl State {
         confirmed
     }
 
-    /// Allocate a PRIVMSG/NOTICE's local reference and render its record header.
+    /// Retain a PRIVMSG/NOTICE's msgid and render its record header. The
+    /// message and its reply target are named by their shared references.
     fn header(&mut self, message: &Message, label: &str) -> (String, String) {
         let reference = message
             .tags
             .get("msgid")
-            .map(|id| self.reference(id))
+            .map(|id| self.remember(id))
             .unwrap_or("live-only".into());
         let (nick, account) = sender(message);
         let reply = message
             .tags
             .get("+reply")
-            .map(|id| {
-                let reference = self
-                    .references
-                    .iter()
-                    .find(|r| r.msgid == *id)
-                    .map(|r| format!("@{}", r.number))
-                    .unwrap_or_else(|| {
-                        let bounded: String = id.chars().take(128).collect();
-                        format!(
-                            "msgid:{}{}",
-                            safe(&bounded),
-                            if bounded.len() < id.len() {
-                                "…[truncated]"
-                            } else {
-                                ""
-                            }
-                        )
-                    });
-                format!(" reply={reference}")
-            })
+            .map(|id| format!(" reply={}", reference::present(id)))
             .unwrap_or_default();
         let mut header = format!(
             "{label}{} {} {}({}){}{}",
@@ -539,25 +564,32 @@ impl State {
         (reference, header)
     }
 
-    /// The retained record whose header starts with this local `@N`, followed
-    /// by its full attachment metadata for `show`.
-    pub fn retained_show(&self, reference: &str) -> Option<String> {
+    /// The retained record of exactly this msgid, followed by its full
+    /// attachment metadata for `show`. A record saved by an earlier release is
+    /// found through the msgid's retained internal number.
+    pub fn retained_show(&self, msgid: &str) -> Option<String> {
+        let shared = reference::exact(msgid);
+        let number = self
+            .references
+            .iter()
+            .find(|r| r.msgid == msgid)
+            .map(|r| r.number);
         self.events
             .iter()
             .rev()
-            .find(|e| record_reference(&e.text) == Some(reference))
-            .map(|e| match &e.detail {
-                Some(detail) => format!("{}\n{detail}", e.text),
-                None => e.text.clone(),
+            .find(|e| {
+                let token = record_token(&e.text);
+                shared.is_some() && token == shared.as_deref()
+                    || number.is_some()
+                        && token.and_then(|t| local_number(t.strip_prefix('@')?)) == number
             })
-    }
-
-    /// The local `@N` already assigned to a server msgid.
-    pub fn local_reference(&self, msgid: &str) -> Option<String> {
-        self.references
-            .iter()
-            .find(|r| r.msgid == msgid)
-            .map(|r| format!("@{}", r.number))
+            .map(|e| {
+                let text = self.shown(&e.text);
+                match &e.detail {
+                    Some(detail) => format!("{text}\n{detail}"),
+                    None => text.into_owned(),
+                }
+            })
     }
 
     /// Render a looked-up message for `show` only; it is never recorded.
@@ -637,11 +669,12 @@ impl State {
             .filter(|e| e.sequence > self.cursor)
             .take(limit)
         {
+            let shown = self.shown(&event.text);
             // Byte-bounded, but always one event so a large one cannot stall reads.
-            if last.is_some() && text.len() + event.text.len() > READ_BYTES {
+            if last.is_some() && text.len() + shown.len() > READ_BYTES {
                 break;
             }
-            text.push_str(&event.text);
+            text.push_str(&shown);
             text.push('\n');
             last = Some(event.sequence);
         }
@@ -830,8 +863,9 @@ impl State {
                 through = event.sequence;
                 continue;
             }
-            if records.len() + event.text.len() < budget {
-                records.push_str(&event.text);
+            let text = self.shown(&event.text);
+            if records.len() + text.len() < budget {
+                records.push_str(&text);
                 records.push('\n');
             } else if events > 0 {
                 // Complete records only; the rest follows in the next batch.
@@ -839,20 +873,20 @@ impl State {
                 break;
             } else {
                 // One oversized record: an explicit prefix; the original stays retained.
-                let hint = record_reference(&event.text).map_or_else(
+                let hint = record_reference(&text).map_or_else(
                     || "it remains readable with airc read until evicted".to_string(),
                     |reference| format!("airc show {session} {reference} prints all of it"),
                 );
                 let marker = |omitted: usize| {
                     format!(
                         "\n! record truncated: {omitted} of {} bytes not delivered; {hint}\n",
-                        event.text.len()
+                        text.len()
                     )
                 };
-                let room = budget.saturating_sub(records.len() + marker(event.text.len()).len());
-                let kept = prefix(&event.text, room);
+                let room = budget.saturating_sub(records.len() + marker(text.len()).len());
+                let kept = prefix(&text, room);
                 records.push_str(kept);
-                records.push_str(&marker(event.text.len() - kept.len()));
+                records.push_str(&marker(text.len() - kept.len()));
             }
             events += 1;
             through = event.sequence;
@@ -1120,7 +1154,7 @@ impl State {
         let mut tags = std::collections::BTreeMap::new();
         tags.insert(SEND_TAG.to_owned(), token.clone());
         if let Some(reply) = reply {
-            tags.insert("+reply".into(), self.resolve_reference(reply)?);
+            tags.insert("+reply".into(), reference::resolve(reply)?);
         }
         let frames = multiline::outbound(
             (&self.nick, &self.account),
@@ -1340,11 +1374,19 @@ impl State {
             }
         );
         for receipt in self.receipts.iter().rev() {
+            // A receipt saved by an earlier release confirmed a local `@N`.
+            let outcome = match receipt.outcome.rsplit_once(" @") {
+                Some((head, number)) if head.starts_with("confirmed ") => local_number(number)
+                    .map_or(Cow::Borrowed(receipt.outcome.as_str()), |number| {
+                        Cow::Owned(format!("{head} {}", self.legacy(number)))
+                    }),
+                _ => Cow::Borrowed(receipt.outcome.as_str()),
+            };
             text.push_str(&format!(
                 "send={} target={}: {}\n",
                 receipt.token,
                 safe(&receipt.target),
-                safe(&receipt.outcome)
+                safe(&outcome)
             ));
             if receipt.outcome.starts_with("uncertain") {
                 text.push_str(&format!("  text: {}\n", safe(&receipt.text)));
@@ -1371,6 +1413,21 @@ impl State {
         }
         text
     }
+}
+
+/// The first token of a rendered record: its reference, `live-only`, an older
+/// saved `@N` or `unavailable`.
+fn record_token(text: &str) -> Option<&str> {
+    let text = text.strip_prefix("history ").unwrap_or(text);
+    text.split([' ', '\n']).next()
+}
+
+/// The number of an earlier release's `@N`, given the digits after `@`.
+fn local_number(digits: &str) -> Option<u64> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// The channel and `reply=` value in a rendered record header, if present.
@@ -1540,10 +1597,13 @@ mod tests {
         let mut state = state();
         state.ingest(&message, false);
         let output = state.read(50);
-        let header = output.lines().find(|l| l.starts_with("@1 ")).unwrap();
+        let header = output
+            .lines()
+            .find(|l| l.starts_with("msgid:with-one "))
+            .unwrap();
         assert!(
             header.starts_with(&format!(
-                "@1 #work Human(human) attachments=1:1@4/{id}/4: see [Image #1]"
+                "msgid:with-one #work Human(human) attachments=1:1@4/{id}/4: see [Image #1]"
             )),
             "{output}"
         );
@@ -1551,7 +1611,7 @@ mod tests {
             !output.contains("sha256="),
             "delivery carries no full metadata"
         );
-        let shown = state.retained_show("@1").unwrap();
+        let shown = state.retained_show("with-one").unwrap();
         assert!(shown.ends_with(&format!(
             "\n! attachment 1 artifact={id} name=paste-1.png bytes=4 sha256={} at=4",
             "a".repeat(64)
@@ -1559,7 +1619,7 @@ mod tests {
         // Full metadata survives a state round trip; delivery text is unchanged.
         let restored: State =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
-        assert_eq!(restored.retained_show("@1").unwrap(), shown);
+        assert_eq!(restored.retained_show("with-one").unwrap(), shown);
         assert_eq!(state.render_context(&message).unwrap(), shown);
 
         // Eight attachments, a long channel/reply header: the summary keeps the
@@ -1586,12 +1646,12 @@ mod tests {
             .unwrap();
         let header = &header[..header.find(": ").unwrap()];
         assert!(header.len() <= attachments::HEADER_BUDGET, "{header}");
-        let listed = header.matches("@").count() - 1;
+        let listed = header.matches("@").count();
         assert!(
             listed < 8 && header.ends_with(&format!("+{}", 8 - listed)),
             "{header}"
         );
-        let shown = state.retained_show("@2").unwrap();
+        let shown = state.retained_show("with-eight").unwrap();
         assert_eq!(shown.matches("\n! attachment ").count(), 8);
 
         // A tag whose span does not hold its marker renders nothing.
@@ -1602,7 +1662,7 @@ mod tests {
         );
         state.ingest(&bad, false);
         assert!(!state.read(50).contains("attachments="));
-        assert!(!state.retained_show("@3").unwrap().contains("! attachment"));
+        assert!(!state.retained_show("bad").unwrap().contains("! attachment"));
     }
 
     #[test]
@@ -1661,9 +1721,230 @@ mod tests {
         assert!(!first.contains("message 138\n"));
         assert_eq!(state.last_read, first);
         assert!(state.read(50).contains("message 138\n"));
-        assert!(state.resolve_reference("@1").is_err());
-        assert_eq!(state.resolve_reference("@600").unwrap(), "id-599");
+        assert!(!state.remembered_ids().contains("id-0"));
+        assert!(state.remembered_ids().contains("id-599"));
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn records_and_receipts_name_messages_by_their_shared_reference() {
+        let mut state = state();
+        let root = "123e4567-e89b-42d3-a456-426614174000";
+        let answer = "00112233-4455-6677-8899-aabbccddeeff";
+        let mut m = chat("answer", answer);
+        m.tags.insert("+reply".into(), root.into());
+        state.ingest(&m, false);
+        state.ingest(&chat("opaque", "id-7"), true);
+        // The reply target is named without any retained local state.
+        assert_eq!(
+            state.read(50),
+            "m:ABEiM0RVZneImaq7zN3u_w #work Human(human) reply=m:Ej5FZ-ibQtOkVkJmFBdAAA: answer\n\
+             history msgid:id-7 #work Human(human): opaque\n"
+        );
+        // show finds a retained record by its exact msgid only.
+        let shown = state.retained_show(answer).unwrap();
+        assert!(
+            shown.starts_with("m:ABEiM0RVZneImaq7zN3u_w #work "),
+            "{shown}"
+        );
+        let shown = state.retained_show("id-7").unwrap();
+        assert!(shown.starts_with("history msgid:id-7 #work "), "{shown}");
+        assert!(state.retained_show(root).is_none());
+        assert!(state.retained_show("id-").is_none());
+        // A confirmed send names its own message the same way.
+        let sent = state
+            .prepare_send("#work", "mine", Some("m:Ej5FZ-ibQtOkVkJmFBdAAA"), None)
+            .unwrap()
+            .remove(0);
+        assert_eq!(sent.tags["+reply"], root);
+        let token = sent.tags[SEND_TAG].clone();
+        let mut echo = sent.clone();
+        echo.prefix = Some("Alice!alice@airc".into());
+        echo.tags.insert("account".into(), "alice".into());
+        let own = "6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5";
+        echo.tags.insert("msgid".into(), own.into());
+        assert_eq!(state.ingest(&echo, false), Some(token.clone()));
+        assert_eq!(
+            state.outcome(&token),
+            format!("confirmed #work m:bxwtPkpbTG2Of5ChssPU5Q; send={token}")
+        );
+        // A reply to it is attention for this session, by full msgid.
+        let mut reply = chat("for you", "fbefbefb-efbe-fbef-befb-efbefbefbefb");
+        reply.tags.insert("+reply".into(), own.into());
+        state.ingest(&reply, false);
+        assert!(
+            state
+                .read(50)
+                .contains("reply=m:bxwtPkpbTG2Of5ChssPU5Q: for you")
+        );
+        // --reply takes every full form but never a local number.
+        for form in [format!("msgid:{root}"), root.to_string()] {
+            let sent = state.prepare_send("#work", "x", Some(&form), None).unwrap();
+            assert_eq!(sent[0].tags["+reply"], root);
+        }
+        let receipts = state.receipts.len();
+        for bad in ["@1", "m:Ej5FZ-ibQtOkVkJmFBdAAB"] {
+            assert!(state.prepare_send("#work", "x", Some(bad), None).is_err());
+        }
+        assert_eq!(
+            state.receipts.len(),
+            receipts,
+            "a refused reply prepares nothing"
+        );
+    }
+
+    #[test]
+    fn records_saved_with_local_numbers_show_a_shared_reference_or_unavailable() {
+        let mut state = state();
+        let known = "123e4567-e89b-42d3-a456-426614174000";
+        state.references.push_back(Reference {
+            number: 7,
+            msgid: known.into(),
+        });
+        state.next_reference = 7;
+        for text in [
+            "history @7 #work Bob(bob) reply=@8: says reply=@7 and @7",
+            "@8 #work Bob(bob) reply=@7 attachments=1:1@0/x/4: [Image #1]",
+            "! recovered send 5d5a: confirmed @7",
+            "! @9 #work Bob(bob): message of 2000000 bytes omitted",
+            "@x #work Bob(bob): not a saved number",
+        ] {
+            state.record(text.into(), Classification::Critical);
+        }
+        // Message text is never rewritten; unknown numbers are never guessed.
+        assert_eq!(
+            state.read(50),
+            "history m:Ej5FZ-ibQtOkVkJmFBdAAA #work Bob(bob) reply=unavailable: says reply=@7 and @7\n\
+             unavailable #work Bob(bob) reply=m:Ej5FZ-ibQtOkVkJmFBdAAA attachments=1:1@0/x/4: [Image #1]\n\
+             ! recovered send 5d5a: confirmed m:Ej5FZ-ibQtOkVkJmFBdAAA\n\
+             ! unavailable #work Bob(bob): message of 2000000 bytes omitted\n\
+             @x #work Bob(bob): not a saved number\n"
+        );
+        // show reaches a saved record through the msgid's retained number.
+        assert_eq!(
+            state.retained_show(known).unwrap(),
+            "history m:Ej5FZ-ibQtOkVkJmFBdAAA #work Bob(bob) reply=unavailable: says reply=@7 and @7"
+        );
+        for receipt in ["confirmed #work @7", "confirmed #work @8", "uncertain @7"] {
+            state.receipts.push_back(Receipt {
+                token: receipt.into(),
+                target: "#work".into(),
+                text: String::new(),
+                outcome: receipt.into(),
+                sha256: None,
+                bytes: None,
+            });
+        }
+        let status = state.describe(false);
+        assert!(
+            status.contains(": confirmed #work m:Ej5FZ-ibQtOkVkJmFBdAAA\n"),
+            "{status}"
+        );
+        assert!(
+            status.contains(": confirmed #work unavailable\n"),
+            "{status}"
+        );
+        assert!(status.contains(": uncertain @7\n"), "{status}");
+    }
+
+    #[test]
+    fn a_pending_batch_saved_with_local_numbers_keeps_its_bytes() {
+        let mut state = delivering();
+        state.begin_delivery();
+        state.ingest(
+            &chat("@Alice hi", "123e4567-e89b-42d3-a456-426614174000"),
+            false,
+        );
+        state
+            .prepare_delivery("trial", opts(WakeMode::Mentions, 4096))
+            .unwrap();
+        let saved = "@3 #work Human(human) reply=@2: @Alice hi\n";
+        state
+            .delivery
+            .as_mut()
+            .unwrap()
+            .pending
+            .as_mut()
+            .unwrap()
+            .records = saved.into();
+        for rendering in [Rendering::Retry, Rendering::Inspect] {
+            let text = state.pending_delivery().unwrap().render(rendering);
+            assert!(text.ends_with(saved), "{text}");
+        }
+    }
+
+    #[test]
+    fn numbered_records_and_a_receipt_hold_survive_restarts_together() {
+        // State as the release before shared references saved it: version 4,
+        // a pending receipt-enabled batch and the replay cache in `@N` bytes.
+        let mut s = delivering();
+        s.begin_delivery();
+        let known = "123e4567-e89b-42d3-a456-426614174000";
+        s.references.push_back(Reference {
+            number: 7,
+            msgid: known.into(),
+        });
+        s.next_reference = 7;
+        let numbered = "@7 #work Bob(bob) reply=@6: @Alice saved before the upgrade";
+        s.record(numbered.into(), Classification::Critical);
+        let (a, _) = s.prepare_delivery("trial", receipt_opts(8192, 60)).unwrap();
+        let old = format!("{numbered}\n");
+        s.delivery
+            .as_mut()
+            .unwrap()
+            .pending
+            .as_mut()
+            .unwrap()
+            .records = old.clone();
+        s.last_read = old.clone();
+        let restart = |s: &State| {
+            let mut restored: State =
+                serde_json::from_slice(&serde_json::to_vec(s).unwrap()).unwrap();
+            restored.validate().unwrap();
+            restored.begin_epoch();
+            restored.set_receipt_store(std::path::Path::new("/srv/airc"));
+            restored
+        };
+        let mut s = restart(&s);
+        assert_eq!(s.version, RECEIPTS_VERSION);
+        // The pending batch keeps its saved bytes and its receipt request.
+        let retry = s.pending_delivery().unwrap().render(Rendering::Retry);
+        assert!(retry.ends_with(&old), "{retry}");
+        assert!(
+            retry.contains(&format!("--mark-received {a} --receipt-scope {SCOPE}")),
+            "{retry}"
+        );
+        assert_eq!(s.last_read, old);
+        // Its acceptance holds later batches, and the hold survives a restart.
+        s.finish_delivery(&a, "accepted").unwrap();
+        assert!(s.holding());
+        let later = "6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5";
+        let mut reply = chat("@Alice a newer reply", later);
+        reply.tags.insert("+reply".into(), known.into());
+        s.ingest(&reply, false);
+        let mut s = restart(&s);
+        assert_eq!(s.version, RECEIPTS_VERSION, "kept for good");
+        assert!(s.holding() && s.hold_until.is_some());
+        // Reads name both by shared reference from the restored number table;
+        // the saved record's unknown reply is never guessed.
+        let fresh = "m:bxwtPkpbTG2Of5ChssPU5Q #work Human(human) reply=m:Ej5FZ-ibQtOkVkJmFBdAAA: @Alice a newer reply\n";
+        assert_eq!(
+            s.read(50),
+            format!(
+                "m:Ej5FZ-ibQtOkVkJmFBdAAA #work Bob(bob) reply=unavailable: @Alice saved before the upgrade\n{fresh}"
+            )
+        );
+        // The exact report releases the restored hold; the next batch carries
+        // the shared reference and a new request.
+        assert!(
+            s.mark_received(&a, SCOPE)
+                .unwrap()
+                .contains("hold is released")
+        );
+        assert!(!s.holding());
+        let (b, text) = s.prepare_delivery("trial", receipt_opts(8192, 60)).unwrap();
+        assert!(text.ends_with(fresh), "{text}");
+        assert!(text.contains(&format!("--mark-received {b} ")), "{text}");
     }
 
     #[test]
@@ -1805,7 +2086,7 @@ mod tests {
         );
         let event = state.events.back().unwrap();
         assert_eq!(event.class, Some(Classification::Context));
-        assert!(event.text.starts_with("history @"));
+        assert!(event.text.starts_with("history msgid:page-1 "));
         assert_eq!(state.checkpoints["#work"], "page-1");
         state.ingest(&chat("live and newer", "live-1"), false);
         state.ingest_with(
@@ -1995,7 +2276,8 @@ mod tests {
         let marker = text.lines().last().unwrap();
         assert!(
             marker.starts_with("! record truncated: ")
-                && marker.ends_with("bytes not delivered; airc show trial @1 prints all of it"),
+                && marker
+                    .ends_with("bytes not delivered; airc show trial msgid:big prints all of it"),
             "{marker}"
         );
         assert!(header_of(&text).ends_with(" session=trial]"), "{text}");
@@ -2668,8 +2950,10 @@ mod tests {
     #[test]
     fn record_links_read_only_the_rendered_header() {
         assert_eq!(
-            record_links("@5 #work Bob(bob) reply=@4: text reply=@9"),
-            (Some("#work"), Some("@4"))
+            record_links(
+                "m:Ej5FZ-ibQtOkVkJmFBdAAA #work Bob(bob) reply=m:ABEiM0RVZneImaq7zN3u_w: text reply=@9"
+            ),
+            (Some("#work"), Some("m:ABEiM0RVZneImaq7zN3u_w"))
         );
         assert_eq!(
             record_links("history @5 #work Bob(bob) reply=msgid:abc: x"),
