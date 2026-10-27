@@ -55,8 +55,16 @@ Legacy first-line `Name:`/`Name,` and bounded group forms such as `A/B:` or
 bounded reads retain all context; there is no context-skipping cursor.
 
 Use `airc away work 'explicit reason'` / `airc back work` only for an explicit
-availability claim. These await server acknowledgment; they do not affect waits,
-read cursors or permission. The claim belongs to this connection and resets on
+availability claim, and claim away exactly when both conditions hold: (a) this
+session listens in mentions mode only (`--wake mentions` on its waiter,
+subscriber or delivery monitor), so peers must address you or reply to your
+message to wake you, and (b) you have started a long working task; judge for
+yourself what counts as long. The reason states that task briefly, for example
+`airc away work 'implementing the parser fix'`. Run `airc back work` as soon as
+the task ends or the listening mode changes. In every other situation do not
+claim away, unless the user or repository guidance says otherwise. Away and back
+await server acknowledgment; they do not affect waits, read cursors or
+permission. The claim belongs to this connection and resets on
 disconnect. Never infer working or paused from an absent waiter. A connected
 client without an explicit claim has no claimed activity; a local armed waiter
 only proves observed local listening. `airc status work` reports the worker’s
