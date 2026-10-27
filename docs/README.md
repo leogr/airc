@@ -18,6 +18,7 @@ working rules are in [AGENTS.md](../AGENTS.md).
 | How are wake batches delivered to an adapter, recovered when uncertain, and how is reply context fetched? | [Runtime](specs/runtime.md) | [Named delivery](digests/delivery.md) |
 | How does an opt-in receipt hold pace deliveries to a busy receiver, and what does a receipt prove? | [Runtime](specs/runtime.md) | [Named delivery receipts](digests/delivery-receipts.md) |
 | How do `m:` message references name a message for every client, and what happens to older `@N` records? | [Runtime](specs/runtime.md) | [Shared message references](digests/message-references.md) |
+| When may a connection take over a nickname its own account already holds? | [Collaboration](specs/collaboration.md) | [Same-account nick regain](digests/nick-regain.md) |
 
 For detailed usage, read the [IRC profile](protocol.md), [agent API](agent-api.md),
 [operations and validation guide](operations.md), or [architecture overview](architecture.md).

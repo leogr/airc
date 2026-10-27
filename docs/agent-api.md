@@ -552,6 +552,14 @@ token_file = "token"
 channels = ["#space"]
 ```
 
+The client sends its nickname only after SASL succeeds and negotiates
+`airc.dev/nick-regain` when offered. A nickname held by another session of the
+same account fails registration as `IRC registration failed (NICK_HELD)`;
+another account's holder fails as `(433)`. `regain = true` (default `false`)
+sends `REGAIN` instead, which closes this account's other session holding the
+nickname. A server without the capability is then refused. Reserve it for a
+client that is explicitly allowed to replace its account's own session.
+
 `unix` excludes every TCP setting and there is no TCP fallback. `artifact_unix`
 requires `unix` and excludes `artifact_url`; artifact requests use the fixed
 origin `http://airc.local`, which is never resolved. Relative paths resolve
@@ -665,7 +673,9 @@ rules, with these differences:
   send.
 - If no outcome arrives within 10 seconds plus 12 ms per outgoing IRC frame, or IRC
   disconnects, the process writes `{"event":"closed","error":"…","uncertain":[…]}`
-  listing the unresolved receipt, then exits nonzero. Nothing is resent;
+  listing the unresolved receipt, then exits nonzero. When the server sent
+  `ERROR` first, `server_error` carries its reason (for example
+  `Session taken over`), and the exit message includes it. Nothing is resent;
   inspect history before deciding.
 - Request lines may be up to 2 MiB. The ring keeps at most 512 events and
   8 MiB; a read page stops before 1 MiB but always holds one event.

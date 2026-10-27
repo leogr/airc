@@ -37,6 +37,7 @@ pub const FEATURES: &[&str] = &[
     "named-delivery-receipts",
     "named-show",
     "message-attachments",
+    "nick-regain",
 ];
 
 /// The `features` probe printed by both binaries.

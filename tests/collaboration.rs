@@ -135,6 +135,7 @@ impl Fixture {
             artifact_url: Some(format!("http://{}", server.artifact_address.unwrap())),
             unix: None,
             artifact_unix: None,
+            regain: false,
         }
     }
 }
@@ -598,6 +599,132 @@ async fn auth_failures_cap_atomicity_and_malformed_frames() {
             .unwrap()
             .is_none()
     );
+    server.shutdown().await.unwrap();
+}
+
+/// Opens an authenticated, still unregistered connection that negotiated
+/// nick-regain: the state in which NICK_HELD and REGAIN apply.
+async fn regain_peer(server: &RunningServer, account: &str) -> Peer {
+    let mut peer = Peer::open(server).await;
+    peer.send("CAP LS 302").await;
+    assert!(peer.until("CAP").await.params[2].contains("airc.dev/nick-regain"));
+    peer.send("CAP REQ :airc.dev/nick-regain").await;
+    assert_eq!(peer.until("CAP").await.params[1], "ACK");
+    peer.send(&format!("PASS {account}:{TOKEN}")).await;
+    peer.send(&format!("USER {account} 0 * :Test participant"))
+        .await;
+    peer
+}
+
+#[tokio::test]
+async fn nick_regain_takes_over_only_the_same_accounts_session() {
+    let fixture = Fixture::new();
+    let server = fixture.start().await;
+    let mut holder = Peer::login(&server, "human", false).await;
+    holder.join().await;
+    let mut alice = Peer::login(&server, "alice", false).await;
+    alice.join().await;
+
+    // Ordinary clients are unchanged: any holder is 433, even the same account.
+    let mut plain = Peer::open(&server).await;
+    plain.send(&format!("PASS human:{TOKEN}")).await;
+    plain.send("NICK human").await;
+    assert_eq!(plain.until("433").await.params[1], "human");
+
+    // Another account never learns or takes over the holder.
+    let mut other = regain_peer(&server, "bob").await;
+    for command in ["NICK", "REGAIN"] {
+        other.send(&format!("{command} Human")).await;
+        assert_eq!(other.until("433").await.params[1], "Human");
+    }
+
+    // REGAIN needs the capability and authentication, before registration.
+    let mut early = Peer::open(&server).await;
+    early.send("REGAIN human").await;
+    let fail = early.until("FAIL").await;
+    assert_eq!(fail.params[..3], ["REGAIN", "INVALID_STATE", "human"]);
+    let mut unauthenticated = Peer::open(&server).await;
+    unauthenticated.send("CAP LS 302").await;
+    unauthenticated.until("CAP").await;
+    unauthenticated.send("CAP REQ :airc.dev/nick-regain").await;
+    unauthenticated.until("CAP").await;
+    unauthenticated.send("REGAIN human").await;
+    assert_eq!(
+        unauthenticated.until("FAIL").await.params[1],
+        "INVALID_STATE"
+    );
+
+    // The same account is told, distinctly, without disturbing the holder.
+    let mut view = regain_peer(&server, "human").await;
+    view.send("NICK human").await;
+    let fail = view.until("FAIL").await;
+    assert_eq!(fail.params[..3], ["NICK", "NICK_HELD", "human"]);
+    holder.send("PING still-here").await;
+    assert_eq!(holder.until("PONG").await.params[1], "still-here");
+
+    // An explicit REGAIN closes the holder loudly and takes the name.
+    view.send("REGAIN HUMAN").await;
+    let error = holder.until("ERROR").await;
+    assert_eq!(error.params[0], "Session taken over");
+    let quit = alice.until("QUIT").await;
+    assert!(quit.prefix.as_deref().unwrap().starts_with("human!human@"));
+    assert_eq!(quit.params[0], "Session taken over");
+    view.send("CAP END").await;
+    let welcome = view.until("001").await;
+    assert_eq!(welcome.params[0], "HUMAN");
+    view.send("REGAIN human").await;
+    assert_eq!(view.until("FAIL").await.params[1], "INVALID_STATE");
+    server.shutdown().await.unwrap();
+}
+
+/// The human view's JSONL v2 client: a second view without `regain` fails
+/// registration distinctly; with it, the first view is closed with the
+/// server's reason and exits without reconnecting. Another account is 433.
+#[tokio::test]
+async fn regain_client_closes_the_taken_over_jsonl_view() {
+    let fixture = Fixture::new();
+    let server = fixture.start().await;
+    let config = fixture.client_config(&server, "human");
+    let (_requests, input) = tokio::io::duplex(65536);
+    let (output, responses) = tokio::io::duplex(65536);
+    let first = tokio::spawn(client::frontend_with(
+        config.clone(),
+        2,
+        BufReader::new(input),
+        output,
+    ));
+    let mut responses = BufReader::new(responses);
+    let ready = read_line(&mut responses, 65536).await.unwrap().unwrap();
+    assert!(ready.contains("\"ready\""), "{ready}");
+
+    let held = client::connect(&config).await.err().expect("NICK_HELD");
+    assert_eq!(held.to_string(), "IRC registration failed (NICK_HELD)");
+    let mut foreign = fixture.client_config(&server, "bob");
+    foreign.nick = "human".into();
+    foreign.regain = true;
+    let refused = client::connect(&foreign).await.err().expect("433");
+    assert_eq!(refused.to_string(), "IRC registration failed (433)");
+
+    let mut regain = config.clone();
+    regain.regain = true;
+    let _second = client::connect(&regain).await.unwrap();
+    let closed: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(5), read_line(&mut responses, 65536))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(closed["event"], "closed", "{closed}");
+    assert_eq!(closed["server_error"], "Session taken over", "{closed}");
+    assert_eq!(closed["uncertain"], serde_json::json!([]), "{closed}");
+    let exit = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("the taken-over view exits nonzero");
+    assert!(exit.to_string().contains("Session taken over"), "{exit}");
     server.shutdown().await.unwrap();
 }
 

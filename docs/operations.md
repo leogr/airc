@@ -66,13 +66,16 @@ names only implemented features: `multiline`, `unix-listeners`, `unix-artifacts`
 `control-status`, `control-reload`, `acl-revoke`, `client-unix`,
 `client-artifact-unix`, `client-multiline`, `jsonl-v2`, `named-multiline`,
 `send-stdin`, `client-presence`, `server-presence`, `channel-add-reload`,
-`channel-delete-reload`, `client-topic` and `named-channels`. A deployer should refuse a managed mode whose feature is missing
+`channel-delete-reload`, `client-topic`, `named-channels` and `nick-regain`
+(among others the probe lists). A deployer should refuse a managed mode whose feature is missing
 rather than fall back. `client-presence` covers JSONL `who`/`away`/`back` and
 away-notify negotiation/events; `server-presence` covers connection-scoped AWAY,
 WHO H/G and away-notify. `channel-add-reload` covers reload channel additions;
 `channel-delete-reload` explicit channel deletion through `removed_channels`;
 `client-topic` the JSONL version 2 `topic` operation; `named-channels` the named
-`join`/`part`/`topic` controls, followed-channel state and partial startup. The live control status includes the same implemented
+`join`/`part`/`topic` controls, followed-channel state and partial startup;
+`nick-regain` the `airc.dev/nick-regain` capability, `REGAIN` and the client's
+`regain` setting. The live control status includes the same implemented
 feature list: check that proof as well as executable probes when reusing a
 running server. Executable features are distinct from IRC CAP negotiation.
 

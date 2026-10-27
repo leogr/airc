@@ -6,6 +6,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub const MAX_LINE: usize = 4608;
 pub const MAX_TAGS: usize = 4096;
+/// Capability that lets an authenticated, unregistered connection learn that
+/// its own account holds a nickname (FAIL NICK_HELD) and take that session
+/// over with `REGAIN`. Another account's holder is always 433.
+pub const NICK_REGAIN: &str = "airc.dev/nick-regain";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {

@@ -75,6 +75,7 @@ fn member(dir: &Path, config: &Config, name: &str) -> ClientConfig {
         artifact_url: None,
         unix: config.listen_unix.clone(),
         artifact_unix: config.artifacts.as_ref().unwrap().listen_unix.clone(),
+        regain: false,
     }
 }
 
@@ -366,6 +367,7 @@ fn both_binaries_print_the_same_feature_probe() {
         "named-channels",
         "named-delivery",
         "named-show",
+        "nick-regain",
     ] {
         assert!(features.iter().any(|f| f == feature), "{feature}");
     }

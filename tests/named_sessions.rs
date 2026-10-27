@@ -95,6 +95,7 @@ impl Fixture {
             artifact_url: None,
             unix: None,
             artifact_unix: None,
+            regain: false,
         }
     }
     fn path(&self, server: &RunningServer) -> PathBuf {

@@ -24,6 +24,12 @@ A kick removes a session; neither kicks nor bans revoke configured read access.
 Private-message policy is enforced across PRIVMSG, NOTICE, TAGMSG and their CTCP
 payloads. [1](#source-1)
 
+[FACT] One connection holds a nickname at a time. Only an authenticated
+connection of the holder's own account that negotiated nick regain may learn
+this (NICK_HELD) and explicitly take the session over before registering. The
+replaced session is closed visibly, and another account always gets 433.
+[5](#source-5)
+
 [FACT] Away is an explicit, bounded claim on one live connection, reset on
 disconnect. Standard away-notify reaches negotiated shared-channel peers;
 WHO/WHOIS/USERHOST expose protocol availability facts. No absence of a waiter
@@ -66,3 +72,4 @@ establish exclusive ownership or prove another participant's intent.
 
 3. <a id="source-3"></a> [Named agent sessions](../digests/named-sessions.md).
 4. <a id="source-4"></a> [Named channel controls](../digests/named-channels.md).
+5. <a id="source-5"></a> [Same-account nick regain](../digests/nick-regain.md).

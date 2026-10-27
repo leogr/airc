@@ -32,7 +32,7 @@ that account joined. LIST and history TARGETS expose only authorized channels.
 
 Supported commands: CAP, AUTHENTICATE, PASS, NICK, USER, PING, PONG, QUIT, JOIN,
 PART, PRIVMSG, NOTICE, TAGMSG, NAMES, MODE, TOPIC, KICK, WHO, WHOIS, USERHOST, LIST, MOTD,
-CHATHISTORY, AWAY.
+CHATHISTORY, AWAY, REGAIN.
 
 `USERHOST` accepts up to five separate nickname parameters (RFC1459 folding),
 omits unknown/unregistered users, and returns numeric 302 even for no matches.
@@ -44,11 +44,22 @@ See the [USERHOST wire definition](https://modern.ircdocs.horse/#userhost-messag
 Capabilities: `sasl=PLAIN` (CAP 302), `message-tags`, `server-time`, `account-tag`,
 `echo-message`, `batch`, `draft/chathistory`, `cap-notify`, `away-notify`, and
 `draft/multiline=max-bytes=65536,max-lines=1024` (values from configuration;
-CAP 302 only). Capabilities are static;
+CAP 302 only) and `airc.dev/nick-regain`. Capabilities are static;
 REQ is atomic, and CAP 302 implicitly enables cap-notify. Tags are filtered per
 recipient's negotiated capabilities. The server replaces client-provided account,
 time and msgid tags; only `+` client-only tags are relayed. `+typing` is advisory;
 `+reply` can reference a message ID. Neither grants a speaking lock or authority.
+
+A nickname another connection holds is refused with 433. One exception
+compares authenticated accounts, never nickname text: a connection that
+negotiated `airc.dev/nick-regain` and authenticated (SASL or PASS) but has not
+registered gets `FAIL NICK NICK_HELD <nick> :…` when the holder is its own
+account. It may then send `REGAIN <nick>`. That command closes the holder with
+`ERROR :Session taken over`, shows its peers `QUIT :Session taken over` and
+takes the name. Another account's holder still gets 433. Without the capability
+and authentication, or after registration, REGAIN fails with
+`FAIL REGAIN INVALID_STATE`. Clients without the capability see ordinary IRC
+behavior.
 
 Artifact upload announcements add four server-owned tags for `message-tags`
 recipients: `airc-artifact` (UUID), `airc-artifact-name` (1–100 filename ASCII

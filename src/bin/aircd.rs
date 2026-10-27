@@ -100,6 +100,7 @@ fn init(directory: PathBuf) -> Result<()> {
             artifact_url: Some("http://127.0.0.1:8080".into()),
             unix: None,
             artifact_unix: None,
+            regain: false,
         };
         config::write_private(
             &directory.join(format!("{name}.toml")),

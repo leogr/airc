@@ -90,7 +90,8 @@ lines). `--jsonl 2` assembles multiline messages (`"lines":N`), returns
 `{"receipt":ID,"state":"pending"}` for `send` and later a read event
 `{"event":"receipt","receipt":ID,"state":"confirmed"|"rejected",…}`; one send
 may be pending. On disconnect or confirmation timeout it writes
-`{"event":"closed","uncertain":[…]}` and exits. Client configs may use
+`{"event":"closed","uncertain":[…]}` (with `server_error` when the server ended
+the connection, for example `Session taken over`) and exits. Client configs may use
 `unix`/`artifact_unix` instead of host/port/`artifact_url`, with no TCP fallback.
 
 Every request contains `id` and `op`; every response echoes `id` with `ok` and

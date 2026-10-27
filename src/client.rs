@@ -1,7 +1,7 @@
 //! Persistent IRC connection with a bounded, cursor-addressed JSONL frontend.
 use crate::{
     multiline::{self, Assembler, Limits},
-    protocol::{MAX_LINE, Message, fold, read_line, valid_channel, valid_nick},
+    protocol::{MAX_LINE, Message, NICK_REGAIN, fold, read_line, valid_channel, valid_nick},
     transport,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -43,6 +43,10 @@ pub struct ClientConfig {
     /// Unix artifact endpoint; excludes `artifact_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_unix: Option<PathBuf>,
+    /// Take over this account's other session holding `nick` at registration
+    /// (`REGAIN`), instead of failing with NICK_HELD. Off unless configured.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub regain: bool,
 }
 fn yes() -> bool {
     true
@@ -258,7 +262,6 @@ async fn open_connection(
     let mut capabilities = BTreeSet::new();
     let mut offered_multiline = None;
     write_message(&mut writer, Message::new("CAP", ["LS", "302"])).await?;
-    write_message(&mut writer, Message::new("NICK", [&config.nick])).await?;
     write_message(
         &mut writer,
         Message::new("USER", [&config.account, "0", "*", "AIRC agent"]),
@@ -278,6 +281,10 @@ async fn open_connection(
                         .any(|s| s == "sasl" || s.starts_with("sasl=")),
                     "server lacks SASL"
                 );
+                ensure!(
+                    !config.regain || offered.split_whitespace().any(|s| s == NICK_REGAIN),
+                    "server lacks nick regain"
+                );
                 offered_multiline = offered
                     .split_whitespace()
                     .find_map(|s| s.strip_prefix(&format!("{}=", multiline::CAP)))
@@ -293,6 +300,7 @@ async fn open_connection(
                     "away-notify",
                     "draft/chathistory",
                     multiline::CAP,
+                    NICK_REGAIN,
                 ]
                 .into_iter()
                 .filter(|c| {
@@ -331,7 +339,13 @@ async fn open_connection(
                     write_message(&mut writer, Message::new("AUTHENTICATE", ["+"])).await?;
                 }
             }
-            "903" => write_message(&mut writer, Message::new("CAP", ["END"])).await?,
+            "903" => {
+                // The nickname follows authentication, so the server can tell
+                // this account's own sessions apart from another account's.
+                let command = if config.regain { "REGAIN" } else { "NICK" };
+                write_message(&mut writer, Message::new(command, [&config.nick])).await?;
+                write_message(&mut writer, Message::new("CAP", ["END"])).await?;
+            }
             "001" => {
                 // Named sessions correlate later numerics with this server name.
                 let server = m.prefix.clone().unwrap_or_default();
@@ -347,6 +361,15 @@ async fn open_connection(
             "PING" => write_message(&mut writer, Message::new("PONG", m.params)).await?,
             "ERROR" | "432" | "433" | "464" | "904" | "905" | "906" => {
                 bail!("IRC registration failed ({})", m.command)
+            }
+            "FAIL"
+                if matches!(
+                    m.params.first().map(String::as_str),
+                    Some("NICK" | "REGAIN")
+                ) =>
+            {
+                let code = m.params.get(1).map_or("FAIL", String::as_str);
+                bail!("IRC registration failed ({code})")
             }
             _ => {}
         }
@@ -666,6 +689,8 @@ struct Ring {
     events: VecDeque<(u64, Value, usize)>,
     bytes: usize,
     cursor: u64,
+    /// The server's ERROR reason (for example "Session taken over").
+    error: Option<String>,
 }
 
 impl Ring {
@@ -681,6 +706,9 @@ impl Ring {
         }
     }
     fn message(&mut self, message: Message) {
+        if message.command == "ERROR" {
+            self.error = message.params.first().cloned();
+        }
         let lines = message
             .params
             .get(1)
@@ -795,6 +823,7 @@ async fn run_frontend_v2(
         events: VecDeque::new(),
         bytes: 0,
         cursor: 0,
+        error: None,
     };
     let mut pending: Option<Pending> = None;
     let failure = loop {
@@ -961,12 +990,15 @@ async fn run_frontend_v2(
         .iter()
         .map(|p| json!({"receipt": p.receipt, "target": p.target}))
         .collect::<Vec<_>>();
-    write_json(
-        output,
-        &json!({"event":"closed","error":failure,"uncertain":uncertain}),
-    )
-    .await?;
-    bail!("{failure}")
+    let mut closed = json!({"event":"closed","error":failure,"uncertain":uncertain});
+    if let Some(reason) = &ring.error {
+        closed["server_error"] = json!(reason);
+    }
+    write_json(output, &closed).await?;
+    match &ring.error {
+        Some(reason) => bail!("{failure} (server: {reason})"),
+        None => bail!("{failure}"),
+    }
 }
 
 async fn run_frontend(
@@ -1478,6 +1510,7 @@ mod tests {
             events: VecDeque::new(),
             bytes: 0,
             cursor: 0,
+            error: None,
         };
         let text = "a\nb";
         let mut pending = Some(Pending {
@@ -1592,6 +1625,7 @@ mod tests {
             events: VecDeque::new(),
             bytes: 0,
             cursor: 0,
+            error: None,
         };
         let mut waiting = Some(Pending {
             reply: Some("parent".into()),
@@ -1634,6 +1668,7 @@ mod tests {
             artifact_url: None,
             unix: None,
             artifact_unix: None,
+            regain: false,
         };
         let (to_client, inbound) = mpsc::channel(16);
         let (outbound, _unused) = mpsc::channel(1);

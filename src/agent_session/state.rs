@@ -1563,6 +1563,7 @@ mod tests {
             artifact_url: None,
             unix: None,
             artifact_unix: None,
+            regain: false,
         }
     }
 

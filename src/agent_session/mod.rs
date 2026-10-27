@@ -2044,6 +2044,7 @@ mod tests {
             artifact_url: None,
             unix: None,
             artifact_unix: None,
+            regain: false,
         };
         let mut state = State::new(&config).unwrap();
         state.begin_epoch();

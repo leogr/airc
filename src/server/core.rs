@@ -2,7 +2,7 @@ use super::{ControlOp, Event, ban};
 use crate::{
     attachments::{self, Published},
     config::Config,
-    protocol::{MAX_TAGS, Message, fold, valid_channel, valid_nick},
+    protocol::{MAX_TAGS, Message, NICK_REGAIN, fold, valid_channel, valid_nick},
     store::{Ban, Entry, StageRefusal, Store},
 };
 use anyhow::{Result, bail, ensure};
@@ -28,6 +28,7 @@ const CAPS: &[&str] = &[
     "cap-notify",
     "away-notify",
     MULTILINE,
+    NICK_REGAIN,
 ];
 const AWAY_LEN: usize = 200;
 const MULTILINE: &str = "draft/multiline";
@@ -743,8 +744,8 @@ impl State {
         }
         let p = &m.params;
         let required = match m.command.as_str() {
-            "NICK" | "PASS" | "AUTHENTICATE" | "JOIN" | "PART" | "PING" | "NAMES" | "WHO"
-            | "WHOIS" | "USERHOST" | "MODE" | "TOPIC" | "TAGMSG" | "KICK" => 1,
+            "NICK" | "REGAIN" | "PASS" | "AUTHENTICATE" | "JOIN" | "PART" | "PING" | "NAMES"
+            | "WHO" | "WHOIS" | "USERHOST" | "MODE" | "TOPIC" | "TAGMSG" | "KICK" => 1,
             "PRIVMSG" | "NOTICE" => 2,
             "USER" => 4,
             _ => 0,
@@ -783,27 +784,10 @@ impl State {
                 }
             }
             "AUTHENTICATE" => return self.sasl(id, &p[0]),
-            "NICK" => {
-                if !valid_nick(&p[0]) {
-                    self.numeric(id, "432", &["*", "Erroneous nickname"]);
+            "NICK" | "REGAIN" => {
+                if !self.nick(id, &p[0], m.command == "REGAIN") {
                     return Ok(());
                 }
-                if self
-                    .clients
-                    .iter()
-                    .any(|(other, c)| *other != id && fold(&c.nick) == fold(&p[0]))
-                {
-                    self.numeric(id, "433", &[&p[0], "Nickname in use"]);
-                    return Ok(());
-                }
-                if self.clients[&id].registered {
-                    let mut change = Message::new("NICK", [&p[0]]);
-                    change.prefix = Some(self.prefix(id));
-                    let mut peers = self.peers(id);
-                    peers.insert(id);
-                    self.broadcast(peers, change);
-                }
-                self.clients.get_mut(&id).unwrap().nick = p[0].clone();
             }
             "USER" => {
                 self.clients.get_mut(&id).unwrap().user = true;
@@ -851,6 +835,58 @@ impl State {
         }
         self.register(id);
         Ok(())
+    }
+
+    /// NICK, or with `regain` the registration-only REGAIN. A nickname another
+    /// connection holds is refused with 433, except that a connection which
+    /// negotiated NICK_REGAIN and authenticated before registering is told
+    /// when that holder is its own account: FAIL NICK_HELD for NICK, while
+    /// REGAIN closes the holder ("Session taken over") and takes the name.
+    /// The decision compares authenticated accounts, never nickname text.
+    /// Returns false when the nickname was refused.
+    fn nick(&mut self, id: u64, nick: &str, regain: bool) -> bool {
+        let command = if regain { "REGAIN" } else { "NICK" };
+        let c = &self.clients[&id];
+        if regain && (!c.caps.contains(NICK_REGAIN) || c.registered || c.account.is_none()) {
+            let reason = "REGAIN needs nick-regain and SASL before registration";
+            self.fail(id, command, "INVALID_STATE", nick, reason);
+            return false;
+        }
+        if !valid_nick(nick) {
+            self.numeric(id, "432", &["*", "Erroneous nickname"]);
+            return false;
+        }
+        let holder = self
+            .clients
+            .iter()
+            .find(|(other, c)| **other != id && fold(&c.nick) == fold(nick))
+            .map(|(other, c)| (*other, c.account.clone()));
+        if let Some((other, account)) = holder {
+            let c = &self.clients[&id];
+            let own = !c.registered
+                && c.caps.contains(NICK_REGAIN)
+                && c.account.is_some()
+                && account == c.account;
+            if !own {
+                self.numeric(id, "433", &[nick, "Nickname in use"]);
+                return false;
+            }
+            if !regain {
+                let reason = "Nickname is held by another session of this account";
+                self.fail(id, command, "NICK_HELD", nick, reason);
+                return false;
+            }
+            self.close(other, "Session taken over");
+        }
+        if self.clients[&id].registered {
+            let mut change = Message::new("NICK", [nick]);
+            change.prefix = Some(self.prefix(id));
+            let mut peers = self.peers(id);
+            peers.insert(id);
+            self.broadcast(peers, change);
+        }
+        self.clients.get_mut(&id).unwrap().nick = nick.to_owned();
+        true
     }
 
     fn register(&mut self, id: u64) {
