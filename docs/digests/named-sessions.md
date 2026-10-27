@@ -1,6 +1,6 @@
 # Named agent sessions
 
-Verification: `a9d1d9bbf24858c64e1ce2c398ee7a2ec1e0c5a9` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `a9d1d9bbf24858c64e1ce2c398ee7a2ec1e0c5a9` and accompanying changes; `src/agent_session/mod.rs` and `tests/named_sessions.rs` anchors re-located by symbol at `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] The existing Rust binary supports explicit connect/read/wait/send/status/
 disconnect commands alongside unchanged JSONL version 1. A spawned local Unix
@@ -96,17 +96,17 @@ read cursors. [11](#source-11) [13](#source-13) [14](#source-14)
 ## Sources
 
 1. <a id="source-1"></a> [src/bin/airc.rs](../../src/bin/airc.rs#L1-L488) — CLI dispatch, JSONL preservation and shutdown.
-2. <a id="source-2"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L467-L1689) — process lifecycle, bounded IPC, readiness/reads/sends and failure reporting.
+2. <a id="source-2"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L519-L1904) — process lifecycle, bounded IPC, readiness/reads/sends and failure reporting.
 3. <a id="source-3"></a> [src/agent_session/storage.rs](../../src/agent_session/storage.rs#L18-L136) — ownership, native lock, bounded decode and durable publication.
 4. <a id="source-4"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L30-L1142) — events with attention stamps, framing, confirmation matching, references, cursor, receipts and `readiness`.
 5. <a id="source-5"></a> [src/agent_session/history.rs](../../src/agent_session/history.rs#L465-L694) — `recover`, bounded paging, live staging and overlap regression.
-6. <a id="source-6"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L172-L768) — named CLI, non-consuming wait/cancellation and network-fault scenarios.
+6. <a id="source-6"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L188-L802) — named CLI, non-consuming wait/cancellation and network-fault scenarios.
 7. <a id="source-7"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L1143-L1704) — state, identity, control escaping, framing, version and fixed-transcript tests.
-8. <a id="source-8"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1690-L1859) — idle renewal, error termination, malformed readiness and request strictness tests.
+8. <a id="source-8"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1906-L2003) — idle renewal, error termination, malformed readiness and request strictness tests.
 9. <a id="source-9"></a> [src/multiline.rs](../../src/multiline.rs#L147-L179) — `outbound` single-line versus batch preparation; `src/bin/airc.rs` `read_stdin_text` at L473–488.
-10. <a id="source-10"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L770-L998) — multiline fallback recovery, multiline send/read/recovery and wake-class regressions.
+10. <a id="source-10"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L805-L1035) — multiline fallback recovery, multiline send/read/recovery and wake-class regressions.
 11. <a id="source-11"></a> [src/agent_session/attention.rs](../../src/agent_session/attention.rs#L1-L1129) — `classify`, `readiness`, debounce/high-water/gap rules and unit tests.
-12. <a id="source-12"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L43-L52) — `Wake` modes; reader-before-waiter evaluation in `serve` at L1120–1600.
+12. <a id="source-12"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L45-L54) — `Wake` modes; reader-before-waiter evaluation in `serve` at L1606–1635.
 
-13. <a id="source-13"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L454) — `WaitingAvailability`, `validate`, `call`, confirmed availability and timeout; `state.rs` `ingest` records peer AWAY as context.
-14. <a id="source-14"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1000-L1112) — explicit claims, unchanged waits, rejected input, dropped/timed-out acknowledgment and reconnect without replay.
+13. <a id="source-13"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L496) — `WaitingAvailability`, `validate`, `call`, confirmed availability and timeout; `state.rs` `ingest` records peer AWAY as context.
+14. <a id="source-14"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1038-L1149) — explicit claims, unchanged waits, rejected input, dropped/timed-out acknowledgment and reconnect without replay.

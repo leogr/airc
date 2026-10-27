@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::{
-    io::Write,
+    io::{BufRead, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -215,4 +215,105 @@ fn a_descendant_holding_stdout_does_not_block_acceptance() {
     let output = fake.run("lingering", THREAD, BATCH.as_bytes(), &[]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+/// Starts the adapter in `--wait-for-idle` mode with a private, empty Codex
+/// home: its control alias is absent, so it waits and never reaches the
+/// shared daemon directory.
+fn spawn_waiting(fake: &Fake, extra: &[&str]) -> std::process::Child {
+    let home = fake.dir.path().join("codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_airc-codex"))
+        .args(["--thread", THREAD, "--wait-for-idle", "--codex"])
+        .arg(fake.codex())
+        .args(extra)
+        .env("CODEX_HOME", &home)
+        .env("FAKE_DIR", fake.dir.path())
+        .env("FAKE_MODE", "ok")
+        .env("AIRC_DELIVERY_ID", "6f1c")
+        .env_remove("AIRC_SUBSCRIBER_PID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(BATCH.as_bytes())
+        .unwrap();
+    child
+}
+
+#[test]
+fn idle_timeout_requires_wait_for_idle() {
+    let fake = Fake::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_airc-codex"))
+        .args(["--thread", THREAD, "--idle-timeout", "5"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(fake.argv().is_none());
+}
+
+#[test]
+fn an_idle_timeout_ends_the_wait_without_sending() {
+    let fake = Fake::new();
+    let started = std::time::Instant::now();
+    let output = spawn_waiting(&fake, &["--idle-timeout", "1"])
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("delivery 6f1c not sent: thread not idle within --idle-timeout 1 s")
+            && stderr.contains("control alias is absent"),
+        "{stderr}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(fake.argv().is_none());
+}
+
+#[test]
+fn an_unrepresentable_idle_timeout_is_refused_at_once() {
+    let fake = Fake::new();
+    let started = std::time::Instant::now();
+    let output = spawn_waiting(&fake, &["--idle-timeout", &u64::MAX.to_string()])
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("delivery 6f1c not sent: waiting for idle refused: --idle-timeout 18446744073709551615 is too large"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(fake.argv().is_none());
+}
+
+#[test]
+fn a_signal_while_waiting_sends_nothing() {
+    use rustix::process::{Pid, Signal, kill_process};
+    let fake = Fake::new();
+    for signal in [Signal::TERM, Signal::INT, Signal::HUP] {
+        let mut child = spawn_waiting(&fake, &[]);
+        // Its handlers are installed before the first retry diagnostic.
+        let mut errors = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut seen = String::new();
+        while !seen.contains("retrying status discovery") {
+            assert_ne!(errors.read_line(&mut seen).unwrap(), 0, "{seen}");
+        }
+        let pid = Pid::from_raw(child.id() as i32).unwrap();
+        kill_process(pid, signal).unwrap();
+        let status = child.wait().unwrap();
+        std::io::Read::read_to_string(&mut errors, &mut seen).unwrap();
+        assert_eq!(status.code(), Some(3), "{seen}");
+        assert!(
+            seen.contains("cancelled by signal while waiting for idle"),
+            "{seen}"
+        );
+    }
+    assert!(fake.argv().is_none());
 }

@@ -338,9 +338,14 @@ idle wait prints `wait timed out; no events consumed`.
 `subscribe` keeps running. For each batch it starts ADAPTER directly (no
 shell) with the batch on stdin and `AIRC_SESSION`, `AIRC_DELIVERY_ID`,
 `AIRC_DELIVERY_RETRY` (`0` or `1`) and `AIRC_SUBSCRIBER_PID` in its environment.
-Exit 0 within `--sink-timeout` (default 60 s) accepts the batch. Anything else
-(non-zero exit, signal or timeout) ends `subscribe` with exit 1 and a bounded
-diagnostic that includes the adapter's captured stderr. Nothing is retried.
+Exit 0 within `--sink-timeout` (default 60 s, 1–3600) accepts the batch.
+Anything else (non-zero exit, signal or timeout) ends `subscribe` with exit 1
+and a bounded diagnostic that includes the adapter's captured stderr. Nothing
+is retried. `--sink-timeout 0` sets no deadline, for an adapter that waits on
+its own such as `airc-codex --wait-for-idle`; if `subscribe` then stops on
+SIGTERM or SIGINT while the adapter runs, it kills the adapter's process group
+(children that left that group, or a `subscribe` killed with SIGKILL, escape
+this). With a deadline, only the adapter itself is killed.
 `-- -` writes batches to stdout and accepts each after flushing.
 `--wrap N` (64–65536 bytes) first splits each line after the header that is
 longer than N bytes at UTF-8 boundaries. Every continuation starts with `| `,

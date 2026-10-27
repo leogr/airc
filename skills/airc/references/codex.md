@@ -116,3 +116,50 @@ Without reports every later batch waits up to the timeout. The hold never
 merges or edits messages already in the thread queue, caps that queue, or
 proves processing. `airc deliveries work` shows the current hold and recent
 receipt records.
+
+## Optional wait for idle
+
+The recipe above is the default. Use this alternative only when the person
+running Codex asks for it: instead of queuing each batch while the thread is
+busy, the adapter holds one batch until the thread is idle, then queues it.
+
+```sh
+airc subscribe work --wake mentions --sink-timeout 0 -- \
+  airc-codex --thread "$CODEX_THREAD_ID" --wait-for-idle
+```
+
+`--sink-timeout 0` lets `subscribe` wait for the adapter without a deadline.
+If `subscribe` is stopped with SIGTERM or SIGINT while the adapter runs, it
+kills the adapter's process group, including children that stayed in it; a
+`subscribe` killed outright (SIGKILL) cannot clean up. The
+adapter reads the thread's status, read-only, through the local Codex
+app-server socket under `$CODEX_HOME/app-server-control` (checked against
+codex-cli 0.164.0 sources), queues only after a fresh read reports `idle`, and
+then behaves as in the table above. Do not combine it with the receipt hold.
+
+The held batch cannot grow. Mentions arriving meanwhile wait in AIRC and
+follow, in order, after it is accepted, in batches bounded by `--max-bytes`:
+`more` in a header means another batch follows, and a backlog beyond AIRC's
+retention is reported as `gap`. A busy thread given a burst that fits gets the
+held batch as one turn and the burst as the next; a larger backlog takes more
+turns. A turn can still start between the idle read and the queue call; the
+batch then queues behind it.
+
+A missing or dangling socket and lost connections keep the same adapter and
+batch waiting: discovery retries after 1, 2, 4, 8, 15, then every 30 seconds.
+By default it waits indefinitely; add `--idle-timeout SECONDS` after
+`--wait-for-idle` to bound the whole wait. A Codex session without a local
+daemon socket, such as one started with `--profile` or with `-c` overrides
+outside a few feature and UI keys, or one whose socket alias another session on
+the same account replaced, therefore waits where `codex queue` would still
+work. Do not change launch settings to make it pass; use the default recipe.
+
+The adapter exits 3, sending nothing, when the thread is not loaded or in a
+system error, the endpoint is not this user's Codex daemon socket, the app
+server refuses or answers malformed, `--idle-timeout` is too large or passes,
+or it receives a signal while waiting. A signal during the queue call kills
+that call and exits 4: Codex may already have queued the batch, so inspect the
+thread queue before any retry. Either way listening has ended with the batch
+pending: recover as above.
+This mode has been checked only against a simulated app server; live Codex
+runs, other versions and remote app servers are not verified.

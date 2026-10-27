@@ -733,6 +733,8 @@ pub struct DeliverOptions {
     pub timeout: Option<u64>,
     /// The exact pending ID authorized for one redelivery.
     pub retry: Option<String>,
+    /// Seconds the adapter may take; 0 (`subscribe` only) sets no deadline
+    /// and kills the adapter's whole process group if the subscriber stops.
     pub sink_timeout: u64,
     /// Wrap lines after the header longer than this many bytes into `| `
     /// continuations before the sink sees the batch.
@@ -787,8 +789,9 @@ pub async fn deliver(
     };
     validate(&consume)?;
     ensure!(
-        (1..=3600).contains(&options.sink_timeout),
-        "--sink-timeout requires 1–3600 seconds"
+        (1..=3600).contains(&options.sink_timeout)
+            || (options.sink_timeout == 0 && matches!(sink, Sink::Exec(_))),
+        "--sink-timeout requires 1–3600 seconds, or 0 for an adapter without a deadline"
     );
     if let Some(wrap) = options.wrap {
         ensure!(
@@ -946,6 +949,9 @@ fn write_stdout(text: &str) -> Result<()> {
 /// Run one adapter: argv without a shell, the batch on stdin, then EOF. Exit 0
 /// in time means the sink accepted it. The direct child is killed on timeout or
 /// when this future is dropped; anything it started itself is its own concern.
+/// With `limit` 0 there is no deadline, and dropping this future (the
+/// subscriber stopping) kills the adapter's process group instead, so a
+/// waiting adapter leaves no sender behind.
 async fn run_sink(
     argv: &[String],
     session: &str,
@@ -969,6 +975,10 @@ async fn run_sink(
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("adapter {} did not start", safe(program)))?;
+    let group = ProcessGroup(std::sync::atomic::AtomicU32::new(match limit {
+        0 => child.id().unwrap_or(0),
+        _ => 0,
+    }));
     let mut stdin = child.stdin.take().context("adapter stdin unavailable")?;
     let mut stderr = child.stderr.take().context("adapter stderr unavailable")?;
     let run = async {
@@ -991,7 +1001,10 @@ async fn run_sink(
             let finished = async {
                 let written = stdin.write_all(text.as_bytes()).await;
                 drop(stdin);
-                (written, child.wait().await)
+                let status = child.wait().await;
+                // Reaped: its ID may now name an unrelated group.
+                group.disarm();
+                (written, status)
             };
             tokio::pin!(errors, finished);
             let mut drained = false;
@@ -1020,11 +1033,36 @@ async fn run_sink(
         written.with_context(|| format!("adapter did not read the whole batch{detail}"))?;
         Ok(())
     };
+    if limit == 0 {
+        return run.await;
+    }
     match timeout(Duration::from_secs(limit), run).await {
         Ok(result) => result,
         Err(_) => {
             let _ = child.start_kill();
             bail!("adapter exceeded {limit} s and was killed")
+        }
+    }
+}
+
+/// The process group of an unbounded adapter (its own PID, from
+/// `process_group(0)`), killed on drop until the adapter has been reaped.
+struct ProcessGroup(std::sync::atomic::AtomicU32);
+
+impl ProcessGroup {
+    fn disarm(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let id = self.0.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(group) = i32::try_from(id)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
     }
 }

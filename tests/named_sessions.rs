@@ -3991,3 +3991,177 @@ async fn a_pending_batch_without_a_receipt_still_retries_wrapped() {
     f.ok(&["disconnect", "trial"]).await;
     server.shutdown().await.unwrap();
 }
+
+/// `--sink-timeout 0`: the adapter may hold one batch with no deadline while
+/// later mentions accumulate for the next batch, and stopping the subscriber
+/// kills the adapter's process group. Bounded sinks keep their deadline and
+/// their cleanup, which leaves the adapter's own children alone.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unbounded_sink_holds_its_batch_and_its_group_stops_with_the_subscriber() {
+    use rustix::process::{Pid, Signal, kill_process};
+    fn running(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            let state = stat.rsplit_once(") ").map(|(_, rest)| rest.as_bytes()[0]);
+            !matches!(state, Some(b'Z' | b'X'))
+        })
+    }
+    let terminate = |pid: u32| {
+        kill_process(Pid::from_raw(pid as i32).unwrap(), Signal::TERM).unwrap();
+    };
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+    let registered = |pid: u32| {
+        let f = &f;
+        async move {
+            eventually(
+                || f.ok(&["status", "trial"]),
+                |s| s.contains(&format!("delivery consumer: subscribe pid={pid} ")),
+            )
+            .await
+        }
+    };
+    let pending = |status: &str| {
+        status
+            .split_once(" pending=")
+            .and_then(|(_, rest)| rest.split(' ').next())
+            .unwrap()
+            .to_string()
+    };
+    // A bounded sink is still killed at its deadline.
+    let bounded = subscriber(
+        &f,
+        &["--wake", "mentions", "--sink-timeout", "1"],
+        &["sh", "-c", "cat > /dev/null; exec sleep 30"],
+    );
+    registered(bounded.id().unwrap()).await;
+    send(&mut human, "@alice bounded").await;
+    let ended = timeout(Duration::from_secs(15), bounded.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        text(&ended).contains("adapter exceeded 1 s and was killed"),
+        "{}",
+        text(&ended)
+    );
+    let status = f.ok(&["status", "trial"]).await;
+    f.ok(&["deliveries", "trial", "--drop", &pending(&status)])
+        .await;
+    // Holds each batch until "$0.go" appears; records "adapter background-child".
+    let script = "cat >> \"$0\"; sleep 300 < /dev/null > /dev/null 2>&1 & echo \"$$ $!\" >> \"$0.pids\"; \
+        while [ ! -e \"$0.go\" ]; do sleep 0.05; done; rm \"$0.go\"; kill $!";
+    let out = f.dir.path().join("held");
+    let gate = out.with_extension("go");
+    let pids = |path: &PathBuf| {
+        let pids = std::fs::read_to_string(path.with_extension("pids")).unwrap();
+        let last = pids.lines().last().unwrap().to_string();
+        let (adapter, child) = last.split_once(' ').unwrap();
+        (
+            adapter.parse::<i32>().unwrap(),
+            child.parse::<i32>().unwrap(),
+        )
+    };
+    let held = subscriber(
+        &f,
+        &["--wake", "mentions", "--sink-timeout", "0"],
+        &["sh", "-c", script, out.to_str().unwrap()],
+    );
+    let pid = held.id().unwrap();
+    registered(pid).await;
+    send(&mut human, "@alice lead").await;
+    eventually(|| contents(out.clone()), |s| s.contains("@alice lead")).await;
+    for n in 1..=3 {
+        send(&mut human, &format!("@alice burst {n}")).await;
+    }
+    // Past the bounded sink's deadline, the same consumer still holds the lead.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let status = f.ok(&["status", "trial"]).await;
+    let lead = delivery_id(&contents(out.clone()).await);
+    assert!(
+        status.contains(&format!("delivery consumer: subscribe pid={pid} "))
+            && pending(&status) == lead,
+        "{status}"
+    );
+    std::fs::write(&gate, "").unwrap();
+    // The lead stays alone; the next batch carries the accumulated burst in order.
+    let both = eventually(
+        || contents(out.clone()),
+        |s| batches(s).len() == 2 && s.contains("@alice burst 3"),
+    )
+    .await;
+    let held_batches = batches(&both);
+    assert!(!held_batches[0].contains("burst"), "{both}");
+    let second = held_batches[1];
+    let at = |n: u32| second.find(&format!("@alice burst {n}")).unwrap();
+    assert!(at(1) < at(2) && at(2) < at(3), "{second}");
+    let second_id = delivery_id(second);
+    eventually(
+        || async { std::fs::read_to_string(out.with_extension("pids")).unwrap_or_default() },
+        |s| s.lines().count() == 2,
+    )
+    .await;
+    let (adapter, child) = pids(&out);
+    assert!(running(adapter) && running(child));
+    // Stopping the subscriber kills the whole group and keeps the exact batch.
+    terminate(pid);
+    let stopped = timeout(Duration::from_secs(15), held.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        text(&stopped).contains("stopped by signal"),
+        "{}",
+        text(&stopped)
+    );
+    eventually(
+        || async { format!("{} {}", running(adapter), running(child)) },
+        |s| s == "false false",
+    )
+    .await;
+    let status = eventually(
+        || f.ok(&["status", "trial"]),
+        |s| s.contains("delivery consumer: none"),
+    )
+    .await;
+    assert_eq!(pending(&status), second_id);
+    // `--show` always restates the batch's settings after the header.
+    let notice = "! delivery settings: account=alice nick=alice wake=mentions max-bytes=8192 wrap=off min-interval=0\n";
+    assert_eq!(
+        f.ok(&["deliveries", "trial", "--show", &second_id]).await,
+        second.replacen("]\n", &format!("]\n{notice}"), 1)
+    );
+    // The default bounded sink keeps today's cleanup: only the adapter dies.
+    f.ok(&["deliveries", "trial", "--drop", &second_id]).await;
+    let out = f.dir.path().join("bounded");
+    let default = subscriber(
+        &f,
+        &["--wake", "mentions"],
+        &["sh", "-c", script, out.to_str().unwrap()],
+    );
+    let pid = default.id().unwrap();
+    registered(pid).await;
+    send(&mut human, "@alice default").await;
+    eventually(
+        || async { std::fs::read_to_string(out.with_extension("pids")).unwrap_or_default() },
+        |s| s.lines().count() == 1,
+    )
+    .await;
+    let (adapter, child) = pids(&out);
+    terminate(pid);
+    timeout(Duration::from_secs(15), default.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    eventually(|| async { running(adapter).to_string() }, |s| s == "false").await;
+    assert!(
+        running(child),
+        "a bounded adapter's own child is left alone"
+    );
+    kill_process(Pid::from_raw(child).unwrap(), Signal::KILL).unwrap();
+    f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}

@@ -1,6 +1,6 @@
 # Shared message references
 
-Verification: `19db126da853896fb81d9eed2cb0295436955b5a` and accompanying changes.
+Verification: `19db126da853896fb81d9eed2cb0295436955b5a` and accompanying changes; source anchors re-located, same symbols, at `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes.
 
 [FACT] A canonical (lowercase, hyphenated) UUID msgid has one shared reference:
 `m:` plus the unpadded base64url encoding of its 16 bytes in display order, 24
@@ -61,8 +61,8 @@ retained and one fetched from server history; and refuse `@N` arguments.
 
 1. <a id="source-1"></a> [Codec](../../src/agent_session/reference.rs#L1-L247) — `compact`, `decode`, `resolve`, `present`, `exact`, `shareable` and their unit tests.
 2. <a id="source-2"></a> [Presentation](../../src/agent_session/state.rs#L319-L593) — `remember`, `legacy`, `shown`, `header`, `retained_show`; `read` L656, `prepare_delivery` L823, `describe` L1362, `record_token`/`local_number` L1418–L1431.
-3. <a id="source-3"></a> [Show walk](../../src/agent_session/mod.rs#L385-L467) — `advance`, `push`; `validate` at L1032 refuses show and reply arguments.
+3. <a id="source-3"></a> [Show walk](../../src/agent_session/mod.rs#L385-L467) — `advance`, `push`; `validate` at L1070 refuses show and reply arguments.
 4. <a id="source-4"></a> [Delivery hint](../../src/agent_session/delivery.rs#L612-L618) — `record_reference` offers only shareable references.
 5. <a id="source-5"></a> [Shared vectors](../../tests/data/message-references.json#L1-L53) — valid, invalid, uncompactable and opaque entries.
-6. <a id="source-6"></a> [State and argument tests](../../src/agent_session/state.rs#L1729-L1948) — shared headers and send outcomes, saved-number records, byte-preserved pending batches, combined receipt-hold restore; `mod.rs` refusal test at L1993.
-7. <a id="source-7"></a> [Named-session tests](../../tests/named_sessions.rs#L187-L285) — send/reply refusal and confirmation; two-client test at L1908, show chain at L1983.
+6. <a id="source-6"></a> [State and argument tests](../../src/agent_session/state.rs#L1730-L1949) — shared headers and send outcomes, saved-number records, byte-preserved pending batches, combined receipt-hold restore; `mod.rs` refusal test at L2031.
+7. <a id="source-7"></a> [Named-session tests](../../tests/named_sessions.rs#L188-L286) — send/reply refusal and confirmation; two-client test at L1909, show chain at L1984.

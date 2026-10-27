@@ -340,6 +340,13 @@ The unmodified 9b5215c binaries refused receipt options, reports and
 version-4 state, kept reading version-3 state that the new binary had used
 without receipts, and as old clients stayed held by a new worker.
 
+`airc-codex --wait-for-idle` and `subscribe --sink-timeout 0` have offline
+tests only: a mock Unix WebSocket server laid out like the codex-cli 0.164.0
+control socket, a fake `codex queue`, and shell adapters holding a batch while
+a real worker and server accumulate the next one. The status protocol was taken
+from the 0.164.0 sources; no Codex daemon, model turn, queue depth, long busy
+period or cross-box shared-account socket was exercised.
+
 The `airc-delivery` Claude Code plugin was probed with Claude Code 2.1.306 and
 one model configuration (Sonnet 5.5) in a disposable box. The plugin was loaded
 with `--plugin-dir` and ran `subscribe -- -` from AIRC b1e88a8, before

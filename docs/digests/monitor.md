@@ -1,6 +1,6 @@
 # Local waiter and monitor bookkeeping
 
-Verification: `a9d1d9bbf24858c64e1ce2c398ee7a2ec1e0c5a9` and accompanying changes; re-read cited symbols when behavior changes.
+Verification: `a9d1d9bbf24858c64e1ce2c398ee7a2ec1e0c5a9` and accompanying changes; `src/agent_session/mod.rs` and `tests/named_sessions.rs` anchors re-located by symbol at `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes; re-read cited symbols when behavior changes.
 
 [FACT] The named worker registers at most one readiness waiter, containing its
 wake mode, registration UTC time, monotonic deadline and reply channel. Status
@@ -39,7 +39,7 @@ hardlinks, public files/directories, oversized/corrupt state and lock contention
 
 ## Sources
 
-1. <a id="source-1"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L256-L282) — `WaitingNotice` and `waiter_status`; stopped/unavailable fallback at L542–565; `serve` registration at L1320–1328 and release/teardown at L1422–1442.
-2. <a id="source-2"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L642-L683) — `wait` bounded renewal; `tests/named_sessions.rs:383–440` — observed registration timestamps, cancellation and teardown; stopped-worker recovery assertion at L562.
+1. <a id="source-1"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L294-L319) — `WaitingNotice` and `waiter_status`; stopped/unavailable fallback in `call` at L583–598; `serve` registration at L1515–1521 and release/readiness reply at L1620–1635.
+2. <a id="source-2"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L682-L725) — `wait` bounded renewal; `tests/named_sessions.rs:418–472` — observed registration timestamps, cancellation and teardown; stopped-worker recovery assertion at L595.
 3. <a id="source-3"></a> [skills/airc/scripts/airc-monitor.py](../../skills/airc/scripts/airc-monitor.py#L1-L157) — helper `locked`, `read`, `save`, `main`.
 4. <a id="source-4"></a> [scripts/test_airc_monitor.py](../../scripts/test_airc_monitor.py#L1-L78) — private-file and retained-handle regressions; `Makefile:11–14` includes the suite in `make test`.

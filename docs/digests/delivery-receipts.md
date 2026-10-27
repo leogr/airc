@@ -1,6 +1,6 @@
 # Named delivery receipts
 
-Verification: `19db126da853896fb81d9eed2cb0295436955b5a` and accompanying changes.
+Verification: `19db126da853896fb81d9eed2cb0295436955b5a` and accompanying changes; source anchors re-located, same symbols, at `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes.
 
 [FACT] `subscribe --receipt-timeout S --receipt-scope UUID` is opt-in: 0, the
 default, disables it; enabled values are 1–3600 seconds and at least
@@ -81,13 +81,13 @@ simulated FIFO receiver. These are mock checks, not live Codex or model runs.
 ## Sources
 
 1. <a id="source-1"></a> [src/bin/airc.rs](../../src/bin/airc.rs#L64-L101) — `Subscribe` flags; receipt pairing in dispatch at L337–374, `Deliveries` at L119–139 and L394–412.
-2. <a id="source-2"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1032-L1145) — `validate`, including the `--wrap` refusal at L1104–1108; `ConsumerSettings` and `ReceiptSettings` at L191–218; `deliver` at L760–800; worker store at L1173; `serve` opt-in and wrapped-retry refusals at L1334–1365.
-3. <a id="source-3"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L333-L354) — `consumer_status`; `deliveries` at L1147–1161.
+2. <a id="source-2"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1070-L1183) — `validate`, including the `--wrap` refusal at L1142–1146; `ConsumerSettings` and `ReceiptSettings` at L191–218; `deliver` at L762–803; worker store at L1211; `serve` opt-in and wrapped-retry refusals at L1372–1403.
+3. <a id="source-3"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L333-L354) — `consumer_status`; `deliveries` at L1185–1199.
 4. <a id="source-4"></a> [src/agent_session/delivery.rs](../../src/agent_session/delivery.rs#L25-L327) — limits, `Delivery`, `ReceiptRequest::notice`, `Credit`, `Reason`, `validate_scope`, `valid_store`, `shell_word`; `render`/`validate` at L352–383, `ReceiptOptions` at L419–433; `SOCKET_PATH_BYTES` in `storage.rs` at L14.
 5. <a id="source-5"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L721-L1138) — `set_receipt_store`, `receipt_refusal`, `reserved`, `prepare_delivery`, `finish_delivery`, `mark_received`, hold methods, `delivery_pressure`, status lines; versions at L38–43, `validate` at L195–241, `begin_epoch`/`restore_hold` at L257–278, `receipt_request` at L1463–1475.
-6. <a id="source-6"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1447-L1456) — `serve` saves a report before replying; tick expiry and hold gating at L1651–1694; consumer-connection restriction in `handle` at L1803–1810.
+6. <a id="source-6"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1485-L1494) — `serve` saves a report before replying; tick expiry and hold gating at L1689–1732; consumer-connection restriction in `handle` at L1841–1848.
 7. <a id="source-7"></a> [src/agent_session/attention.rs](../../src/agent_session/attention.rs#L289-L299) — shared `high_water`, used by `readiness` at L379.
-8. <a id="source-8"></a> [src/lib.rs](../../src/lib.rs#L14-L40) — `FEATURES`.
-9. <a id="source-9"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L2567-L2948) — receipt unit tests; `delivery.rs` tests at L780 and L858.
-10. <a id="source-10"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2476-L3099) — helpers that run the printed command, hold, expiry, bypass, early-report, failed-save and IPC regressions; later ones at L3485–3992.
-11. <a id="source-11"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L3101-L3483) — `replay` counting harness with drain mode, `receipt_credit_reduces_records_queued_for_a_busy_receiver` and the ignored `receipt_measurement_matrix`.
+8. <a id="source-8"></a> [src/lib.rs](../../src/lib.rs#L14-L41) — `FEATURES`.
+9. <a id="source-9"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L2568-L2949) — receipt unit tests; `delivery.rs` tests at L780 and L858.
+10. <a id="source-10"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2477-L3100) — helpers that run the printed command, hold, expiry, bypass, early-report, failed-save and IPC regressions; later ones at L3486–3993.
+11. <a id="source-11"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L3102-L3484) — `replay` counting harness with drain mode, `receipt_credit_reduces_records_queued_for_a_busy_receiver` and the ignored `receipt_measurement_matrix`.

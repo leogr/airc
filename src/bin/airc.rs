@@ -74,7 +74,7 @@ enum Command {
         /// Minimum seconds between accepted batches; critical events bypass it.
         #[arg(long, default_value_t = 0)]
         min_interval: u64,
-        /// Seconds an adapter may take to accept a batch before it is killed.
+        /// Seconds (1–3600) an adapter may take before it is killed; 0 sets no deadline.
         #[arg(long, default_value_t = 60)]
         sink_timeout: u64,
         /// Redeliver this exact pending batch once after inspecting it.

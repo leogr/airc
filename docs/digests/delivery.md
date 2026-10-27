@@ -1,6 +1,6 @@
 # Named delivery and context lookup
 
-Verification: `19db126da853896fb81d9eed2cb0295436955b5a` and accompanying changes.
+Verification: `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes.
 
 [FACT] Named state version 3 has an optional delivery record: a separate
 cursor, loss summary, one pending batch at most and the last outcome; opt-in
@@ -49,7 +49,8 @@ adapter argv without a shell (own process group, `kill_on_drop`): batch on
 stdin, `AIRC_SESSION`, `AIRC_DELIVERY_ID`, `AIRC_DELIVERY_RETRY` and
 `AIRC_SUBSCRIBER_PID` set, stdout inherited, last 4 KiB of stderr kept. Exit 0 within `--sink-timeout`
 accepts; any other outcome leaves the batch pending and ends `subscribe` with
-exit 1. Only the direct child is killed; its descendants are not.
+exit 1. Only the direct child is killed, unless `--sink-timeout 0`
+([no deadline](codex-idle-wait.md)) kills its process group.
 [4](#source-4) [7](#source-7)
 
 [FACT] `show` resolves an `m:` [reference](message-references.md) or msgid
@@ -69,7 +70,8 @@ accepts both markers, checks the header ID against `AIRC_DELIVERY_ID` and its pa
 `AIRC_SUBSCRIBER_PID`, then runs `codex queue --thread ID --message BATCH` with
 literal argv. It accepts only a clean exit whose bounded stdout matches
 `Queued message … for thread <ID>.`, exits 3 when nothing was sent and 4 when
-uncertain, kills the queue call after 30 seconds and escapes output. [10](#source-10) [11](#source-11)
+uncertain, kills the queue call after 30 seconds and escapes output. Opt-in
+`--wait-for-idle` [first waits](codex-idle-wait.md). [10](#source-10) [11](#source-11)
 
 [FACT] `subscribe --wrap N` (64–65536) splits each post-header line longer
 than N bytes at char boundaries into `| ` continuations before the sink.
@@ -85,23 +87,22 @@ prints one `AIRC delivery stopped: …` line after it exits. [13](#source-13) [1
 [FACT] Tests cover cursors, context counts, compact omissions, settings
 notices and budgets, legacy restore, splitting/truncation, gaps, upgrade,
 failed sinks, ID-bound recovery, consumer settings and exclusivity, adapter
-environment, show gaps and wrapped stdout. Adapter and launcher tests use
-fakes; the operations guide records live checks. [6](#source-6) [7](#source-7) [8](#source-8) [11](#source-11) [14](#source-14) [15](#source-15)
+environment, show gaps and wrapped stdout, with fake adapters and launchers. [6](#source-6) [7](#source-7) [8](#source-8) [11](#source-11) [14](#source-14) [15](#source-15)
 
 ## Sources
 
 1. <a id="source-1"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L697-L1138) — delivery methods; `VERSION`, `notice_due`, `upgrade` at L39, L81, L1223–1235.
 2. <a id="source-2"></a> [src/agent_session/delivery.rs](../../src/agent_session/delivery.rs#L1-L958) — batch, `Compact`, `Settings`, `Rendering`, header, `wrap`, tests.
-3. <a id="source-3"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1334-L1476) — `serve` delivery and show operations; `revert_delivery` call at L1702.
-4. <a id="source-4"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L321-L366) — consumer status and refusals; `ConsumerSettings` at L191–208; `deliver` and `run_sink` at L760–1030.
+3. <a id="source-3"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L1372-L1514) — `serve` delivery and show operations; `revert_delivery` call at L1740.
+4. <a id="source-4"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L321-L366) — consumer status and refusals; `ConsumerSettings` at L191–208; `deliver` through `ProcessGroup` at L762–1069.
 5. <a id="source-5"></a> [src/agent_session/history.rs](../../src/agent_session/history.rs#L127-L151) — lookups; AROUND request at L210; test at L792.
-6. <a id="source-6"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L2131-L2565) — delivery unit tests.
-7. <a id="source-7"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1658-L1906) — delivery regressions; `subscribe` and consumer-settings tests at L2064 and L2197.
-8. <a id="source-8"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1983-L2061) — show regression; `ShowWalk` and `claim_lookup` in `src/agent_session/mod.rs` at L373–487.
+6. <a id="source-6"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L2132-L2566) — delivery unit tests.
+7. <a id="source-7"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1659-L1907) — delivery regressions; `subscribe` and consumer-settings tests at L2065 and L2198.
+8. <a id="source-8"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L1984-L2062) — show regression; `ShowWalk` and `claim_lookup` in `src/agent_session/mod.rs` at L373–487.
 9. <a id="source-9"></a> [src/agent_session/attention.rs](../../src/agent_session/attention.rs#L153-L175) — `broadcast`; test `only_explicit_bounded_all_and_here_broadcast` at L602.
-10. <a id="source-10"></a> [src/bin/airc-codex.rs](../../src/bin/airc-codex.rs#L1-L294) — adapter bounds, checks, queue call, receipts.
-11. <a id="source-11"></a> [tests/codex_adapter.rs](../../tests/codex_adapter.rs#L1-L218) — fake-`codex` tests; unit tests in `src/bin/airc-codex.rs` from L295.
-12. <a id="source-12"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L727-L742) — `DeliverOptions::wrap`; checked at L793–800, applied at L879–882.
+10. <a id="source-10"></a> [src/bin/airc-codex.rs](../../src/bin/airc-codex.rs#L1-L419) — adapter bounds, checks, queue call, receipts.
+11. <a id="source-11"></a> [tests/codex_adapter.rs](../../tests/codex_adapter.rs#L1-L319) — fake-`codex` tests; unit tests in `src/bin/airc-codex.rs` from L420.
+12. <a id="source-12"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L727-L744) — `DeliverOptions::wrap`; checked at L796–803, applied at L882–885.
 13. <a id="source-13"></a> [integrations/claude-plugin/scripts/airc-delivery](../../integrations/claude-plugin/scripts/airc-delivery#L1-L41) — launcher, run by `monitors/monitors.json`.
 14. <a id="source-14"></a> [tests/claude_plugin.rs](../../tests/claude_plugin.rs#L1-L238) — launcher tests with a fake `airc`.
-15. <a id="source-15"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2389-L2474) — `subscribe_wrap_splits_long_stdout_lines_into_continuations`.
+15. <a id="source-15"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2390-L2475) — `subscribe_wrap_splits_long_stdout_lines_into_continuations`.

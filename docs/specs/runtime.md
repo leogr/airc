@@ -78,6 +78,21 @@ binaries refuse the state and options rather than drop them. [9](#source-9)
 busy, but timeouts and bypasses can still add records and records already
 handed to a sink are never merged, so it is pacing, not a queue bound.
 [9](#source-9)
+
+[FACT] Opt-in `airc-codex --wait-for-idle` under `subscribe --sink-timeout 0`
+holds one batch until a fresh read-only status read reports the Codex thread
+idle, retrying only status discovery through transient endpoint loss. A
+definite refusal, the deadline or a signal while waiting exits before
+`codex queue` starts, so nothing was sent. A signal during the queue call kills
+it and leaves the outcome uncertain: inspect before any explicit retry. Either
+way the subscriber ends with the batch pending. [11](#source-11)
+
+[DERIVED] Messages arriving meanwhile stay above the delivery cursor and follow
+in later batches bounded by `--max-bytes` (`more` marks a remainder; bounded
+retention can report a gap). A busy thread given a burst that fits therefore
+receives the held batch, then one consolidated batch; a larger backlog takes
+more. Idle is not reserved, so this is backpressure, not a queue cap.
+[8](#source-8) [11](#source-11)
 They renew bounded idle requests and stop on errors/disconnects. Agent turn
 scheduling remains the harness's responsibility. Status exposes only the worker's
 current registration; optional private handle bookkeeping never proves a wake.
@@ -97,3 +112,4 @@ current registration; optional private handle bookkeeping never proves a wake.
 8. <a id="source-8"></a> [Named delivery](../digests/delivery.md).
 9. <a id="source-9"></a> [Named delivery receipts](../digests/delivery-receipts.md).
 10. <a id="source-10"></a> [Shared message references](../digests/message-references.md).
+11. <a id="source-11"></a> [Codex wait-for-idle delivery](../digests/codex-idle-wait.md).
