@@ -2073,7 +2073,7 @@ async fn subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_
         .arg("--state-dir")
         .arg(&f.root)
         .args(["subscribe", "trial", "--wake", "mentions", "--", "sh", "-c"])
-        .arg("cat >> \"$0\"; echo \"$AIRC_DELIVERY_ID $AIRC_DELIVERY_RETRY $AIRC_SESSION $AIRC_SUBSCRIBER_PID\" >> \"$0.env\"")
+        .arg("cat >> \"$0\"; echo \"$AIRC_DELIVERY_ID $AIRC_DELIVERY_RETRY $AIRC_SESSION $AIRC_SUBSCRIBER_PID $AIRC_DELIVERY_STATE_DIR\" >> \"$0.env\"")
         .arg(&out)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2135,7 +2135,16 @@ async fn subscribe_feeds_each_batch_to_its_adapter_and_owns_the_single_consumer_
     )
     .await;
     for (line, header) in env.lines().zip(&headers) {
-        assert_eq!(line, format!("{} 0 trial {pid}", delivery_id(header)));
+        assert_eq!(
+            line,
+            format!(
+                "{} 0 trial {pid} {}",
+                delivery_id(header),
+                std::fs::canonicalize(f.root.join("trial"))
+                    .unwrap()
+                    .display()
+            )
+        );
     }
     eventually(
         || f.ok(&["deliveries", "trial"]),

@@ -11,7 +11,13 @@
 //! server reports the thread idle (see `idle`), then queues exactly as above.
 //! It is meant for `airc subscribe --sink-timeout 0`. A signal while waiting
 //! exits 3; while `codex queue` runs, it kills and reaps that child and exits 4.
+//!
+//! Opt-in `--app-server` starts or steers through the same existing local
+//! daemon, with durable per-batch replay protection (see `app_server`). The
+//! default and wait-for-idle queue paths remain separate.
 
+#[path = "airc-codex/app_server.rs"]
+mod app_server;
 #[path = "airc-codex/idle.rs"]
 mod idle;
 
@@ -47,7 +53,7 @@ const UNCERTAIN: u8 = 4;
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
-#[command(version, about = "Queue AIRC deliveries on an existing Codex thread")]
+#[command(version, about = "Deliver AIRC batches to an existing Codex thread")]
 struct Args {
     /// Codex thread UUID, normally "$CODEX_THREAD_ID" of the session to wake.
     #[arg(long, value_parser = parse_thread)]
@@ -58,8 +64,16 @@ struct Args {
     /// Queue only after the local Codex app server (codex-cli 0.164.0)
     /// reports the thread idle; observed read-only through
     /// $CODEX_HOME/app-server-control. Run under `subscribe --sink-timeout 0`.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "app_server")]
     wait_for_idle: bool,
+    /// Opt-in native app-server delivery. The legacy queue path remains default.
+    /// Requires the exact verified existing daemon socket and subscriber state.
+    #[arg(long, requires = "app_server_socket")]
+    app_server: bool,
+    /// Absolute existing private socket under `/tmp/codex-daemon-<euid>/`.
+    /// No daemon discovery, start, fallback or permission override is attempted.
+    #[arg(long, requires = "app_server")]
+    app_server_socket: Option<PathBuf>,
     /// Give up waiting for idle after this many seconds, reconnects
     /// included (exit 3, nothing sent). 0 waits until idle, a signal or a
     /// definite refusal.
@@ -93,6 +107,27 @@ fn main() -> ExitCode {
             return ExitCode::from(NOT_SENT);
         }
     };
+    if args.app_server {
+        let (Some(delivery), Some(_), Some(state_dir), Some(socket)) = (
+            delivery.as_deref(),
+            subscriber.as_deref(),
+            std::env::var_os("AIRC_DELIVERY_STATE_DIR"),
+            args.app_server_socket.as_deref(),
+        ) else {
+            eprintln!(
+                "airc-codex: app-server mode requires a direct named subscriber, batch ID and private state directory"
+            );
+            return ExitCode::from(NOT_SENT);
+        };
+        return ExitCode::from(app_server::run(
+            socket,
+            &PathBuf::from(state_dir),
+            &args.thread,
+            delivery,
+            &batch,
+            || check_subscriber(subscriber.as_deref()),
+        ));
+    }
     let endpoint = match args.wait_for_idle.then(idle::Endpoint::local).transpose() {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -608,6 +643,8 @@ esac
                 thread: THREAD.into(),
                 codex,
                 wait_for_idle: true,
+                app_server: false,
+                app_server_socket: None,
                 idle_timeout,
             };
             let cancel = Box::leak(Box::new(AtomicBool::new(false)));

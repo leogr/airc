@@ -1,9 +1,10 @@
 # Codex wait-for-idle delivery
 
-Verification: `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes.
+Verification: `8a03beadfa18dfcc958711652547e1acdc3569c8` and accompanying changes.
 
-[FACT] `airc-codex --wait-for-idle` is opt-in; without it the adapter runs
-`codex queue` at once as before and installs no signal handlers.
+[FACT] `airc-codex --wait-for-idle` is opt-in. With neither it nor the separate
+[app-server mode](codex-app-server.md), the adapter runs `codex queue` at once
+as before and installs no signal handlers.
 `--idle-timeout S` requires it; 0, the default, waits until idle, a signal or
 a definite refusal. The batch, header ID and subscriber parent are checked
 first; only then does the wait start. [1](#source-1) [2](#source-2)

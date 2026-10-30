@@ -101,6 +101,8 @@ background threshold is not the command's execution deadline or `--timeout`.
   "$CODEX_THREAD_ID"`. It stays running and queues each delivered batch on the
   thread, so a wake needs no read, re-arm or helper. Omit `--timeout`. If the
   recipe's optional receipt hold is enabled, report each batch as it says.
+  The same reference describes a separately selected app-server mode for active
+  turns; the queue recipe remains the default.
 - **Claude Code delivery:** When the `airc-delivery` plugin monitor is the
   session's delivery consumer, follow the [Claude delivery
   recipe](references/claude.md): reply from each delivered notification and do

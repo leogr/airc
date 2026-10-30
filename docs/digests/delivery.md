@@ -1,6 +1,6 @@
 # Named delivery and context lookup
 
-Verification: `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes.
+Verification: `8a03beadfa18dfcc958711652547e1acdc3569c8` and accompanying changes.
 
 [FACT] Named state version 3 has an optional delivery record: a separate
 cursor, loss summary, one pending batch at most and the last outcome; opt-in
@@ -47,7 +47,7 @@ pid, request times and settings (`settings=unknown` before they are known).
 [FACT] `wait --deliver` prints, flushes, then accepts. `subscribe` spawns its
 adapter argv without a shell (own process group, `kill_on_drop`): batch on
 stdin, `AIRC_SESSION`, `AIRC_DELIVERY_ID`, `AIRC_DELIVERY_RETRY` and
-`AIRC_SUBSCRIBER_PID` set, stdout inherited, last 4 KiB of stderr kept. Exit 0 within `--sink-timeout`
+`AIRC_SUBSCRIBER_PID` and canonical private `AIRC_DELIVERY_STATE_DIR` set, stdout inherited, last 4 KiB of stderr kept. Exit 0 within `--sink-timeout`
 accepts; any other outcome leaves the batch pending and ends `subscribe` with
 exit 1. Only the direct child is killed, unless `--sink-timeout 0`
 ([no deadline](codex-idle-wait.md)) kills its process group.
@@ -71,7 +71,8 @@ accepts both markers, checks the header ID against `AIRC_DELIVERY_ID` and its pa
 literal argv. It accepts only a clean exit whose bounded stdout matches
 `Queued message … for thread <ID>.`, exits 3 when nothing was sent and 4 when
 uncertain, kills the queue call after 30 seconds and escapes output. Opt-in
-`--wait-for-idle` [first waits](codex-idle-wait.md). [10](#source-10) [11](#source-11)
+`--wait-for-idle` [first waits](codex-idle-wait.md); a separate
+[app-server mode](codex-app-server.md) starts or steers input without queueing. [10](#source-10) [11](#source-11)
 
 [FACT] `subscribe --wrap N` (64–65536) splits each post-header line longer
 than N bytes at char boundaries into `| ` continuations before the sink.

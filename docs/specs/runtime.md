@@ -98,6 +98,14 @@ scheduling remains the harness's responsibility. Status exposes only the worker'
 current registration; optional private handle bookkeeping never proves a wake.
 [4](#source-4) [7](#source-7)
 
+[FACT] Optional Codex app-server delivery starts input on an idle loaded thread
+or steers the identified active turn on the same existing daemon. The default
+queue route stays unchanged. A private durable submission journal precedes each
+mutation; accepted/uncertain attempts are never automatically resent. Unknown
+binding, receipt or storage state stops delivery. Transport acceptance is not
+model acknowledgment or a processing deadline; approval routing is untested.
+[12](#source-12)
+
 ## Sources
 
 1. <a id="source-1"></a> [Storage, transport and lifecycle evidence](../digests/storage.md).
@@ -113,3 +121,5 @@ current registration; optional private handle bookkeeping never proves a wake.
 9. <a id="source-9"></a> [Named delivery receipts](../digests/delivery-receipts.md).
 10. <a id="source-10"></a> [Shared message references](../digests/message-references.md).
 11. <a id="source-11"></a> [Codex wait-for-idle delivery](../digests/codex-idle-wait.md).
+
+12. <a id="source-12"></a> [Codex app-server delivery](../digests/codex-app-server.md).

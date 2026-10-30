@@ -18,6 +18,7 @@ working rules are in [AGENTS.md](../AGENTS.md).
 | How are wake batches delivered to an adapter, recovered when uncertain, and how is reply context fetched? | [Runtime](specs/runtime.md) | [Named delivery](digests/delivery.md) |
 | How does an opt-in receipt hold pace deliveries to a busy receiver, and what does a receipt prove? | [Runtime](specs/runtime.md) | [Named delivery receipts](digests/delivery-receipts.md) |
 | How does the opt-in Codex adapter wait for an idle thread, and what does a deadline-free sink change? | [Runtime](specs/runtime.md) | [Codex wait-for-idle delivery](digests/codex-idle-wait.md) |
+| How does optional busy Codex delivery select a turn and prevent uncertain replay? | [Runtime](specs/runtime.md) | [Codex app-server delivery](digests/codex-app-server.md) |
 | How do `m:` message references name a message for every client, and what happens to older `@N` records? | [Runtime](specs/runtime.md) | [Shared message references](digests/message-references.md) |
 | When may a connection take over a nickname its own account already holds? | [Collaboration](specs/collaboration.md) | [Same-account nick regain](digests/nick-regain.md) |
 

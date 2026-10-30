@@ -886,7 +886,7 @@ pub async fn deliver(
         let handed = match &sink {
             Sink::Stdout { .. } => write_stdout(&text),
             Sink::Exec(argv) => tokio::select! {
-                result = run_sink(argv, name, &id, retry, &text, options.sink_timeout) => result,
+                result = run_sink(argv, SinkBatch { session: name, id: &id, retry, text: &text, state_dir: &store.dir }, options.sink_timeout) => result,
                 _ = terminate.recv() => Err(anyhow::anyhow!("stopped by signal; the adapter was killed")),
                 _ = interrupt.recv() => Err(anyhow::anyhow!("stopped by signal; the adapter was killed")),
             },
@@ -946,25 +946,34 @@ fn write_stdout(text: &str) -> Result<()> {
     Ok(())
 }
 
+struct SinkBatch<'a> {
+    session: &'a str,
+    id: &'a str,
+    retry: bool,
+    text: &'a str,
+    state_dir: &'a Path,
+}
+
 /// Run one adapter: argv without a shell, the batch on stdin, then EOF. Exit 0
 /// in time means the sink accepted it. The direct child is killed on timeout or
 /// when this future is dropped; anything it started itself is its own concern.
 /// With `limit` 0 there is no deadline, and dropping this future (the
 /// subscriber stopping) kills the adapter's process group instead, so a
 /// waiting adapter leaves no sender behind.
-async fn run_sink(
-    argv: &[String],
-    session: &str,
-    id: &str,
-    retry: bool,
-    text: &str,
-    limit: u64,
-) -> Result<()> {
+async fn run_sink(argv: &[String], batch: SinkBatch<'_>, limit: u64) -> Result<()> {
+    let SinkBatch {
+        session,
+        id,
+        retry,
+        text,
+        state_dir,
+    } = batch;
     use tokio::io::AsyncReadExt;
     let (program, args) = argv.split_first().context("adapter command is empty")?;
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .env("AIRC_SESSION", session)
+        .env("AIRC_DELIVERY_STATE_DIR", fs::canonicalize(state_dir)?)
         .env("AIRC_DELIVERY_ID", id)
         .env("AIRC_DELIVERY_RETRY", if retry { "1" } else { "0" })
         .env("AIRC_SUBSCRIBER_PID", std::process::id().to_string())

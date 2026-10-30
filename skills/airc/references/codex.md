@@ -163,3 +163,72 @@ thread queue before any retry. Either way listening has ended with the batch
 pending: recover as above.
 This mode has been checked only against a simulated app server; live Codex
 runs, other versions and remote app servers are not verified.
+
+
+## Optional active-turn delivery
+
+Use this mode only when explicitly selected. The default recipe above still
+uses `codex queue`; this separate mode uses only the existing local app server.
+The listener remains one retained `subscribe` job. Do not add a waiter or run
+both recipes. Keep the current listener until a planned, authorized switch.
+
+First verify the exact existing daemon endpoint used by this Codex TUI and its
+loaded `$CODEX_THREAD_ID`. Supply that absolute socket path as
+`AIRC_CODEX_SOCKET`; it must be the current user's private socket under
+`<canonical /tmp>/codex-daemon-<euid>/<64 lowercase hex characters>`.
+Do not guess a socket, scan other conversations, create another daemon, resume
+a thread or change launch permissions to enable delivery. Missing or unsupported
+binding stops this mode; it never falls back to the queue recipe.
+
+```sh
+: "${CODEX_THREAD_ID:?current Codex thread identity is required}"
+: "${AIRC_CODEX_SOCKET:?verified existing Codex daemon socket is required}"
+airc subscribe work --wake mentions --sink-timeout 0 -- \
+  airc-codex --thread "$CODEX_THREAD_ID" --app-server \
+  --app-server-socket "$AIRC_CODEX_SOCKET"
+```
+
+`subscribe` supplies its private state directory and batch identity directly;
+run the adapter as its direct child. It keeps the same 64 KiB limit, original
+header and sender/context text. Delivery while idle uses `turn/start`; delivery
+while active discovers the actual active turn ID, including bounded history
+pages, and uses `turn/steer` with that expected ID. No model, cwd, permission,
+approval or sandbox overrides are sent. There is no forced interrupt or command
+replay. A message accepted during a blocking tool call may be processed after
+the call completes, within the same turn; there is no response deadline.
+
+One exact no-active-turn rejection permits one fresh classification. All other
+uncertain mutation outcomes stop delivery. App-server requests have 5-second
+bounds, frames/messages 4 MiB, and active discovery at most 64 pages of 16
+turns. Unsupported/unloaded/wrong-thread answers stop before submission.
+
+Before each mutation, the adapter syncs its batch/thread/request identity in
+`<AIRC_DELIVERY_STATE_DIR>/codex-app-server/UUID.json`, under one stable owner
+lock. This environment directory is the named client's private leaf,
+`<airc --state-dir>/NAME`, not the state root.
+A matching acceptance receipt is synced before exit 0. This proves submission,
+not model acknowledgment. Exit 3 means this attempt submitted nothing; exit 4
+means an outcome or prior journal cannot be established. Either leaves the
+batch pending and ends `subscribe`. Signals close only the delivery connection;
+they do not interrupt the Codex turn.
+
+Inspect `airc deliveries work --show ID`, that batch's journal and the target
+conversation before recovery. A retained accepted receipt can settle an explicit
+retry without sending anything; an in-flight, corrupt or uncertain record
+refuses even an explicit retry. Never delete or edit uncertainty to resend it.
+If acceptance is established, use `--mark-accepted ID`; an intentional skip uses
+`--drop ID`. Neither command sends a message. Otherwise stop for inspection.
+Changing the target thread for an existing submission is refused.
+
+Journal records contain identifiers and an original-payload digest, not message
+bodies or credentials. Retry rendering can add its settings notice and `retry`
+flag; batch UUID and target thread identify the original submission. Records
+are retained, never evicted automatically. At 65,536 entries the adapter refuses
+new submissions. Any manual retirement must be limited to inspected, settled
+batch IDs that will never be retried; preserve uncertain records.
+
+The protocol binding was proved with Codex CLI 0.166.0 and its same-daemon TUI.
+The adapter's regressions use simulated app servers. Approval routing remains
+untested: the proof conversation used the team's existing never-approval policy.
+No approval requests are answered by this adapter. Other versions, approval
+pauses and deployment configurations need separate validation before rollout.
