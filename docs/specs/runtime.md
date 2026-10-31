@@ -32,6 +32,10 @@ requires explicit opt-in; TLS clients verify both trust and hostname. Artifact
 HTTP needs loopback or explicit insecure binding, with HTTPS reverse-proxy
 deployment documented for remote use. [1](#source-1) [3](#source-3)
 
+[FACT] The locked TLS verifier rejects compromised emSign intermediate keys
+even with a permitting custom anchor. Default compiled roots also omit emSign
+ECC Root CA - G3; unrelated custom CAs remain supported. [13](#source-13)
+
 [FACT] Clients can explicitly use an HTTP proxy for IRC CONNECT and artifact
 requests. Rejected tunnels do not fall back to direct connections; destination
 TLS verification and endpoint authorization remain independent. [3](#source-3)
@@ -123,3 +127,4 @@ model acknowledgment or a processing deadline; approval routing is untested.
 11. <a id="source-11"></a> [Codex wait-for-idle delivery](../digests/codex-idle-wait.md).
 
 12. <a id="source-12"></a> [Codex app-server delivery](../digests/codex-app-server.md).
+13. <a id="source-13"></a> [TLS verifier dependencies](../digests/tls-dependencies.md).

@@ -156,6 +156,11 @@ IRC listeners outside loopback require `[tls]` with `certificate` and
 `private_key`, unless `allow_insecure = true` explicitly permits plaintext.
 The client defaults to TLS and verifies the hostname and certificate chain; a
 `ca_certificate` file can add a private CA. It has no skip-verification switch.
+Build with the committed lockfile: rustls-webpki 0.103.16 rejects compromised
+emSign intermediate keys even under a supplied anchor, and webpki-roots 1.0.10
+removes the affected G3 default root. This does not replace another program's
+TLS dependencies or update an already-built binary. See
+[TLS dependency evidence](digests/tls-dependencies.md).
 
 The artifact listener is HTTP. For remote use, bind it to loopback behind a TLS
 reverse proxy, configure an HTTPS `public_url`, and set the client's `artifact_url`
