@@ -3494,6 +3494,10 @@ async fn receipt_measurement_matrix() {
 #[tokio::test]
 async fn an_acceptance_that_cannot_be_saved_starts_no_hold() {
     let f = Fixture::new();
+    if std::fs::metadata(f.dir.path()).unwrap().uid() == 0 {
+        eprintln!("SKIP: root bypasses directory modes; run this permission test as non-root");
+        return;
+    }
     let server = f.start().await;
     let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
     f.connect(&server).await;
@@ -3526,9 +3530,6 @@ async fn an_acceptance_that_cannot_be_saved_starts_no_hold() {
         .unwrap()
         .unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if std::fs::metadata(dir.join("state.json")).is_ok_and(|m| m.uid() == 0) {
-        return; // A privileged run ignores directory modes.
-    }
     assert!(!ended.success());
     let id = delivery_id(&contents(out.clone()).await);
     eventually(
