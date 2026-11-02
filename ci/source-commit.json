@@ -1,0 +1,35 @@
+{
+  "sha": "b76ba355863cc3eb51900a313d7647d9190eedfa",
+  "node_id": "C_kwDOSWvU3doAKGI3NmJhMzU1ODYzY2MzZWI1MTkwMGEzMTNkNzY0N2Q5MTkwZWVkZmE",
+  "url": "https://api.github.com/repos/leogr/airc/git/commits/b76ba355863cc3eb51900a313d7647d9190eedfa",
+  "html_url": "https://github.com/leogr/airc/commit/b76ba355863cc3eb51900a313d7647d9190eedfa",
+  "author": {
+    "name": "Leonardo Grasso",
+    "email": "me@leonardograsso.com",
+    "date": "2026-10-31T05:20:36Z"
+  },
+  "committer": {
+    "name": "Leonardo Grasso",
+    "email": "me@leonardograsso.com",
+    "date": "2026-10-31T05:20:36Z"
+  },
+  "tree": {
+    "sha": "11b1a7aa80b6ce101ec849bb831a201f7ea1a0f0",
+    "url": "https://api.github.com/repos/leogr/airc/git/trees/11b1a7aa80b6ce101ec849bb831a201f7ea1a0f0"
+  },
+  "message": "chore(deps): bump the TLS verifier and pin its trust behavior",
+  "parents": [
+    {
+      "sha": "5268e062d31f73da3f76d5921412919cd53e90ca",
+      "url": "https://api.github.com/repos/leogr/airc/git/commits/5268e062d31f73da3f76d5921412919cd53e90ca",
+      "html_url": "https://github.com/leogr/airc/commit/5268e062d31f73da3f76d5921412919cd53e90ca"
+    }
+  ],
+  "verification": {
+    "verified": true,
+    "reason": "valid",
+    "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCgAdFiEE5+rXnL1gwHVBzgzfWCaiBidXS4MFAmrleqQACgkQWCaiBidX\nS4NqiA/+Ng4Ml4N5FPwX6hQUnaJYEuz8kkxQZoicwbyeJDU6CTyQTmyaGSUig6Xm\ne6mNstSTIfdSzKwofDHAV+aG3vvdNbCKoKgCTyKTVONKwFqmGnZodjH4/rP1h9dZ\n0eoqYQZ3O00GMp4DlK0hSnKU4e01VVpZ8GqRBxMkbIG5HmsvJD/aPqrUMf8JQAV1\n/+34vUGEQGaXV8BUSm2xocizzW67OCobDM9JmEmSJPGAHM+jyM63cXpYdwP32IEw\nC0SlhWOSdJJJqhWx/f93WUddm90bYvGjk9d8XsiwloJHdIKnsgG3PL4lKcimCb23\np4PG2KQ4nMkqn7Gns3C3Tz9NnkFcumWI7COiczKIbrF11tGIi3HZkI30X/LXQjgF\nGLTDE/V6uIjqMTitifLVAGBK/tHevVkut9Dk1bTuVDCvgCfOIAhOy4LW7Mf73rFO\nJUYpu3hCYmqL8dauieAET42FBRsR28r/Ry09wONyejm+8IvAVM8jR2EZnX3CoCgO\n+sLqf/pS22E1lIFPElZVfrKnhjdLkB/cULxL7KXJzVqxxnh3QqM+2Zqh0o2cgNvr\nXXjD7DneXw2+QcLLjPpCdbMmJanbSQSc8Yt4Nae7FIaOg7YOIZfw24RReD8jnd9p\no+0XH3Tvmm27OEXANi9N07ZHiP3GYBsPdHKjf0K4vVsoXgP0eR0=\n=NMFY\n-----END PGP SIGNATURE-----",
+    "payload": "tree 11b1a7aa80b6ce101ec849bb831a201f7ea1a0f0\nparent 5268e062d31f73da3f76d5921412919cd53e90ca\nauthor Leonardo Grasso <me@leonardograsso.com> 1793424036 +0100\ncommitter Leonardo Grasso <me@leonardograsso.com> 1793424036 +0100\n\nchore(deps): bump the TLS verifier and pin its trust behavior\n",
+    "verified_at": "2026-10-31T05:20:42Z"
+  }
+}

@@ -1,0 +1,104 @@
+# REVIEW-ONLY workflow interface proposal. Not installed or execution-qualified.
+# Native adapters and shared publisher are authored under upstream-proposal; assemble/review before enabling.
+name: Native verified release
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+      release_tag:
+        description: 'New immutable tag, required only for authorized publication'
+        type: string
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: airc-reviewed-release
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.repository == 'leogr/airc' && github.ref == 'refs/heads/release-ci'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_REPOSITORY: leogr/airc
+      SOURCE_SUBJECT: b76ba355863cc3eb51900a313d7647d9190eedfa
+      BUILD_ARCH: ${{ matrix.arch }}
+      BUILD_DEFINITION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: build-definition
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: b76ba355863cc3eb51900a313d7647d9190eedfa
+          path: source
+          persist-credentials: false
+      - name: Native preflight, source identity and two isolated reproducible builds
+        id: native_build
+        run: |
+          set +e
+          bash build-definition/ci/release-native.sh "$SOURCE_SUBJECT" "$BUILD_ARCH" "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/release"
+          native_status=$?
+          printf '%s\n' "$native_status" > "$RUNNER_TEMP/native-build.exit"
+          exit "$native_status"
+      - name: Export bounded read-only build diagnostics
+        if: always()
+        run: python3 build-definition/ci/export-diagnostics.py --profile build-definition/ci/diagnostics-profile.json --output "$RUNNER_TEMP/release" --destination "$RUNNER_TEMP/build-diagnostics" --exit-file "$RUNNER_TEMP/native-build.exit" --build-outcome "${{ steps.native_build.outcome || 'unknown' }}"
+      - name: Retain partial build diagnostics on success or failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: 'airc-build-diagnostics-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}'
+          path: '${{ runner.temp }}/build-diagnostics/'
+          if-no-files-found: error
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: '${{ runner.temp }}/release/publication/*.tar.gz'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: 'airc-linux-${{ matrix.arch }}'
+          path: '${{ runner.temp }}/release/publication/'
+          if-no-files-found: error
+  publish:
+    needs: build
+    if: inputs.publish && github.repository == 'leogr/airc' && github.ref == 'refs/heads/release-ci'
+    runs-on: ubuntu-24.04
+    environment: upstream-release
+    permissions:
+      contents: write
+      actions: read
+    env:
+      RELEASE_REPOSITORY: leogr/airc
+      SOURCE_SUBJECT: b76ba355863cc3eb51900a313d7647d9190eedfa
+      RELEASE_MODE: apply
+      BUILD_DEFINITION: ${{ github.sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: build-definition
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: 'airc-linux-*'
+          path: '${{ runner.temp }}/publish-inputs'
+      - name: Verify complete native matrix, publish once, verify downloaded bytes
+        run: bash build-definition/ci/publish-release.sh "$SOURCE_SUBJECT" "$RELEASE_TAG" "$RUNNER_TEMP/publish-inputs"
+      - name: Retain public publication receipts on success or failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: 'publication-receipts-airc-${{ github.run_id }}'
+          path: '${{ runner.temp }}/publication-airc-${{ github.run_id }}/'
+          if-no-files-found: ignore

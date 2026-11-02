@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "repository": "leogr/airc",
+  "files": [
+    "BUILD-OWNER.json",
+    "FAILED.json",
+    "pull-intent.json",
+    "pull.log",
+    "image.json",
+    "image-manifest.json",
+    "image-index.json",
+    "evidence/docker/admission.json",
+    "evidence/docker/resources.jsonl",
+    "build-1/create-intent.json",
+    "build-1/create-result.json",
+    "build-1/start-intent.json",
+    "build-1/start-result.json",
+    "build-1/stop-intent.json",
+    "build-1/stop-result.json",
+    "build-1/inspect-completed.json",
+    "build-1/container.log",
+    "build-2/create-intent.json",
+    "build-2/create-result.json",
+    "build-2/start-intent.json",
+    "build-2/start-result.json",
+    "build-2/stop-intent.json",
+    "build-2/stop-result.json",
+    "build-2/inspect-completed.json",
+    "build-2/container.log"
+  ],
+  "directories": {
+    "evidence/host": "^(system|machine|identity)\\.(stdout|stderr)$",
+    "evidence/docker": "^(context-show|context-inspect|daemon-info|socket-stat|output-filesystem|docker-filesystem)\\.(stdout|stderr)$",
+    "build-1": "^(airc|aircd|airc-codex)\\.(elf|version|help)\\.(stdout|stderr)$",
+    "build-1/build": "^((upstream-check|build|release-tests)\\.(stdout|stderr|status)|(rustc|cargo|apk-packages)\\.txt|(airc|aircd|airc-codex)\\.(version|help))$",
+    "build-2": "^(airc|aircd|airc-codex)\\.(elf|version|help)\\.(stdout|stderr)$",
+    "build-2/build": "^((upstream-check|build|release-tests)\\.(stdout|stderr|status)|(rustc|cargo|apk-packages)\\.txt|(airc|aircd|airc-codex)\\.(version|help))$"
+  }
+}
