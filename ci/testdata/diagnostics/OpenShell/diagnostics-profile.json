@@ -1,0 +1,20 @@
+{
+  "directories": {
+    "evidence/build-1": "^((rustc|cargo|cc|cc-target|readelf-version|packages-unsorted)\\.txt(\\.exit)?|packages\\.txt|stamped-inputs\\.sha256|source-date-epoch\\.txt|commands\\.txt|binaries\\.sha256|build-complete\\.txt|(openshell-sandbox|openshell-supervisor)-(build\\.(log|exit)|(elf-header|elf-programs|elf-dynamic|version|help)\\.txt(\\.exit)?))$",
+    "evidence/build-2": "^((rustc|cargo|cc|cc-target|readelf-version|packages-unsorted)\\.txt(\\.exit)?|packages\\.txt|stamped-inputs\\.sha256|source-date-epoch\\.txt|commands\\.txt|binaries\\.sha256|build-complete\\.txt|(openshell-sandbox|openshell-supervisor)-(build\\.(log|exit)|(elf-header|elf-programs|elf-dynamic|version|help)\\.txt(\\.exit)?))$",
+    "evidence/commands": "^[0-9]{3}-(source-commit|source-tree|source-clean|source-commit-object|definition-head|definition-clean|import-public-key|public-key-fingerprints|verify-source-signature|docker-context|docker-info|docker-version|storage-filesystem-types|registry-index|registry-selected-manifest|image-pull|image-inspect|create-[12]|inspect-created-[12]|start-attach-[12]|inspect-completed-[12]|remove-owned-[12]|inventory-after-remove-[12])\\.(request\\.json|result\\.json|stdout|stderr)$"
+  },
+  "files": [
+    "BUILD-OWNER.json",
+    "INCOMPLETE.json",
+    "build-1.cid",
+    "build-2.cid",
+    "evidence/worker.json",
+    "evidence/storage-before.json",
+    "evidence/storage-build-1.json",
+    "evidence/storage-build-2.json",
+    "evidence/storage-after.json"
+  ],
+  "repository": "leogr/OpenShell",
+  "schema": 1
+}

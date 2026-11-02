@@ -1,0 +1,28 @@
+name: Standard native hosted resource trial
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  resources:
+    if: github.repository == 'leogr/airc' && github.ref == 'refs/heads/release-ci' && github.actor == 'leogr'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Measure actual native headroom without pull or build
+        run: python3 ci/hosted_resources.py --architecture '${{ matrix.arch }}' --output "$RUNNER_TEMP/hosted-resource-trial"
+      - name: Preserve admission result including unavailable or insufficient resources
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: 'hosted-resources-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}'
+          path: '${{ runner.temp }}/hosted-resource-trial/RESOURCE-TRIAL.json'
+          if-no-files-found: error
