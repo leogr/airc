@@ -287,6 +287,9 @@ if __name__ == '__main__':
         print(json.dumps({'scope': 'release attachment', 'partial': True,
                           'known_effects': error.known_effects, 'automatic_retry': False}), file=sys.stderr)
         raise SystemExit(1)
-    except (pub.Refusal, RuntimeError, OSError, ValueError, TypeError, KeyError):
+    except (pub.Refusal, RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
+        # The controlled reason, as publish-release reports it: a refusal's own
+        # fixed message, else only the error type (never response bodies).
         print('AIRC release attachment refused; retain receipts/diagnostics; no automatic retry', file=sys.stderr)
+        print(json.dumps({'scope': 'release attachment', **pub.error_report(error)}, sort_keys=True), file=sys.stderr)
         raise SystemExit(1)

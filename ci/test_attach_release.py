@@ -313,6 +313,37 @@ class AttachmentTests(unittest.TestCase):
         # creation uses GITHUB_TOKEN; GitHub suppresses its release trigger.
         self.assertNotIn('gh release create', text)
 
+class RefusalReportTests(unittest.TestCase):
+    """A refused attachment states its controlled reason, never only a fixed line."""
+
+    def run_script(self, args, env):
+        import subprocess
+        import sys
+        return subprocess.run([sys.executable, str(Path(__file__).with_name('attach-release.py')), *args],
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    def test_refusal_prints_its_reason(self):
+        result = self.run_script(['only-one-argument'], {'PATH': os.environ.get('PATH', '')})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('AIRC release attachment refused', result.stderr)
+        report = json.loads(result.stderr.strip().splitlines()[-1])
+        self.assertEqual(report['scope'], 'release attachment')
+        self.assertEqual(report['status'], 'BLOCKED')
+        self.assertIn('usage: attach-release.py', report['reason'])
+        self.assertEqual(report['automatic_retry'], False)
+
+    def test_non_refusal_errors_report_only_their_type(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            env = {'PATH': os.environ.get('PATH', ''), 'RELEASE_MODE': 'attach', 'GH_TOKEN': 'secret-token-value',
+                   'RUNNER_TEMP': temporary, 'GITHUB_ACTIONS': 'true', 'GITHUB_RUN_ATTEMPT': '1',
+                   'GITHUB_JOB': 'attach', 'GITHUB_RUN_ID': '1', 'GITHUB_EVENT_PATH': str(Path(temporary) / 'absent.json')}
+            result = self.run_script(['a', 'b', 'c', 'd'], env)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn('secret-token-value', result.stderr)
+        report = json.loads(result.stderr.strip().splitlines()[-1])
+        self.assertEqual(report['status'], 'BLOCKED')
+        self.assertTrue(report['reason'])
 
 if __name__ == '__main__':
     unittest.main()
+
