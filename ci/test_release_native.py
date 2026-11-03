@@ -1,9 +1,11 @@
-"""Pure/mock checks only; never invokes Docker, Rust, network or compiled ELF."""
+"""Local Git/file and mock checks; no Docker, Rust, network or compiled ELF."""
+import hashlib
 import importlib.util
 import io
 import json
 from pathlib import Path
 import struct
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -32,6 +34,32 @@ class NativeReleaseTests(unittest.TestCase):
     def setUp(self):
         reset=patch.object(r,'ADMITTED_DOCKER',None)
         reset.start();self.addCleanup(reset.stop)
+
+    def test_archive_git_inventory_includes_tracked_ignored_files_and_checks_exact_tree(self):
+        files={'.gitignore':(b'ignored.md\ntarget/\n',0o644),
+               'README.md':(b'# Source\n',0o644), 'ignored.md':(b'# Tracked despite ignore\n',0o644),
+               'run.sh':(b'#!/bin/sh\n',0o755)}
+        def obj(kind, raw):
+            return hashlib.sha1(kind.encode()+b' '+str(len(raw)).encode()+b'\0'+raw).digest()
+        body=b''.join((('100755' if mode==0o755 else '100644')+' '+name).encode()+b'\0'+obj('blob',raw)
+                      for name,(raw,mode) in sorted(files.items()))
+        expected=obj('tree',body).hex()
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            for name,(raw,mode) in files.items():
+                (root/name).write_bytes(raw);(root/name).chmod(mode)
+            r.prepare_source_git(root,expected)
+            listed=subprocess.check_output(['git','-C',str(root),'ls-files','-z','--cached','--others',
+                                            '--exclude-standard','--','*.md']).decode().split('\0')
+            self.assertEqual(set(filter(None,listed)),{'README.md','ignored.md'})
+            self.assertFalse((root/'.git/hooks').exists())
+            with self.assertRaises(RuntimeError):r.prepare_source_git(root,expected)
+            self.assertEqual({name:(root/name).read_bytes() for name in files},
+                             {name:raw for name,(raw,_) in files.items()})
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(RuntimeError,'differs from verified source'):
+                r.prepare_source_git(Path(temp),expected)
+        self.assertIn('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/source',r.INNER)
 
     def test_required_nanosecond_date_capability_is_not_silently_seconds(self):
         import subprocess

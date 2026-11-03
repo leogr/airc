@@ -281,6 +281,19 @@ def source_members(data, commit=None, archive_hash=None):
     return files
 
 
+def prepare_source_git(snapshot, expected_tree):
+    # check-docs.py uses git ls-files. Give this fresh, verified archive its
+    # own uncommitted index, without copying host/worktree Git state or hooks.
+    require(re.fullmatch('[0-9a-f]{40}', expected_tree)
+            and not (snapshot/'.git').exists() and not (snapshot/'.git').is_symlink(),
+            'new source Git metadata and exact selected tree required')
+    command(['git','init','--quiet','--template=','--object-format=sha1',
+             '--initial-branch=ci-snapshot',str(snapshot)])
+    command(['git','-C',str(snapshot),'add','--force','--all','--','.'])
+    require(command(['git','-C',str(snapshot),'write-tree']) == expected_tree,
+            'source snapshot Git tree differs from verified source')
+
+
 def static_elf(data, arch):
     require(len(data) >= 64 and data[:6] == b'\x7fELF\x02\x01', 'expected ELF64 little endian')
     require(struct.unpack_from('<H',data,18)[0] == {'amd64':62,'arm64':183}[arch], 'ELF architecture mismatch')
@@ -333,6 +346,9 @@ export CARGO_HOME=/cache/cargo RUSTUP_HOME=/usr/local/rustup CARGO_TARGET_DIR=/b
 export CARGO_BUILD_TARGET=$TARGET
 export CARGO_BUILD_JOBS=2
 export SOURCE_DATE_EPOCH=0 TZ=UTC LC_ALL=C PYTHONDONTWRITEBYTECODE=1
+# Only this independently tree-verified read-only mount is trusted by root's
+# Git process; no account/global configuration is written.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/source
 export RUSTFLAGS='--remap-path-prefix=/source=airc-source --remap-path-prefix=/build=airc-build -C target-feature=+crt-static'
 apk add --no-cache build-base linux-headers binutils python3 make bash git openssl perl coreutils
 python3 - <<'AIRC_NANOSECOND_DATE_CHECK'
@@ -580,6 +596,7 @@ def release(source, output, definitions, arch, subject=None):
         snapshot=work/'source'; snapshot.mkdir()
         for n,(content,mode) in files.items():
             p=snapshot/n; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(content); p.chmod(mode)
+        prepare_source_git(snapshot, source_tree)
         build=work/'build'; build.mkdir()
         cache=work/'cache'; cache.mkdir()
         script=work/'inner.sh'; script.write_text(INNER)
