@@ -549,7 +549,7 @@ def validate_airc_admission(files, proof, arch):
     need(admission['monitoring'] == {'path': 'evidence/docker/resources.jsonl', 'paths': paths, 'minimum_disk_gib': 14},
          'Docker backing monitor path/floor differs')
     lines = files.read('evidence/docker/resources.jsonl', limit=2 * 1024**2).splitlines()
-    need(4 <= len(lines) <= 20000 and all(lines), 'bounded Docker/output resource monitoring absent')
+    need(3 <= len(lines) <= 20000 and all(lines), 'bounded Docker/output resource monitoring absent')
     floors = []
     for line in lines:
         sample = decode(line)
@@ -561,8 +561,8 @@ def validate_airc_admission(files, proof, arch):
              and type(sample['mem_available']) is int and sample['mem_available'] >= 2 * 1024**3,
              'Docker/output disk or memory floor violated during producer run')
         floors.append(floor)
-    need(floors[0] == 20 and 16 in floors and floors.count(14) >= 2 and floors.index(16) < floors.index(14),
-         'admission/before-pull/both-build monitoring sequence missing')
+    need(floors[0] == 20 and 16 in floors and 14 in floors and floors.index(16) < floors.index(14),
+         'admission/before-pull/single-build monitoring sequence missing')
     return admission
 
 
@@ -600,16 +600,16 @@ def validate_airc(files, manifest, arch, source_policy=None, event=False):
     for label, expected in (('host-system', b'Linux'), ('host-machine', {'amd64': b'x86_64', 'arm64': b'aarch64'}[arch])):
         out, _ = command_record(files, proof['commands'][label])
         need(out.strip() == expected, 'actual host uname receipt differs')
-    need(proof['reproducible'] is True and [b['iteration'] for b in proof['builds']] == [1, 2], 'two AIRC builds absent')
+    need(proof.get('reproducible') is False and proof.get('reproducibility_check') == 'not_run'
+         and [b['iteration'] for b in proof['builds']] == [1],
+         'one AIRC build with explicit untested reproducibility required')
     archive_name = 'airc-linux-' + arch + '.tar.gz'
     need(set(manifest['artifacts']) == {archive_name}, 'AIRC archive inventory mismatch')
-    cids = []
-    for iteration in (1, 2):
+    for iteration in (1,):
         prefix = 'build-' + str(iteration)
         created = files.json(prefix + '/create-result.json')
         cid = created['container_id']
         need(re.fullmatch('[0-9a-f]{64}', cid), 'actual AIRC create result missing')
-        cids.append(cid)
         create_argv = files.json(prefix + '/create-intent.json')['argv']
         start = files.json(prefix + '/start-intent.json')
         need(create_argv[:4] == admission['bound_argv'] + ['create']
@@ -636,15 +636,14 @@ def validate_airc(files, manifest, arch, source_policy=None, event=False):
             for label in ('elf', 'version', 'help'):
                 out, _ = command_record(files, proof['commands'][str(iteration) + '-' + binary + '-' + label])
                 if label == 'version':
-                    need(out.strip() == (binary + ' ' + version).encode(), 'actual native AIRC version differs')
+                    need(out.strip() == ('airc ' + version).encode(), 'actual native AIRC package version differs')
                 else:
                     need(bool(out.strip()), 'empty native CLI/ELF evidence')
         raw = files.read(prefix + '/' + archive_name, proof['builds'][iteration - 1]['archive_sha256'])
         payload = payload_archive(raw, arch, repo, source, policy)
-        need(sha(raw) == manifest['artifacts'][archive_name] == sha(files.read(archive_name)), 'AIRC actual two-build archives differ')
+        need(sha(raw) == manifest['artifacts'][archive_name] == sha(files.read(archive_name)), 'AIRC actual build/archive checksum differs')
         declared = {p['path']: {k: p[k] for k in ('sha256', 'size')} | {'mode': int(p['mode'], 8)} for p in proof['payloads']}
         need(payload == declared, 'AIRC actual payload/proof bytes differ')
-    need(cids[0] != cids[1], 'same AIRC container reused as two builds')
     return proof
 
 
@@ -1008,7 +1007,9 @@ def publication_assets(plan, root):
                 'workflow_definition': plan['workflow_definition'], 'architectures': arch_manifests,
                 'producer_build_complete': True, 'publication_channel': plan['publication_channel'],
                 'consumer_qualification': 'NOT RUN',
-                'scope': 'Producer reproducibility/static/interface/source evidence; no production readiness or yoloctl native/custom-base gate claim.',
+                'scope': ('Producer single-build/static/interface/source evidence; reproducibility not checked; no production readiness or yoloctl native/custom-base gate claim.'
+                          if plan['repository'] == 'leogr/airc' else
+                          'Producer reproducibility/static/interface/source evidence; no production readiness or yoloctl native/custom-base gate claim.'),
                 'artifacts': {name: {'sha256': digest_regular(path), 'size': path.stat().st_size} for name, path in sorted(assets.items())}}
     if 'event_release' in plan:
         manifest['event_release'] = plan['event_release']

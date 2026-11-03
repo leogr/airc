@@ -51,7 +51,7 @@ def airc_fixture():
     files.objects['image.json'] = {'Id': image_id, 'Os': 'linux', 'Architecture': 'amd64',
                                   'RepoDigests': ['docker.io/library/rust@' + POLICY['images']['amd64']]}
     archive = 'airc-linux-amd64.tar.gz'
-    files.data[archive] = b'actual-paired-archive'
+    files.data[archive] = b'actual-single-build-archive'
     proof = {'schema': 1, 'repository': REPO, 'source_commit': POLICY['source'], 'source_tree': POLICY['tree'],
              'source_archive_sha256': POLICY['archive'], 'cargo_lock_sha256': POLICY['lock'], 'architecture': 'amd64',
              'build_definition': {'commit': W, 'tree': 'c' * 40, 'recipe_sha256': recipe},
@@ -60,7 +60,7 @@ def airc_fixture():
              'runner': {'system': 'Linux', 'machine': 'x86_64'},
              'toolchain': {'image_index': POLICY['index'], 'image_digest': POLICY['images']['amd64'],
                            'image_config': image_id, 'target': 'x86_64-unknown-linux-musl'},
-             'reproducible': True, 'commands': {}, 'builds': [], 'payloads': []}
+             'reproducible': False, 'reproducibility_check': 'not_run', 'commands': {}, 'builds': [], 'payloads': []}
     def command(key, argv, stdout_path, stdout):
         stderr_path = stdout_path.removesuffix('.stdout') + '.stderr'
         files.data[stdout_path], files.data[stderr_path] = stdout, b''
@@ -98,8 +98,8 @@ def airc_fixture():
     proof['docker_admission'] = {'path': 'evidence/docker/admission.json', 'sha256': pub.sha(files.data['evidence/docker/admission.json'])}
     files.data['evidence/docker/resources.jsonl'] = b''.join(pub.canonical({
         'disk_floor_gib': floor, 'disks': [{'path': path, 'free_bytes': 24 * 1024**3} for path in (output_path, docker_path)],
-        'mem_total': 8 * 1024**3, 'mem_available': 4 * 1024**3}) for floor in (20, 16, 14, 14))
-    for number in (1, 2):
+        'mem_total': 8 * 1024**3, 'mem_available': 4 * 1024**3}) for floor in (20, 16, 14))
+    for number in (1,):
         prefix, cid = 'build-' + str(number), str(number) * 64
         files.objects[prefix + '/create-result.json'] = {'container_id': cid, 'name': 'owned'}
         files.objects[prefix + '/create-intent.json'] = {'argv': bound + ['create', '--name', 'owned']}
@@ -118,7 +118,7 @@ def airc_fixture():
             command(str(number) + '-' + label, argv, prefix + '/build/' + label + '.stdout', out)
         for binary in POLICY['bins']:
             for label in ('elf', 'version', 'help'):
-                out = (binary + ' 0.1.0\n').encode() if label == 'version' else b'nonempty native evidence\n'
+                out = b'airc 0.1.0\n' if label == 'version' else b'nonempty native evidence\n'
                 command(str(number) + '-' + binary + '-' + label, ['public-binary', '--' + label],
                         prefix + '/' + binary + '.' + label + '.stdout', out)
     files.objects['build-proof-amd64.json'] = proof
@@ -141,9 +141,12 @@ class InputContracts(unittest.TestCase):
             result = pub.validate_airc(files, manifest, 'amd64')
         self.assertTrue(result['producer_build_complete'])
         self.assertEqual(result['consumer_qualification'], 'not_run')
+        self.assertFalse(result['reproducible'])
+        self.assertEqual(result['reproducibility_check'], 'not_run')
+        self.assertEqual([b['iteration'] for b in result['builds']], [1])
 
     def test_airc_list_inspection_missing_raw_receipt_or_failed_actual_build_blocks(self):
-        for control in ('list', 'missing-log', 'nonzero', 'different-pair'):
+        for control in ('list', 'missing-log', 'nonzero', 'different-archive', 'fake-reproduction', 'extra-build', 'missing-reproduction-status', 'wrong-version-label', 'wrong-version'):
             files, manifest, proof = airc_fixture()
             if control == 'list':
                 files.objects['build-1/inspect-completed.json'] = [files.objects['build-1/inspect-completed.json']]
@@ -151,8 +154,18 @@ class InputContracts(unittest.TestCase):
                 files.data.pop('build-1/build/build.stdout')
             elif control == 'nonzero':
                 files.data['build-1/build/build.status'] = b'101\n'
+            elif control == 'different-archive':
+                files.data['build-1/airc-linux-amd64.tar.gz'] = b'different actual archive'
+            elif control == 'fake-reproduction':
+                proof['reproducible'] = True
+            elif control == 'extra-build':
+                proof['builds'].append({'iteration':2,'archive_sha256':pub.sha(b'extra')})
+            elif control in ('wrong-version-label', 'wrong-version'):
+                value=b'aircd 0.1.0\n' if control=='wrong-version-label' else b'airc 99.0.0\n'
+                record=proof['commands']['1-aircd-version']['stdout']
+                files.data[record['path']]=value;record['sha256']=pub.sha(value)
             else:
-                files.data['build-2/airc-linux-amd64.tar.gz'] = b'different actual pair'
+                proof.pop('reproducibility_check')
             def oci(raw, expected):
                 return ({'config': {'digest': files.objects['image.json']['Id']}} if raw == b'manifest' else
                         {'architecture': 'amd64', 'os': 'linux'} if raw == b'config' else {})

@@ -48,7 +48,7 @@ jobs:
           ref: ${{ github.event_name == 'release' && github.sha || 'b76ba355863cc3eb51900a313d7647d9190eedfa' }}
           path: source
           persist-credentials: false
-      - name: Native preflight, source identity and two isolated reproducible builds
+      - name: Native preflight, source identity, tests and one release build
         id: native_build
         run: |
           set +e

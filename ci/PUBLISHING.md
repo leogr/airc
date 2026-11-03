@@ -18,8 +18,11 @@ download-artifact directories `OpenShell-linux-{amd64,arm64}` or
 `airc-linux-{amd64,arm64}`, containing the producer's `publication/` export at
 each directory root. Every referenced raw evidence path must survive export.
 The helper validates source archive/Git tree/lock, actual compiler/native host,
-OCI bytes, two distinct successful container builds, reproduced archive bytes,
-static ELF, version/help, and AIRC's actual upstream/behavior test records.
+OCI bytes, actual successful container build records, static ELF, version/help,
+and AIRC's actual upstream/behavior test records. AIRC requires one build per
+architecture with explicit untested reproducibility, and verifies its archive
+and member checksums. The separate legacy OpenShell validator still requires
+its two reproduced builds; that path is unchanged.
 AIRC additionally exports and validates its effective local UNIX Docker socket,
 raw context/daemon/native architecture and resource records, both Docker/output
 backing filesystems, the fixed 20/16/14 GiB disk floors and 4/2 GiB memory
@@ -88,7 +91,7 @@ and [release assets](https://docs.github.com/en/rest/releases/assets).
 
 The AIRC workflow also handles `release: types: [published]` for stable releases and prereleases. The owner publishes the original release; both native architectures then build and run the unchanged checks. Only after both succeed does the `attach` job run `ci/attach-release.py SOURCE_SHA TAG SAME_RUN_INPUT_DIR SOURCE_CHECKOUT`. It uses `contents:write` and `actions:read`. The original owner-published event authorizes attachment to that release ID; this path does not require the separate manual new-release environment approval and cannot create or publish another release. First-attempt owner identity, original event/ref, actual run head S, both successful same-run jobs, immutable workflow W and actual script/recipe bytes must agree. Missing evidence is a refusal.
 
-S is the actual tagged release commit (`github.sha`); W is `github.workflow_sha`. Separate clean checkouts and the original bounded event file bind them independently, including when they are equal. The source tree and lock are derived from S, and the entire archive is reconstructed against that tree. Existing validators still check every binary/member/mode, both reproduced builds, static ELF, native tests and full raw evidence. Same-run Actions ZIPs are independently fetched and rehashed. The two actual producer recipes must match W before any upload. No runtime option can supply a different release ID, upload URL, source policy or workflow identity.
+S is the actual tagged release commit (`github.sha`); W is `github.workflow_sha`. Separate clean checkouts and the original bounded event file bind them independently, including when they are equal. The source tree and lock are derived from S, and the entire archive is reconstructed against that tree. Existing validators still check every binary/member/mode, the single successful build per architecture, static ELF, native tests and full raw evidence. AIRC proof must state `reproducible:false` and `reproducibility_check:not_run`; no reproducibility qualification is inferred from checksums. Same-run Actions ZIPs are independently fetched and rehashed. The two actual producer recipes must match W before any upload. No runtime option can supply a different release ID, upload URL, source policy or workflow identity.
 
 Attachment repeatedly checks the original numeric release ID, tag, published state and tag target. It POSTs only the complete checked asset set (two native archives, source/proof/manifest/checksum assets) to that ID and downloads every uploaded asset to verify bytes. It never creates a tag/release, PATCHes release metadata, deletes, overwrites or retries a mutation. Unrelated owner assets are preserved. A complete pre-existing managed set is accepted only after all exact bytes and identities verify; this is a read-only reconciliation, never proof that an earlier mutation succeeded. A partial, conflicting, duplicate or incomplete managed set stops before uploads and requires owner receipt inspection; it is not resumed or clobbered.
 

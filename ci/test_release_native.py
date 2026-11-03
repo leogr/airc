@@ -35,6 +35,29 @@ class NativeReleaseTests(unittest.TestCase):
         reset=patch.object(r,'ADMITTED_DOCKER',None)
         reset.start();self.addCleanup(reset.stop)
 
+    def test_successful_single_build_export_never_requires_a_second_build(self):
+        spec=importlib.util.spec_from_file_location('publisher_fixture',Path(__file__).with_name('test_publish_release.py'))
+        fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
+        files,manifest,proof=fixture.airc_fixture()
+        files.objects.update({'CI-MANIFEST.json':manifest,'image-manifest.json':{},'image-index.json':{},
+                              'pull-intent.json':{}})
+        for name in ('pull.log','build-1/container.log','build-1/inner.sh',
+                     'build-1/build/cargo.txt','build-1/build/apk-packages.txt'):
+            files.data[name]=b'fixture raw evidence\n'
+        for binary in r.BINS:
+            files.data['build-1/build/'+binary+'.version']=b'airc 0.1.0\n'
+            files.data['build-1/build/'+binary+'.help']=b'fixture native help\n'
+        with tempfile.TemporaryDirectory() as temp:
+            output=Path(temp)
+            for name,data in {**files.data,**{k:json.dumps(v).encode() for k,v in files.objects.items()}}.items():
+                target=output/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
+            r.export_publication(output,'amd64',proof['commands'])
+            exported=output/'publication'
+            self.assertEqual((exported/'airc-linux-amd64.tar.gz').read_bytes(),files.data['airc-linux-amd64.tar.gz'])
+            self.assertEqual((exported/'build-1/airc-linux-amd64.tar.gz').read_bytes(),files.data['airc-linux-amd64.tar.gz'])
+            self.assertTrue((exported/'build-1/build/release-tests.stdout').is_file())
+            self.assertFalse((exported/'build-2').exists())
+
     def test_archive_git_inventory_includes_tracked_ignored_files_and_checks_exact_tree(self):
         files={'.gitignore':(b'ignored.md\ntarget/\n',0o644),
                'README.md':(b'# Source\n',0o644), 'ignored.md':(b'# Tracked despite ignore\n',0o644),

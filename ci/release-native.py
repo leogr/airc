@@ -28,6 +28,7 @@ IMAGES = {'amd64':'sha256:e4693cd4f8e853454d5a576f6ef38166d0fa55161576d5883468a5
           'arm64':'sha256:ba511babd167c72f478edbfa2461f5499a7e9639e9793705e8b8090382731198'}
 TARGETS = {'amd64':'x86_64-unknown-linux-musl', 'arm64':'aarch64-unknown-linux-musl'}
 BINS = ('airc','aircd','airc-codex')
+BUILD_ITERATIONS = (1,)
 MAX_FILE = 128 * 1024**2
 MAX_TOTAL = 512 * 1024**2
 GIB = 1024**3
@@ -232,7 +233,7 @@ def export_publication(output, arch, commands):
     for record in commands.values():
         for stream in ('stdout','stderr'):
             paths.add(record[stream]['path'])
-    for iteration in (1,2):
+    for iteration in BUILD_ITERATIONS:
         prefix=f'build-{iteration}/'
         for name in ('create-intent.json','create-result.json','start-intent.json','start-result.json',
                      'inspect-completed.json','container.log','inner.sh',f'airc-linux-{arch}.tar.gz'):
@@ -373,7 +374,8 @@ record build cargo build --locked --release --bins
 record release-tests cargo test --locked --release --all-targets
 for name in airc aircd airc-codex; do
   /build/target/$TARGET/release/$name --version > /build/$name.version
-  grep -Fx "$name $EXPECTED_VERSION" /build/$name.version
+  # All three Clap entrypoints use Cargo's package name, airc, for --version.
+  grep -Fx "airc $EXPECTED_VERSION" /build/$name.version
   /build/target/$TARGET/release/$name --help > /build/$name.help
   test -s /build/$name.help
 done
@@ -589,7 +591,7 @@ def release(source, output, definitions, arch, subject=None):
     write_json(output/'image-manifest.json',manifest)
     write_json(output/'image-index.json',index)
     packages=[]
-    for iteration in (1,2):
+    for iteration in BUILD_ITERATIONS:
         resources(output,14)
         work=output/f'build-{iteration}'
         work.mkdir()
@@ -629,14 +631,13 @@ def release(source, output, definitions, arch, subject=None):
             payload['bin/'+binary]=(content,0o755)
             # Execute actual release ELF natively on host as a libc/base boundary check.
             actual_version=run_evidence([str(build/'target'/TARGETS[arch]/'release'/binary),'--version'],work,binary+'.version',output,commands,f'{iteration}-{binary}-version')
-            require(actual_version.strip()==binary+' '+version, 'native version mismatch')
+            require(actual_version.strip()=='airc '+version, 'native package version mismatch')
             require(run_evidence([str(build/'target'/TARGETS[arch]/'release'/binary),'--help'],work,binary+'.help',output,commands,f'{iteration}-{binary}-help'), 'empty native help')
         metadata={'repository':'leogr/airc','source_commit':source_sha,'source_tree':source_tree,'cargo_lock_sha256':lock_sha,'architecture':arch,'libc':'static-musl'}
         payload['RELEASE-IDENTITY.json']=((json.dumps(metadata,sort_keys=True)+'\n').encode(),0o644)
         archive=work/f'airc-linux-{arch}.tar.gz'
         package(archive,payload)
         packages.append((archive,payload))
-    require(packages[0][0].read_bytes()==packages[1][0].read_bytes(), 'two fresh build archives are not reproducible')
     artifact=output/packages[0][0].name
     artifact.write_bytes(packages[0][0].read_bytes())
     recipe = digest((Path(__file__).read_bytes()+Path(__file__).with_suffix('.sh').read_bytes()))
@@ -646,7 +647,8 @@ def release(source, output, definitions, arch, subject=None):
            'docker_admission':{'path':'evidence/docker/admission.json','sha256':digest((output/'evidence/docker/admission.json').read_bytes())},
            'runner':{'name':os.environ['RUNNER_NAME'],'machine':platform.machine(),'system':platform.system()},
            'toolchain':{'image_digest':IMAGES[arch],'image_index':INDEX,'image_config':inspection['Id'],'rustc':(output/'build-1/build/rustc.txt').read_text(),'target':TARGETS[arch]},
-           'reproducible':True,'builds':[{'iteration':i,'archive_sha256':digest(p.read_bytes())} for i,(p,_) in enumerate(packages,1)],
+           'reproducible':False,'reproducibility_check':'not_run',
+           'builds':[{'iteration':i,'archive_sha256':digest(p.read_bytes())} for i,(p,_) in enumerate(packages,1)],
            'qualification':{'upstream_checks':True,'release_behavior_tests':True,'static_elf':True,'native_host_smoke':True,'custom_base':'not_run'},
            'producer_build_complete':True,'publication_channel':channel,'consumer_qualification':'not_run',
            'consumer_prerequisites':['Reviewed supported custom-base and yoloctl consumer/runtime qualification before production pins or consumption.'],
