@@ -716,8 +716,12 @@ class GitHub:
         self.known_effects = []
         self.deadline = time.monotonic() + 3600
 
-    def call(self, endpoint, method='GET', payload=None, upload=None, download=None, expected=(200,), allow404=False, acknowledgement=None):
+    def call(self, endpoint, method='GET', payload=None, upload=None, download=None, expected=(200,), allow404=False, acknowledgement=None,
+             accept='application/octet-stream'):
         need(method in ('GET', 'POST', 'PATCH') and not (payload is not None and upload is not None), 'unsupported GitHub operation')
+        # Release assets stream as octet-stream; the Actions artifact ZIP
+        # endpoint refuses that (HTTP 415) and redirects only for its JSON type.
+        need(accept in ('application/octet-stream', 'application/vnd.github+json'), 'unsupported download media type')
         need(endpoint.startswith('repos/' + self.repository + '/') or endpoint.startswith('https://uploads.github.com/repos/' + self.repository + '/'), 'foreign GitHub endpoint')
         need(self.token not in endpoint and (payload is None or self.token.encode() not in canonical(payload)), 'credential material in public request')
         mutation = method != 'GET'
@@ -735,7 +739,7 @@ class GitHub:
         if download is None:
             argv += ['--include', '-H', 'Accept: application/vnd.github+json']
         else:
-            argv += ['-H', 'Accept: application/octet-stream']
+            argv += ['-H', 'Accept: ' + accept]
         if upload is not None:
             argv += ['-H', 'Content-Type: application/octet-stream', '--input', str(upload)]
         elif payload is not None:
@@ -939,7 +943,8 @@ def same_run_archives(plan, api):
              and artifact.get('workflow_run', {}).get('id') == int(definition['run_id'])
              and re.fullmatch(r'sha256:[0-9a-f]{64}', artifact.get('digest', '')), 'server same-run artifact digest/identity missing')
         destination = api.root / ('same-run-' + arch + '.zip')
-        api.call('repos/' + api.repository + '/actions/artifacts/' + str(artifact['id']) + '/zip', download=destination)
+        api.call('repos/' + api.repository + '/actions/artifacts/' + str(artifact['id']) + '/zip', download=destination,
+                 accept='application/vnd.github+json')
         need('sha256:' + digest_regular(destination) == artifact['digest'], 'server Actions artifact ZIP digest mismatch')
         expected = plan['matrix'][arch]['files']
         observed, total = {}, 0

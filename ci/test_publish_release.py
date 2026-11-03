@@ -653,6 +653,56 @@ class MainPostPublicationReportingControls(unittest.TestCase):
     def test_final_operation_ack_persistence_failure_remains_uncertain(self):
         self.check_failure('operation-ack')
 
+class DownloadMediaTypeTests(unittest.TestCase):
+    """v0.1.0's attachment failed: the Actions artifact ZIP endpoint answers
+    HTTP 415 to Accept: application/octet-stream. Release assets keep it."""
+
+    def test_download_accept_header_is_explicit(self):
+        class Process:
+            def __init__(self):
+                self.stdout = self.pipe(b'bytes')
+                self.stderr = self.pipe(b'')
+            @staticmethod
+            def pipe(raw):
+                read_fd, write_fd = os.pipe()
+                os.write(write_fd, raw)
+                os.close(write_fd)
+                return os.fdopen(read_fd, 'rb', buffering=0)
+            def poll(self):
+                return 0
+        seen = []
+        def start(argv, **kwargs):
+            seen.append(argv[argv.index('-H', argv.index('X-GitHub-Api-Version: 2022-11-28')) + 1])
+            return Process()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(pub.shutil, 'which', return_value='/usr/bin/gh'):
+            api = pub.GitHub(REPO, {'GH_TOKEN': 'private-token', 'PATH': '/usr/bin'}, Path(temporary))
+            with mock.patch.object(pub.subprocess, 'Popen', side_effect=start):
+                api.call('repos/' + REPO + '/releases/assets/9', download=Path(temporary) / 'asset')
+                api.call('repos/' + REPO + '/actions/artifacts/5/zip', download=Path(temporary) / 'artifact.zip',
+                         accept='application/vnd.github+json')
+            with self.assertRaises(pub.Refusal):
+                api.call('repos/' + REPO + '/releases/assets/9', download=Path(temporary) / 'other', accept='text/html')
+        self.assertEqual(seen, ['Accept: application/octet-stream', 'Accept: application/vnd.github+json'])
+
+    def test_same_run_archive_download_requests_json(self):
+        recorded = {}
+        class Api:
+            repository = REPO
+            root = None
+            def list(self, endpoint, key):
+                return [{'name': 'airc-linux-amd64', 'expired': False, 'id': 5, 'digest': 'sha256:' + 'a' * 64,
+                         'workflow_run': {'head_sha': 's' * 40, 'id': 7}}]
+            def call(self, endpoint, **kwargs):
+                recorded.update(kwargs, endpoint=endpoint)
+                raise pub.Refusal('stop after the request')
+        plan = {'repository': REPO, 'workflow_definition': {'run_id': '7', 'commit': 's' * 40}, 'matrix': {}}
+        api = Api()
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(pub.Refusal, 'stop after the request'):
+            api.root = Path(temporary)
+            pub.same_run_archives(plan, api)
+        self.assertTrue(recorded['endpoint'].endswith('/actions/artifacts/5/zip'))
+        self.assertEqual(recorded['accept'], 'application/vnd.github+json')
+
 
 if __name__ == '__main__':
     unittest.main()
