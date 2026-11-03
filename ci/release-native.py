@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tomllib
 import urllib.request
 
 SOURCE = 'b76ba355863cc3eb51900a313d7647d9190eedfa'
@@ -259,13 +260,15 @@ def export_publication(output, arch, commands):
         target.chmod(0o644)
 
 
-def source_members(data):
-    require(digest(data) == ARCHIVE, 'source archive hash mismatch')
+def source_members(data, commit=None, archive_hash=None):
+    commit = SOURCE if commit is None else commit
+    archive_hash = ARCHIVE if archive_hash is None else archive_hash
+    require(digest(data) == archive_hash, 'source archive hash mismatch')
     files = {}
     with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as t:
         for m in t:
             parts = m.name.split('/')
-            require(parts[0] == 'airc-' + SOURCE, 'unexpected source prefix')
+            require(parts[0] == 'airc-' + commit, 'unexpected source prefix')
             n = '/'.join(parts[1:])
             require(not n.startswith('/') and '..' not in parts, 'unsafe source path')
             if m.isdir():
@@ -313,13 +316,27 @@ def package(path, files):
                     t.addfile(member,io.BytesIO(data))
 
 
+NANOSECOND_DATE_CHECK = r'''import subprocess
+import time
+
+before = time.time_ns()
+raw = subprocess.check_output(['date', '+%s%N'], text=True, timeout=5).strip()
+after = time.time_ns()
+if not (raw.isascii() and raw.isdecimal() and before <= int(raw) <= after):
+    raise RuntimeError('named_sessions requires nanosecond date; install GNU coreutils')
+print('nanosecond date capability: OK')
+'''
+
+
 INNER = r'''set -eu
 export CARGO_HOME=/cache/cargo RUSTUP_HOME=/usr/local/rustup CARGO_TARGET_DIR=/build/target
 export CARGO_BUILD_TARGET=$TARGET
 export CARGO_BUILD_JOBS=2
 export SOURCE_DATE_EPOCH=0 TZ=UTC LC_ALL=C PYTHONDONTWRITEBYTECODE=1
 export RUSTFLAGS='--remap-path-prefix=/source=airc-source --remap-path-prefix=/build=airc-build -C target-feature=+crt-static'
-apk add --no-cache build-base linux-headers binutils python3 make bash git openssl perl
+apk add --no-cache build-base linux-headers binutils python3 make bash git openssl perl coreutils
+python3 - <<'AIRC_NANOSECOND_DATE_CHECK'
+''' + NANOSECOND_DATE_CHECK + r'''AIRC_NANOSECOND_DATE_CHECK
 apk info -vv > /build/apk-packages.txt
 rustup component add rustfmt clippy --toolchain 1.99.0
 rustc -vV > /build/rustc.txt
@@ -340,7 +357,7 @@ record build cargo build --locked --release --bins
 record release-tests cargo test --locked --release --all-targets
 for name in airc aircd airc-codex; do
   /build/target/$TARGET/release/$name --version > /build/$name.version
-  grep -Fx "$name 0.1.0" /build/$name.version
+  grep -Fx "$name $EXPECTED_VERSION" /build/$name.version
   /build/target/$TARGET/release/$name --help > /build/$name.help
   test -s /build/$name.help
 done
@@ -382,24 +399,75 @@ def container_start(name, output, work):
             and inspected['State']['ExitCode']==0 and not inspected['State'].get('OOMKilled'), 'container exit not proven')
 
 
-def build_owner(arch):
+def release_event(env):
+    """The original published event binds S and release ID; W is separate."""
+    require(env.get('GITHUB_EVENT_NAME') == 'release'
+            and env.get('GITHUB_REPOSITORY') == 'leogr/airc', 'AIRC release event required')
+    path = Path(env.get('GITHUB_EVENT_PATH', ''))
+    require(path.is_file() and path.stat().st_size <= 1024**2, 'bounded original release event missing')
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'duplicate original release event field')
+            result[key] = value
+        return result
+    event = json.loads(path.read_bytes(), object_pairs_hook=unique)
+    require(isinstance(event, dict) and isinstance(event.get('release'), dict)
+            and isinstance(event.get('repository'), dict), 'original release event object required')
+    release = event.get('release', {})
+    tag = release.get('tag_name', '')
+    require(event.get('action') == 'published' and event.get('repository', {}).get('full_name') == 'leogr/airc'
+            and type(release.get('id')) is int and release['id'] > 0 and release.get('draft') is False
+            and isinstance(tag, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', tag) and '..' not in tag
+            and not tag.endswith(('.', '.lock')), 'original published release identity invalid')
+    require(env.get('GITHUB_REF') == 'refs/tags/' + tag
+            and re.fullmatch(r'[0-9a-f]{40}', env.get('GITHUB_SHA', ''))
+            and env.get('SOURCE_SUBJECT') == env['GITHUB_SHA'], 'release tag/source context differs')
+    require(re.fullmatch(r'[0-9a-f]{40}', env.get('BUILD_DEFINITION', ''))
+            and env.get('BUILD_DEFINITION') == env.get('GITHUB_WORKFLOW_SHA')
+            and env.get('GITHUB_WORKFLOW_REF') == 'leogr/airc/.github/workflows/native-release.yml@refs/tags/' + tag,
+            'actual workflow W/ref missing; do not substitute tagged source S')
+    return {'id': release['id'], 'tag': tag, 'source': env['GITHUB_SHA'],
+            'definition': env['BUILD_DEFINITION'], 'workflow': env['GITHUB_WORKFLOW_REF']}
+
+
+def selected_source(source, sha, env):
+    if env.get('GITHUB_EVENT_NAME') == 'release':
+        event = release_event(env)
+        require(sha == event['source'], 'release argument differs from actual tagged S')
+        require(git(source, 'rev-parse', 'HEAD') == sha, 'release source checkout differs from S')
+        lock = source / 'Cargo.lock'
+        require(lock.is_file() and not lock.is_symlink() and lock.stat().st_size <= 4 * 1024**2,
+                'bounded regular committed lockfile required')
+        return {'source': sha, 'tree': git(source, 'rev-parse', 'HEAD^{tree}'),
+                'lock': digest(lock.read_bytes()), 'archive': None}
+    require(sha == SOURCE, 'manual dispatch retains fixed reviewed source')
+    return {'source': SOURCE, 'tree': TREE, 'archive': ARCHIVE, 'lock': LOCK}
+
+
+def build_owner(arch, source_sha=SOURCE):
     """Closed public ownership identity, checked before creating the output."""
     definition=os.environ.get('BUILD_DEFINITION','')
     require(os.environ.get('GITHUB_REPOSITORY')=='leogr/airc'
             and re.fullmatch(r'[0-9a-f]{40}',definition)
-            and os.environ.get('GITHUB_SHA')==definition
-            and os.environ.get('SOURCE_SUBJECT')==SOURCE
+            and os.environ.get('SOURCE_SUBJECT')==source_sha
             and arch in IMAGES and os.environ.get('BUILD_ARCH')==arch,
             'validated source/workflow/architecture identity required for output ownership')
+    if os.environ.get('GITHUB_EVENT_NAME') == 'release':
+        event = release_event(os.environ)
+        require(event['source'] == source_sha, 'release owner source mismatch')
+    else:
+        require(os.environ.get('GITHUB_SHA') == definition and source_sha == SOURCE,
+                'manual build definition/source identity mismatch')
     run=os.environ.get('GITHUB_RUN_ID','');attempt=os.environ.get('GITHUB_RUN_ATTEMPT','')
     require(re.fullmatch(r'[1-9][0-9]{0,19}',run) and re.fullmatch(r'[1-9][0-9]{0,9}',attempt),
             'bounded positive CI run identity required for output ownership')
-    return {'schema':1,'repository':'leogr/airc','source_subject':SOURCE,
+    return {'schema':1,'repository':'leogr/airc','source_subject':source_sha,
             'workflow_definition':definition,'run_id':run,'run_attempt':attempt,'arch':arch}
 
 
-def initialize_output(output,arch):
-    owner=build_owner(arch)
+def initialize_output(output,arch,source_sha=SOURCE):
+    owner=build_owner(arch,source_sha)
     output.mkdir(mode=0o700)
     # First file in our new output, before any build/registry/Docker effects.
     # Ownership is local provenance, never a claim that a mutation completed.
@@ -415,9 +483,10 @@ def initialize_output(output,arch):
 def main(argv):
     require(len(argv)==5, 'usage: release-native.sh SOURCE_SHA ARCH SOURCE_CHECKOUT OUTPUT_NEW_DIR')
     _, sha, arch, src_arg, out_arg = argv
-    require(sha == SOURCE and arch in IMAGES, 'unreviewed source or architecture')
+    require(re.fullmatch(r'[0-9a-f]{40}', sha) and arch in IMAGES, 'invalid source or architecture')
     require(platform.system()=='Linux' and platform.machine()=={'amd64':'x86_64','arm64':'aarch64'}[arch], 'native Linux host required')
     source = Path(src_arg).resolve(strict=True)
+    subject = selected_source(source, sha, os.environ)
     requested = Path(out_arg).absolute()
     output = requested.parent.resolve(strict=True)/requested.name
     require(',' not in str(output), 'comma in Docker bind path forbidden')
@@ -427,23 +496,30 @@ def main(argv):
     defroot = Path(git(definitions,'rev-parse','--show-toplevel'))
     require(defroot != source, 'build-definition checkout must be separate')
     require(defroot not in output.parents and output not in defroot.parents, 'output/definition overlap')
-    require(git(source,'rev-parse','HEAD')==SOURCE and git(source,'rev-parse','HEAD^{tree}')==TREE, 'source commit/tree mismatch')
+    require(git(source,'rev-parse','HEAD')==subject['source'] and git(source,'rev-parse','HEAD^{tree}')==subject['tree'], 'source commit/tree mismatch')
     require(not git(source,'status','--porcelain','--untracked-files=all'), 'source checkout dirty')
     require(not git(defroot,'status','--porcelain','--untracked-files=all'), 'build definitions dirty')
     require(os.environ.get('BUILD_DEFINITION')==git(defroot,'rev-parse','HEAD'), 'build-definition SHA not pinned by workflow')
     for key in ('GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_WORKFLOW_REF','GITHUB_SHA','GITHUB_REPOSITORY','RUNNER_NAME'):
         require(os.environ.get(key), f'CI identity missing {key}')
-    require(os.environ['GITHUB_REPOSITORY']=='leogr/airc' and os.environ['GITHUB_SHA']==os.environ['BUILD_DEFINITION'], 'workflow identity mismatch')
+    require(os.environ['GITHUB_REPOSITORY']=='leogr/airc', 'workflow repository mismatch')
+    if os.environ.get('GITHUB_EVENT_NAME') == 'release':
+        release_event(os.environ)
+    else:
+        require(os.environ['GITHUB_SHA']==os.environ['BUILD_DEFINITION'], 'manual workflow identity mismatch')
     resources(output.parent,20)
-    initialize_output(output,arch)
+    initialize_output(output,arch,subject['source'])
     try:
-        release(source,output,defroot,arch)
+        release(source,output,defroot,arch,subject)
     except BaseException as e:
         write_json(output/'FAILED.json', {'error':str(e),'replay':False,'status':'prerequisite/failed/uncertain; inspect retained containers and evidence'})
         raise
 
 
-def release(source, output, definitions, arch):
+def release(source, output, definitions, arch, subject=None):
+    subject = subject or {'source': SOURCE, 'tree': TREE, 'archive': ARCHIVE, 'lock': LOCK}
+    source_sha, source_tree, archive_sha, lock_sha = (subject[key] for key in ('source', 'tree', 'archive', 'lock'))
+    channel = 'published-event-release' if os.environ.get('GITHUB_EVENT_NAME') == 'release' else 'candidate-prerelease'
     commands={}
     hostdir=output/'evidence/host';hostdir.mkdir(parents=True)
     for label,arg in [('system','-s'),('machine','-m'),('identity','-a')]:
@@ -453,19 +529,27 @@ def release(source, output, definitions, arch):
     recipedir=output/'evidence/recipe';recipedir.mkdir()
     for name in ('release-native.py','release-native.sh'):
         (recipedir/name).write_bytes(Path(__file__).with_name(name).read_bytes())
-    url = f'https://codeload.github.com/leogr/airc/tar.gz/{SOURCE}'
+    url = f'https://codeload.github.com/leogr/airc/tar.gz/{source_sha}'
     with urllib.request.urlopen(url,timeout=120) as response:
         data = response.read(4*1024**2+1)
     require(len(data)<=4*1024**2, 'source archive download budget')
-    files = source_members(data)
+    # A release tag authorizes its actual immutable S. Its archive is also
+    # compared against EVERY tracked checkout byte/mode below, not trusted as
+    # its own source description. Manual dispatch keeps its independent pin.
+    archive_sha = archive_sha or digest(data)
+    files = source_members(data, source_sha, archive_sha)
     (output/'source.tar.gz').write_bytes(data)
-    require(digest(files['Cargo.lock'][0])==LOCK, 'lockfile mismatch')
+    require(digest(files['Cargo.lock'][0])==lock_sha, 'lockfile mismatch')
     tracked = command(['git','-C',str(source),'ls-files','-z']).split('\0')
     require(set(filter(None,tracked))==set(files), 'source archive/checkout inventory mismatch')
     for n,(content,mode) in files.items():
         p=source/n
         require(not p.is_symlink() and p.is_file() and p.read_bytes()==content, f'source checkout differs: {n}')
         require(bool(p.stat().st_mode & 0o111)==bool(mode & 0o111), f'source mode differs: {n}')
+    version = tomllib.loads(files['Cargo.toml'][0].decode())['package']['version']
+    require(isinstance(version, str) and len(version) <= 128
+            and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?', version),
+            'bounded literal package version required')
     admit_docker(output,arch,commands)
     image = 'docker.io/library/rust@'+IMAGES[arch]
     resources(output,16)
@@ -506,6 +590,7 @@ def release(source, output, definitions, arch):
               '--mount',f'type=bind,src={build},dst=/build', '--mount',f'type=bind,src={cache},dst=/cache',
               '--mount',f'type=bind,src={script},dst=/inner.sh,readonly',
               '--env','TARGET='+TARGETS[arch],'--env','NATIVE_MACHINE='+platform.machine(),
+              '--env','EXPECTED_VERSION='+version,
               image,'sh','/inner.sh']
         write_json(work/'create-intent.json', {'argv':docker_argv(args),'replay':False})
         cid=command(args)
@@ -526,10 +611,10 @@ def release(source, output, definitions, arch):
             run_evidence(elf_cmd,work,binary+'.elf',output,commands,f'{iteration}-{binary}-elf')
             payload['bin/'+binary]=(content,0o755)
             # Execute actual release ELF natively on host as a libc/base boundary check.
-            version=run_evidence([str(build/'target'/TARGETS[arch]/'release'/binary),'--version'],work,binary+'.version',output,commands,f'{iteration}-{binary}-version')
-            require(version.strip()==binary+' 0.1.0', 'native version mismatch')
+            actual_version=run_evidence([str(build/'target'/TARGETS[arch]/'release'/binary),'--version'],work,binary+'.version',output,commands,f'{iteration}-{binary}-version')
+            require(actual_version.strip()==binary+' '+version, 'native version mismatch')
             require(run_evidence([str(build/'target'/TARGETS[arch]/'release'/binary),'--help'],work,binary+'.help',output,commands,f'{iteration}-{binary}-help'), 'empty native help')
-        metadata={'repository':'leogr/airc','source_commit':SOURCE,'source_tree':TREE,'cargo_lock_sha256':LOCK,'architecture':arch,'libc':'static-musl'}
+        metadata={'repository':'leogr/airc','source_commit':source_sha,'source_tree':source_tree,'cargo_lock_sha256':lock_sha,'architecture':arch,'libc':'static-musl'}
         payload['RELEASE-IDENTITY.json']=((json.dumps(metadata,sort_keys=True)+'\n').encode(),0o644)
         archive=work/f'airc-linux-{arch}.tar.gz'
         package(archive,payload)
@@ -538,7 +623,7 @@ def release(source, output, definitions, arch):
     artifact=output/packages[0][0].name
     artifact.write_bytes(packages[0][0].read_bytes())
     recipe = digest((Path(__file__).read_bytes()+Path(__file__).with_suffix('.sh').read_bytes()))
-    proof={'schema':1,'repository':'leogr/airc','source_commit':SOURCE,'source_tree':TREE,'source_archive_sha256':ARCHIVE,'cargo_lock_sha256':LOCK,
+    proof={'schema':1,'repository':'leogr/airc','source_commit':source_sha,'source_tree':source_tree,'source_archive_sha256':archive_sha,'cargo_lock_sha256':lock_sha,'version':version,
            'architecture':arch,'build_definition':{'commit':git(definitions,'rev-parse','HEAD'),'tree':git(definitions,'rev-parse','HEAD^{tree}'),'recipe_sha256':recipe},
            'github_run_id':os.environ['GITHUB_RUN_ID'],'github_run_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'github_workflow_ref':os.environ['GITHUB_WORKFLOW_REF'],
            'docker_admission':{'path':'evidence/docker/admission.json','sha256':digest((output/'evidence/docker/admission.json').read_bytes())},
@@ -546,7 +631,7 @@ def release(source, output, definitions, arch):
            'toolchain':{'image_digest':IMAGES[arch],'image_index':INDEX,'image_config':inspection['Id'],'rustc':(output/'build-1/build/rustc.txt').read_text(),'target':TARGETS[arch]},
            'reproducible':True,'builds':[{'iteration':i,'archive_sha256':digest(p.read_bytes())} for i,(p,_) in enumerate(packages,1)],
            'qualification':{'upstream_checks':True,'release_behavior_tests':True,'static_elf':True,'native_host_smoke':True,'custom_base':'not_run'},
-           'producer_build_complete':True,'publication_channel':'candidate-prerelease','consumer_qualification':'not_run',
+           'producer_build_complete':True,'publication_channel':channel,'consumer_qualification':'not_run',
            'consumer_prerequisites':['Reviewed supported custom-base and yoloctl consumer/runtime qualification before production pins or consumption.'],
            'artifacts':[{'name':artifact.name,'sha256':digest(artifact.read_bytes()),'size':artifact.stat().st_size}],
            'commands':commands,
@@ -554,7 +639,7 @@ def release(source, output, definitions, arch):
     proof_path=output/f'build-proof-{arch}.json'
     write_json(proof_path,proof)
     write_json(output/'CI-MANIFEST.json', {'schema':1,'repository':'leogr/airc','architecture':arch,
-        'source_subject':{'commit':SOURCE,'tree':TREE,'archive_sha256':ARCHIVE,'lock_sha256':LOCK},
+        'source_subject':{'commit':source_sha,'tree':source_tree,'archive_sha256':archive_sha,'lock_sha256':lock_sha},
         'workflow_definition':{'commit':git(definitions,'rev-parse','HEAD'),'repository':os.environ['GITHUB_REPOSITORY'],
           'workflow':os.environ['GITHUB_WORKFLOW_REF'],'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':os.environ['GITHUB_RUN_ATTEMPT']},
         'recipe':{'sha256':recipe}, 'artifacts':{artifact.name:digest(artifact.read_bytes())},

@@ -1,7 +1,9 @@
-# REVIEW-ONLY workflow interface proposal. Not installed or execution-qualified.
-# Native adapters and shared publisher are authored under upstream-proposal; assemble/review before enabling.
+# Owner-published releases build their actual tagged source and attach in place.
+# Manual dispatch retains separate protected new-prerelease publication.
 name: Native verified release
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       publish:
@@ -13,12 +15,14 @@ on:
         required: false
 permissions:
   contents: read
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
 concurrency:
   group: airc-reviewed-release
   cancel-in-progress: false
 jobs:
   build:
-    if: github.repository == 'leogr/airc' && github.ref == 'refs/heads/release-ci'
+    if: github.repository == 'leogr/airc' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release-ci') || (github.event_name == 'release' && github.event.action == 'published' && !github.event.release.draft))
     strategy:
       fail-fast: false
       matrix:
@@ -30,17 +34,18 @@ jobs:
       attestations: write
     env:
       RELEASE_REPOSITORY: leogr/airc
-      SOURCE_SUBJECT: b76ba355863cc3eb51900a313d7647d9190eedfa
+      SOURCE_SUBJECT: ${{ github.event_name == 'release' && github.sha || 'b76ba355863cc3eb51900a313d7647d9190eedfa' }}
       BUILD_ARCH: ${{ matrix.arch }}
-      BUILD_DEFINITION: ${{ github.sha }}
+      BUILD_DEFINITION: ${{ github.workflow_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: build-definition
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: b76ba355863cc3eb51900a313d7647d9190eedfa
+          ref: ${{ github.event_name == 'release' && github.sha || 'b76ba355863cc3eb51900a313d7647d9190eedfa' }}
           path: source
           persist-credentials: false
       - name: Native preflight, source identity and two isolated reproducible builds
@@ -71,7 +76,7 @@ jobs:
           if-no-files-found: error
   publish:
     needs: build
-    if: inputs.publish && github.repository == 'leogr/airc' && github.ref == 'refs/heads/release-ci'
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.repository == 'leogr/airc' && github.ref == 'refs/heads/release-ci'
     runs-on: ubuntu-24.04
     environment: upstream-release
     permissions:
@@ -81,13 +86,14 @@ jobs:
       RELEASE_REPOSITORY: leogr/airc
       SOURCE_SUBJECT: b76ba355863cc3eb51900a313d7647d9190eedfa
       RELEASE_MODE: apply
-      BUILD_DEFINITION: ${{ github.sha }}
+      BUILD_DEFINITION: ${{ github.workflow_sha }}
       RELEASE_TAG: ${{ inputs.release_tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: build-definition
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -101,4 +107,42 @@ jobs:
         with:
           name: 'publication-receipts-airc-${{ github.run_id }}'
           path: '${{ runner.temp }}/publication-airc-${{ github.run_id }}/'
+          if-no-files-found: ignore
+  attach:
+    needs: build
+    if: github.event_name == 'release' && github.repository == 'leogr/airc' && github.event.action == 'published' && !github.event.release.draft
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      RELEASE_REPOSITORY: leogr/airc
+      SOURCE_SUBJECT: ${{ github.sha }}
+      BUILD_DEFINITION: ${{ github.workflow_sha }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      RELEASE_MODE: attach
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: build-definition
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: 'airc-linux-*'
+          path: '${{ runner.temp }}/event-inputs'
+      - name: Verify native pair and attach only to the original published release
+        run: python3 build-definition/ci/attach-release.py "$SOURCE_SUBJECT" "$RELEASE_TAG" "$RUNNER_TEMP/event-inputs" "$GITHUB_WORKSPACE/source"
+      - name: Retain attachment receipts on success or failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: 'attachment-receipts-airc-${{ github.run_id }}'
+          path: '${{ runner.temp }}/attachment-airc-${{ github.run_id }}/'
           if-no-files-found: ignore

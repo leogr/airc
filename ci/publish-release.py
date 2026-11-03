@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tomllib
 import urllib.parse
 import zipfile
 
@@ -293,7 +294,7 @@ def static_elf(raw, arch):
             need(all(struct.unpack_from('<q', raw, pos)[0] != 1 for pos in range(start, start + length, 16)), 'ELF NEEDED forbidden')
 
 
-def payload_archive(raw, arch, repo, source_files):
+def payload_archive(raw, arch, repo, source_files, policy=None):
     need(raw[:2] == b'\x1f\x8b' and len(raw) >= 10 and raw[4:8] == b'\0'*4, 'deterministic gzip mtime0 required')
     members, total = {}, 0
     with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as archive:
@@ -325,7 +326,7 @@ def payload_archive(raw, arch, repo, source_files):
             need(members['bin/' + binary]['mode'] == 0o755, 'AIRC binary mode must be0755')
             static_elf(members['bin/' + binary]['data'], arch)
         identity = decode(members['RELEASE-IDENTITY.json']['data'])
-        policy = REPOS[repo]
+        policy = REPOS[repo] if policy is None else policy
         need(identity == {'repository': repo, 'source_commit': policy['source'], 'source_tree': policy['tree'],
                           'cargo_lock_sha256': policy['lock'], 'architecture': arch, 'libc': 'static-musl'}, 'AIRC payload release identity mismatch')
     return {name: {k: value[k] for k in ('sha256', 'size', 'mode')} for name, value in members.items()}
@@ -368,17 +369,20 @@ def oci_binding(index, manifest, image, policy, arch):
          and any(x.endswith('@' + policy['images'][arch]) for x in image['RepoDigests']), 'actual inspected native image differs')
 
 
-def common_manifest(files, repo, arch, workflow=None):
-    policy = REPOS[repo]
+def common_manifest(files, repo, arch, workflow=None, *, source_policy=None, event_workflow=None):
+    policy = REPOS[repo] if source_policy is None else source_policy
     manifest = files.json('CI-MANIFEST.json')
     need(manifest.get('schema') == 1 and manifest.get('repository') == repo and manifest.get('architecture') == arch, 'CI manifest identity mismatch')
     need(manifest.get('source_subject') == {'commit': policy['source'], 'tree': policy['tree'],
         'archive_sha256': policy['archive'], 'lock_sha256': policy['lock']}, 'actual Rust subject/tree/lock/archive mismatch')
     definition = manifest['workflow_definition']
+    event = event_workflow is not None
+    need(not event or repo == 'leogr/airc', 'release-event workflow is AIRC only')
     need(definition.get('repository') == repo and COMMIT.fullmatch(definition.get('commit', ''))
-         and definition['commit'] != policy['source'] and str(definition.get('run_attempt')) == '1'
+         and (event or definition['commit'] != policy['source']) and str(definition.get('run_attempt')) == '1'
          and re.fullmatch('[1-9][0-9]*', str(definition.get('run_id', '')))
-         and re.fullmatch(re.escape(repo) + r'/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@refs/heads/release-ci', definition.get('workflow', '')),
+         and (definition == event_workflow if event else
+              re.fullmatch(re.escape(repo) + r'/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@refs/heads/release-ci', definition.get('workflow', ''))),
          'workflow W/run/first-attempt/protected definition identity missing')
     need(workflow is None or definition == workflow, 'architecture outputs are not from exactly same run/workflow W')
     need(manifest.get('build_proof') == 'build-proof-' + arch + '.json', 'wrong architecture build proof')
@@ -562,13 +566,15 @@ def validate_airc_admission(files, proof, arch):
     return admission
 
 
-def validate_airc(files, manifest, arch):
-    repo, policy = 'leogr/airc', REPOS['leogr/airc']
+def validate_airc(files, manifest, arch, source_policy=None, event=False):
+    repo = 'leogr/airc'
+    policy = REPOS[repo] if source_policy is None else source_policy
     proof = files.json(manifest['build_proof'])
     for key, value in {'schema': 1, 'repository': repo, 'source_commit': policy['source'], 'source_tree': policy['tree'],
                        'source_archive_sha256': policy['archive'], 'cargo_lock_sha256': policy['lock'], 'architecture': arch}.items():
         need(proof.get(key) == value, 'AIRC build proof identity mismatch: ' + key)
-    need(proof.get('producer_build_complete') is True and proof.get('publication_channel') == 'candidate-prerelease'
+    channel = 'published-event-release' if event else 'candidate-prerelease'
+    need(proof.get('producer_build_complete') is True and proof.get('publication_channel') == channel
          and proof.get('consumer_qualification') == 'not_run', 'producer versus consumer qualification boundary missing')
     definition = manifest['workflow_definition']
     need(proof['build_definition']['commit'] == definition['commit'] and proof['github_run_id'] == definition['run_id']
@@ -576,6 +582,10 @@ def validate_airc(files, manifest, arch):
     recipe_py, recipe_sh = files.read('evidence/recipe/release-native.py'), files.read('evidence/recipe/release-native.sh')
     need(sha(recipe_py + recipe_sh) == manifest['recipe']['sha256'] == proof['build_definition']['recipe_sha256'], 'AIRC actual recipe differs')
     source = source_archive(files.read('source.tar.gz'), policy)
+    version = tomllib.loads(source['Cargo.toml'][0].decode())['package']['version']
+    need(isinstance(version, str) and len(version) <= 128
+         and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?', version),
+         'bounded literal source package version required')
     need(proof['runner']['system'] == 'Linux' and proof['runner']['machine'] == {'amd64': 'x86_64', 'arm64': 'aarch64'}[arch], 'actual native host mismatch')
     admission = validate_airc_admission(files, proof, arch)
     image = files.json('image.json')
@@ -626,11 +636,11 @@ def validate_airc(files, manifest, arch):
             for label in ('elf', 'version', 'help'):
                 out, _ = command_record(files, proof['commands'][str(iteration) + '-' + binary + '-' + label])
                 if label == 'version':
-                    need(out.strip() == (binary + ' 0.1.0').encode(), 'actual native AIRC version differs')
+                    need(out.strip() == (binary + ' ' + version).encode(), 'actual native AIRC version differs')
                 else:
                     need(bool(out.strip()), 'empty native CLI/ELF evidence')
         raw = files.read(prefix + '/' + archive_name, proof['builds'][iteration - 1]['archive_sha256'])
-        payload = payload_archive(raw, arch, repo, source)
+        payload = payload_archive(raw, arch, repo, source, policy)
         need(sha(raw) == manifest['artifacts'][archive_name] == sha(files.read(archive_name)), 'AIRC actual two-build archives differ')
         declared = {p['path']: {k: p[k] for k in ('sha256', 'size')} | {'mode': int(p['mode'], 8)} for p in proof['payloads']}
         need(payload == declared, 'AIRC actual payload/proof bytes differ')
@@ -638,21 +648,25 @@ def validate_airc(files, manifest, arch):
     return proof
 
 
-def validate_inputs(repository, source, tag, input_dir):
+def validate_inputs(repository, source, tag, input_dir, *, source_policy=None, event_workflow=None):
     need(repository in REPOS, 'RELEASE_REPOSITORY must be exactly leogr/OpenShell or leogr/airc')
-    policy = REPOS[repository]
+    need(source_policy is None or (repository == 'leogr/airc' and event_workflow is not None),
+         'dynamic source policy is only accepted from the AIRC event adapter')
+    policy = REPOS[repository] if source_policy is None else source_policy
     need(source == policy['source'], 'SOURCE_SHA must be the fixed reviewed Rust subject')
     need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', tag) and '..' not in tag and not tag.endswith(('.', '.lock'))
          and tag.lower() not in ('latest', 'main', 'master', 'head'), 'new explicit safe immutable tag required')
     root = Path(input_dir).absolute()
     expected = {policy['slug'] + '-linux-' + arch for arch in ARCHES}
     need(root.is_dir() and set(p.name for p in root.iterdir()) == expected, 'exact same-run native amd64+arm64 artifact directories required')
-    matrix, workflow, common = {}, None, {}
+    matrix, workflow, common = {}, event_workflow, {}
     for arch in ARCHES:
         files = Files(root / (policy['slug'] + '-linux-' + arch))
-        manifest = common_manifest(files, repository, arch, workflow)
+        manifest = common_manifest(files, repository, arch, workflow,
+                                   source_policy=source_policy, event_workflow=event_workflow)
         workflow = manifest['workflow_definition']
-        proof = (validate_openshell if repository == 'leogr/OpenShell' else validate_airc)(files, manifest, arch)
+        proof = (validate_openshell(files, manifest, arch) if repository == 'leogr/OpenShell' else
+                 validate_airc(files, manifest, arch, source_policy, event_workflow is not None))
         if repository == 'leogr/OpenShell':
             for name in ('sandbox-policy.rego', 'source-proof.json'):
                 raw = files.read(name)
@@ -662,7 +676,8 @@ def validate_inputs(repository, source, tag, input_dir):
     need(matrix['amd64']['manifest']['recipe'] == matrix['arm64']['manifest']['recipe'], 'architecture recipes differ')
     return {'repository': repository, 'source': source, 'tree': policy['tree'], 'tag': tag,
             'workflow_definition': workflow, 'matrix': matrix, 'producer_build_complete': True,
-            'publication_channel': 'candidate-prerelease', 'consumer_qualification': 'NOT RUN'}
+            'publication_channel': 'published-event-release' if event_workflow else 'candidate-prerelease',
+            'consumer_qualification': 'NOT RUN', 'run_head': source if event_workflow else workflow['commit']}
 
 
 def fsync_json(path, value):
@@ -921,7 +936,7 @@ def same_run_archives(plan, api):
         matches = [a for a in artifacts if a['name'] == name]
         need(len(matches) == 1 and matches[0].get('expired') is False, 'same-run native artifact missing/ambiguous')
         artifact = matches[0]
-        need(artifact.get('workflow_run', {}).get('head_sha') == definition['commit']
+        need(artifact.get('workflow_run', {}).get('head_sha') == plan.get('run_head', definition['commit'])
              and artifact.get('workflow_run', {}).get('id') == int(definition['run_id'])
              and re.fullmatch(r'sha256:[0-9a-f]{64}', artifact.get('digest', '')), 'server same-run artifact digest/identity missing')
         destination = api.root / ('same-run-' + arch + '.zip')
@@ -991,10 +1006,12 @@ def publication_assets(plan, root):
         assets[name] = target
     manifest = {'schema': 1, 'repository': plan['repository'], 'source_subject': {'commit': plan['source'], 'tree': plan['tree']},
                 'workflow_definition': plan['workflow_definition'], 'architectures': arch_manifests,
-                'producer_build_complete': True, 'publication_channel': 'candidate-prerelease',
+                'producer_build_complete': True, 'publication_channel': plan['publication_channel'],
                 'consumer_qualification': 'NOT RUN',
                 'scope': 'Producer reproducibility/static/interface/source evidence; no production readiness or yoloctl native/custom-base gate claim.',
                 'artifacts': {name: {'sha256': digest_regular(path), 'size': path.stat().st_size} for name, path in sorted(assets.items())}}
+    if 'event_release' in plan:
+        manifest['event_release'] = plan['event_release']
     fsync_json(root / 'CI-MANIFEST.json', manifest)
     assets['CI-MANIFEST.json'] = root / 'CI-MANIFEST.json'
     checksums = ''.join(digest_regular(path) + '  ' + name + '\n' for name, path in sorted(assets.items())).encode()

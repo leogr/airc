@@ -33,6 +33,21 @@ class NativeReleaseTests(unittest.TestCase):
         reset=patch.object(r,'ADMITTED_DOCKER',None)
         reset.start();self.addCleanup(reset.stop)
 
+    def test_required_nanosecond_date_capability_is_not_silently_seconds(self):
+        import subprocess
+        import time
+        for raw in ('1700000000\\n', '1700000000000000000\\n', '%s%N\\n', ''):
+            value = raw.replace('\\n', '\n')
+            with self.subTest(raw=raw), patch.object(subprocess, 'check_output', return_value=value), \
+                 patch.object(time, 'time_ns', side_effect=[1700000000000000001, 1700000000000000003]):
+                with self.assertRaises(RuntimeError):
+                    exec(r.NANOSECOND_DATE_CHECK, {})
+        with patch.object(subprocess, 'check_output', return_value='1700000000000000002\n'), \
+             patch.object(time, 'time_ns', side_effect=[1700000000000000001, 1700000000000000003]):
+            exec(r.NANOSECOND_DATE_CHECK, {})
+        self.assertIn('perl coreutils', r.INNER)
+        self.assertLess(r.INNER.index('AIRC_NANOSECOND_DATE_CHECK'), r.INNER.index('record upstream-check'))
+
     def test_both_native_static_architectures(self):
         for arch in ('amd64','arm64'):
             r.static_elf(elf(arch),arch)

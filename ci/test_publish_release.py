@@ -136,7 +136,7 @@ class InputContracts(unittest.TestCase):
             if raw == b'config':
                 return {'architecture': 'amd64', 'os': 'linux'}
             return {'manifests': []}
-        with mock.patch.object(pub, 'source_archive', return_value={}), mock.patch.object(pub, 'oci_raw', side_effect=oci), \
+        with mock.patch.object(pub, 'source_archive', return_value={'Cargo.toml': (b'[package]\nversion="0.1.0"\n', b'100644')}), mock.patch.object(pub, 'oci_raw', side_effect=oci), \
              mock.patch.object(pub, 'oci_binding'), mock.patch.object(pub, 'payload_archive', return_value={}):
             result = pub.validate_airc(files, manifest, 'amd64')
         self.assertTrue(result['producer_build_complete'])
@@ -156,7 +156,7 @@ class InputContracts(unittest.TestCase):
             def oci(raw, expected):
                 return ({'config': {'digest': files.objects['image.json']['Id']}} if raw == b'manifest' else
                         {'architecture': 'amd64', 'os': 'linux'} if raw == b'config' else {})
-            with self.subTest(control=control), mock.patch.object(pub, 'source_archive', return_value={}), \
+            with self.subTest(control=control), mock.patch.object(pub, 'source_archive', return_value={'Cargo.toml': (b'[package]\nversion="0.1.0"\n', b'100644')}), \
                  mock.patch.object(pub, 'oci_raw', side_effect=oci), mock.patch.object(pub, 'oci_binding'), \
                  mock.patch.object(pub, 'payload_archive', return_value={}):
                 with self.assertRaises(pub.Refusal):

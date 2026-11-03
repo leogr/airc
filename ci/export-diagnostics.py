@@ -157,15 +157,39 @@ def read_prefix(rootfd, name, limit, allow_container_root=False):
 
 
 def expected_owner(env, repository):
+    subject, definition = SUBJECTS[repository], env.get('GITHUB_SHA')
+    if env.get('GITHUB_EVENT_NAME') == 'release':
+        # Source S is the original tagged release; W is the workflow commit.
+        # This changes identity validation only, never the closed read profile
+        # or the collector's incomplete/no-positive-proof status.
+        if repository != 'leogr/airc':
+            raise ValueError('release-event diagnostics are AIRC only')
+        subject, definition = env.get('GITHUB_SHA', ''), env.get('GITHUB_WORKFLOW_SHA', '')
+        event_path = Path(env.get('GITHUB_EVENT_PATH', ''))
+        if not event_path.is_file() or event_path.stat().st_size > 1024**2:
+            raise ValueError('bounded original release event missing')
+        event = decode(event_path.read_bytes())
+        if (not isinstance(event, dict) or not isinstance(event.get('release'), dict)
+                or not isinstance(event.get('repository'), dict)):
+            raise ValueError('original release event object required')
+        release = event.get('release', {})
+        tag = release.get('tag_name', '')
+        if (event.get('action') != 'published' or event.get('repository', {}).get('full_name') != repository
+                or type(release.get('id')) is not int or release['id'] <= 0 or release.get('draft') is not False
+                or not isinstance(tag, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', tag) or '..' in tag
+                or tag.endswith(('.', '.lock')) or env.get('GITHUB_REF') != 'refs/tags/' + tag
+                or env.get('GITHUB_WORKFLOW_REF') != repository + '/.github/workflows/native-release.yml@refs/tags/' + tag
+                or not re.fullmatch('[0-9a-f]{40}', subject)):
+            raise ValueError('original release diagnostic identity differs')
     if (env.get('GITHUB_ACTIONS') != 'true' or env.get('GITHUB_REPOSITORY') != repository
-            or env.get('SOURCE_SUBJECT') != SUBJECTS[repository]
+            or env.get('SOURCE_SUBJECT') != subject
             or env.get('BUILD_ARCH') not in ('amd64', 'arm64')
             or not re.fullmatch('[0-9a-f]{40}', env.get('BUILD_DEFINITION', ''))
-            or env.get('BUILD_DEFINITION') != env.get('GITHUB_SHA')
+            or env.get('BUILD_DEFINITION') != definition
             or any(not re.fullmatch('[1-9][0-9]{0,31}', env.get(k, ''))
                    for k in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'))):
         raise ValueError('expected CI identity unavailable')
-    return {'schema': 1, 'repository': repository, 'source_subject': SUBJECTS[repository],
+    return {'schema': 1, 'repository': repository, 'source_subject': subject,
             'workflow_definition': env['BUILD_DEFINITION'], 'run_id': env['GITHUB_RUN_ID'],
             'run_attempt': env['GITHUB_RUN_ATTEMPT'], 'arch': env['BUILD_ARCH']}
 

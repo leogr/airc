@@ -37,6 +37,31 @@ def file_at(root, name, raw):
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_release_event_owner_uses_actual_source_and_definition_without_widening_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'event.json'
+            event = {'action': 'published', 'repository': {'full_name': 'leogr/airc'},
+                     'release': {'id': 17, 'tag_name': 'v0.2.0', 'draft': False}}
+            env = {**environment('leogr/airc'), 'GITHUB_EVENT_NAME': 'release',
+                   'GITHUB_EVENT_PATH': str(path), 'GITHUB_SHA': 'b' * 40,
+                   'SOURCE_SUBJECT': 'b' * 40, 'GITHUB_WORKFLOW_SHA': 'a' * 40,
+                   'GITHUB_REF': 'refs/tags/v0.2.0',
+                   'GITHUB_WORKFLOW_REF': 'leogr/airc/.github/workflows/native-release.yml@refs/tags/v0.2.0'}
+            path.write_text(json.dumps(event))
+            owner = m.expected_owner(env, 'leogr/airc')
+            self.assertEqual(owner['source_subject'], 'b' * 40)
+            self.assertEqual(owner['workflow_definition'], 'a' * 40)
+            for key, value in [('SOURCE_SUBJECT', 'c' * 40), ('BUILD_DEFINITION', 'b' * 40),
+                               ('GITHUB_REF', 'refs/heads/release-ci')]:
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    m.expected_owner({**env, key: value}, 'leogr/airc')
+            for raw in ('[]', '{"release": [], "repository": {}}',
+                        '{"action":"published","action":"published"}',
+                        json.dumps({**event, 'release': {**event['release'], 'tag_name': 7}})):
+                path.write_text(raw)
+                with self.subTest(raw=raw), self.assertRaises(ValueError):
+                    m.expected_owner(env, 'leogr/airc')
+
     def collect(self, root, output, outcome='failure', profile=PROFILE, env=None):
         return m.collect(profile, output, root / 'diagnostics', root / 'native-build.exit',
                          outcome, environment() if env is None else env)
