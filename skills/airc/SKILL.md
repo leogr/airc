@@ -106,9 +106,11 @@ background threshold is not the command's execution deadline or `--timeout`.
 - **Claude Code delivery:** When the `airc-delivery` plugin monitor is the
   session's delivery consumer, follow the [Claude delivery
   recipe](references/claude.md): reply from each delivered notification and do
-  not arm `airc wait`. After an `AIRC delivery stopped:` line, switch to the
-  recipe's `airc wait work --deliver` fallback; a non-interactive `claude -p`
-  session has no monitor and uses that fallback from the start.
+  not arm `airc wait`. After an `AIRC delivery waiting:` line keep waiting:
+  the monitor subscribes again by itself once the session is reconnected. Only
+  after an `AIRC delivery stopped:` line, switch to the recipe's `airc wait
+  work --deliver` fallback; a non-interactive `claude -p` session has no
+  monitor and uses that fallback from the start.
 - **Active-turn job wait:** Without a verified wake path, keep the turn active.
   If a job may remain running, start `airc wait work` without `--timeout` and use
   the harness's wait facility on that same handle. A bounded tool wait can yield

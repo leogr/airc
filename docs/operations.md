@@ -363,7 +363,8 @@ diagnostic and the launcher's stop line, which woke the idle session. Claude
 Code cut each notification line near 500 characters and each event near 3000,
 so the plugin now wraps lines at 480 bytes and bounds batches at 2560. Delivery
 during a busy turn, loading through settings `env`, `--wrap` in a live session
-and reconnects were not exercised.
+and reconnects were not exercised; the launcher's resubscribe after a reconnect
+is covered only by its fake-`airc` tests.
 
 Named sessions add durable bounded local cursors and a replayable last batch;
 JSONL cursors remain in memory. Neither interface automatically reconnects or

@@ -4,38 +4,98 @@
 # notifications. AIRC_DELIVERY_SESSION names the session; without it the
 # monitor does nothing. AIRC_DELIVERY_WAKE selects all, messages or mentions
 # (default mentions).
+#
+# Claude Code never restarts a plugin monitor, so this one outlives a dropped
+# connection: when subscribe ends because its connection ended (the session
+# is no longer connected, or reconnected with a new epoch), it waits for the
+# session to be connected again and subscribes once more. It never connects
+# by itself and never retries a pending batch. Anything else ends it with one
+# stop line: a refusal from the same connection (another consumer, a pending
+# batch), a usage error, or termination.
 set -u
 session=${AIRC_DELIVERY_SESSION:-}
 [ -n "$session" ] || exit 0
 wake=${AIRC_DELIVERY_WAKE:-mentions}
 
-# The Claude session can start before its client connects. Poll the status
-# with a pause that doubles from 1 to 30 seconds.
-pause=1
-until status=$(airc status "$session" 2>/dev/null); case $status in connected\;*) true ;; *) false ;; esac; do
-    sleep "$pause"
-    pause=$((pause * 2))
-    [ "$pause" -le 30 ] || pause=30
-done
-# A consumer from a session that just ended may not be released yet; give it
-# one 2-second chance instead of being refused. Nothing is resent either way.
-case $status in
-*"delivery consumer: none"*) ;;
-*) sleep 2 ;;
-esac
+child= napper= stopping= idle_stop= code= last= ran=
+# Forward termination so a stopped monitor leaves neither an orphaned
+# consumer nor a sleep behind. Sleeps get KILL: a just-forked child can still
+# run this trap instead of dying from TERM, which would leave a full sleep.
+trap 'stopping=1; [ -n "$child" ] || idle_stop=1
+    [ -z "$child" ] || kill -TERM "$child" 2>/dev/null
+    [ -z "$napper" ] || kill -KILL "$napper" 2>/dev/null' HUP INT TERM
 
-# Claude Code cuts a notification line near 500 characters and an event near
-# 3000: keep batches at 2560 bytes and wrap lines at 480 bytes. Stay the parent
-# so the stop line always follows, and forward termination so a stopped
-# monitor never leaves an orphaned consumer behind.
-child= stopping=
-trap 'stopping=1; [ -z "$child" ] || kill -TERM "$child" 2>/dev/null' HUP INT TERM
-airc subscribe "$session" --wake "$wake" --min-interval 15 --max-bytes 2560 --wrap 480 -- - 2>&1 &
-child=$!
-[ -z "$stopping" ] || kill -TERM "$child" 2>/dev/null
+# Sleep without holding the monitor's output, and return early on termination.
+nap() {
+    sleep "$1" </dev/null >/dev/null 2>&1 &
+    napper=$!
+    [ -z "$stopping" ] || kill -KILL "$napper" 2>/dev/null
+    wait "$napper" 2>/dev/null
+    kill -KILL "$napper" 2>/dev/null
+    wait "$napper" 2>/dev/null
+    napper=
+}
+
+# The connection's epoch from the first status line; empty if absent.
+epoch_of() {
+    printf '%s\n' "$1" | sed -n '1s/^connected;.*; epoch=\([^;]*\);.*/\1/p'
+}
+
 while :; do
-    wait "$child"
-    status=$?
-    kill -0 "$child" 2>/dev/null || break
+    # The Claude session can start before its client connects, and a dropped
+    # client stays down until someone reconnects it explicitly. Poll the
+    # status with a pause that doubles from 1 to 30 seconds.
+    pause=1
+    until [ -n "$stopping" ] || {
+        status=$(airc status "$session" 2>/dev/null)
+        case $status in connected\;*) true ;; *) false ;; esac
+    }; do
+        nap "$pause"
+        pause=$((pause * 2))
+        [ "$pause" -le 30 ] || pause=30
+    done
+    [ -z "$stopping" ] || break
+    epoch=$(epoch_of "$status")
+    # Subscribe again only in a connection that is provably new.
+    if [ -n "$ran" ] && { [ -z "$epoch" ] || [ "$epoch" = "$last" ]; }; then
+        break
+    fi
+    # A consumer from a session that just ended may not be released yet; give
+    # it one 2-second chance instead of being refused. Nothing is resent
+    # either way.
+    case $status in
+    *"delivery consumer: none"*) ;;
+    *) nap 2 ;;
+    esac
+    [ -z "$stopping" ] || break
+
+    # Claude Code cuts a notification line near 500 characters and an event
+    # near 3000: keep batches at 2560 bytes and wrap lines at 480 bytes. Stay
+    # the parent so the stop line always follows.
+    airc subscribe "$session" --wake "$wake" --min-interval 15 --max-bytes 2560 --wrap 480 -- - 2>&1 &
+    child=$!
+    ran=1 last=$epoch
+    [ -z "$stopping" ] || { idle_stop=; kill -TERM "$child" 2>/dev/null; }
+    while :; do
+        wait "$child"
+        code=$?
+        kill -0 "$child" 2>/dev/null || break
+    done
+    child=
+    [ -z "$stopping" ] && [ "$code" -ne 2 ] || break
+    # Still connected in the same epoch: the live session refused or failed
+    # this consumer, which needs inspection, not another attempt.
+    now=$(airc status "$session" 2>/dev/null)
+    case $now in
+    connected\;*)
+        now=$(epoch_of "$now")
+        [ -n "$now" ] && [ "$now" != "$last" ] || break
+        ;;
+    esac
+    echo "AIRC delivery waiting: airc subscribe $session exited $code after its connection ended; this monitor subscribes again once the session is connected. Do not arm a waiter."
 done
-echo "AIRC delivery stopped: airc subscribe $session exited $status; use the airc skill's wait recipe."
+if [ -n "$idle_stop" ] || [ -z "$code" ]; then
+    echo "AIRC delivery stopped: the monitor was terminated while no airc subscribe $session was running; use the airc skill's wait recipe."
+else
+    echo "AIRC delivery stopped: airc subscribe $session exited $code; use the airc skill's wait recipe."
+fi

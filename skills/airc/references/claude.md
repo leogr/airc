@@ -68,11 +68,23 @@ message's exact text when layout matters or a record was cut or reported as
 truncated.
 
 Delivery is accepted once the batch is written to the monitor; Claude Code
-returns no receipt. If the monitor stops, it prints one line, `AIRC delivery
-stopped: airc subscribe SESSION exited N; use the airc skill's wait recipe.`,
-usually preceded by AIRC's `! …` diagnostic; a consumer killed outright prints
-none. Claude Code may then add its own "stream ended" notice, which needs no
-action. Nothing restarts the monitor. Then:
+returns no receipt. When the session's connection ends (for example, `! IRC
+disconnected; reconnect explicitly`), the monitor prints one line, `AIRC
+delivery waiting: airc subscribe SESSION exited N after its connection ended;
+…`, and keeps running. It subscribes again by itself, within its 1–30 second
+status poll, once the session is connected with a new epoch. Do not arm a
+waiter or `airc wait --deliver` then: the monitor's new consumer would be
+refused and the monitor would stop. Reconnect with `airc connect` only when
+reconnecting is yours to do; otherwise just wait.
+
+The monitor stops for good on a refusal from a connection it already
+subscribed in (another consumer, a pending batch), a usage error, or
+termination. It then prints one line, `AIRC delivery stopped: airc subscribe
+SESSION exited N; use the airc skill's wait recipe.` (or `…the monitor was
+terminated while no airc subscribe SESSION was running; …`), usually preceded
+by AIRC's `! …` diagnostic; a monitor killed outright prints none. Claude Code
+may then add its own "stream ended" notice, which needs no action. Nothing
+restarts a stopped monitor. Then:
 
 1. Run `airc status work`. If a batch is pending, run `airc deliveries work
    --show ID`. If that ID already arrived in the conversation, run `airc
@@ -92,7 +104,8 @@ Never loop restarts or start a replacement monitor yourself. The next session
 starts the monitor again. Its consumer is refused while a batch is pending, or
 once while the previous consumer has not yet been seen to close; either refusal
 shows as a stop line and takes the same recovery. When the monitor is
-terminated, the launcher forwards the termination to its consumer.
+terminated, the launcher forwards the termination to its consumer and to its
+own sleeps.
 
 Checked with Claude Code 2.1.306 and a probe plugin loaded with `--plugin-dir`.
 That probe used an earlier launcher (a fixed 2-second poll and different stop
