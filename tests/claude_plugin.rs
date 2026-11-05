@@ -429,6 +429,21 @@ fn a_reconnect_without_a_readable_epoch_is_not_treated_as_new() {
 }
 
 #[test]
+fn a_subscribe_without_a_readable_epoch_is_never_retried() {
+    let fake = Fake::new();
+    let output = fake.run(&[
+        ("AIRC_DELIVERY_SESSION", "space"),
+        ("FAKE_STATUS", "noepoch,e1"),
+        ("FAKE_MODES", "drop,hold"),
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(fake.calls(), 1);
+    assert!(waiting_lines(&stdout).is_empty());
+    assert_eq!(stop_lines(&stdout), [STOPPED_1]);
+}
+
+#[test]
 fn terminating_while_waiting_for_a_reconnect_ends_promptly() {
     let fake = Fake::new();
     let mut child = fake

@@ -87,9 +87,10 @@ it and to its own sleeps. When `subscribe` exits (other than with usage status
 2 or on termination), it reads `status` again: if the session is not
 `connected;`, or is connected with a different first-line `epoch=`, it prints
 one `AIRC delivery waiting: …` line, polls the same way and subscribes again
-with the same arguments, only in an epoch it can read and has not subscribed
-in. Otherwise it prints one `AIRC delivery stopped: …` line naming the exit
-status, or saying no subscribe was running when it was terminated outside one.
+with the same arguments, only after an attempt whose epoch it could read and
+only in a readable epoch it has not subscribed in. Otherwise it prints one
+`AIRC delivery stopped: …` line naming the exit status, or saying no subscribe
+was running when it was terminated outside one.
 It never connects or passes `--retry-pending`. [13](#source-13) [14](#source-14)
 
 [FACT] Tests cover cursors, context counts, compact omissions, settings
@@ -111,6 +112,6 @@ environment, show gaps and wrapped stdout, with fake adapters and launchers. [6]
 10. <a id="source-10"></a> [src/bin/airc-codex.rs](../../src/bin/airc-codex.rs#L1-L419) — adapter bounds, checks, queue call, receipts.
 11. <a id="source-11"></a> [tests/codex_adapter.rs](../../tests/codex_adapter.rs#L1-L319) — fake-`codex` tests; unit tests in `src/bin/airc-codex.rs` from L420.
 12. <a id="source-12"></a> [src/agent_session/mod.rs](../../src/agent_session/mod.rs#L727-L744) — `DeliverOptions::wrap`; checked at L796–803, applied at L882–885.
-13. <a id="source-13"></a> [integrations/claude-plugin/scripts/airc-delivery](../../integrations/claude-plugin/scripts/airc-delivery#L1-L101) — launcher and its resubscribe loop, run by `monitors/monitors.json`.
-14. <a id="source-14"></a> [tests/claude_plugin.rs](../../tests/claude_plugin.rs#L1-L480) — launcher tests with a fake `airc`: reconnect, same-epoch refusals, unreadable epoch, termination while polling or in the grace.
+13. <a id="source-13"></a> [integrations/claude-plugin/scripts/airc-delivery](../../integrations/claude-plugin/scripts/airc-delivery#L1-L103) — launcher and its resubscribe loop, run by `monitors/monitors.json`.
+14. <a id="source-14"></a> [tests/claude_plugin.rs](../../tests/claude_plugin.rs#L1-L495) — launcher tests with a fake `airc`: reconnect, same-epoch refusals, unreadable epoch, termination while polling or in the grace.
 15. <a id="source-15"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2390-L2475) — `subscribe_wrap_splits_long_stdout_lines_into_continuations`.

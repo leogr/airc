@@ -83,6 +83,8 @@ while :; do
     done
     child=
     [ -z "$stopping" ] && [ "$code" -ne 2 ] || break
+    # Without a readable epoch for that attempt, no later one can be proven new.
+    [ -n "$last" ] || break
     # Still connected in the same epoch: the live session refused or failed
     # this consumer, which needs inspection, not another attempt.
     now=$(airc status "$session" 2>/dev/null)
