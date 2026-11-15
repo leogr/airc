@@ -241,9 +241,10 @@ async fn route(rpc: &mut Rpc, thread: &str) -> Result<Route, String> {
             }
             match turn.get("status").and_then(Value::as_str) {
                 Some("inProgress") => {
-                    if active.replace(id).is_some() {
-                        return Err("multiple active turns reported".into());
-                    }
+                    // Descending history may retain older unfinished turns.
+                    // Keep the newest candidate; expectedTurnId and the typed
+                    // receipt still bind delivery to that exact active turn.
+                    active.get_or_insert(id);
                 }
                 Some("completed" | "failed" | "interrupted") => {}
                 _ => return Err("turn page has an unknown status".into()),

@@ -271,6 +271,61 @@ async fn active_id_is_found_through_pages_and_steered_with_expected_identity() {
 }
 
 #[tokio::test]
+async fn stale_unfinished_history_steers_only_the_newest_in_progress_turn() {
+    for paginated in [false, true] {
+        for receipt in [TURN, NEXT] {
+            let (f, listener) = Fixture::new();
+            let journal = f.journal();
+            let log = Log::default();
+            let mut steps = vec![ok("thread/read", status(THREAD, "active"))];
+            if paginated {
+                steps.push(ok(
+                    "thread/turns/list",
+                    turn_page("completed", BATCH, json!("older")),
+                ));
+            }
+            steps.extend([
+                ok(
+                    "thread/turns/list",
+                    json!({"data":[
+                        {"id":OTHER,"status":"completed"},
+                        {"id":TURN,"status":"inProgress"},
+                        {"id":NEXT,"status":"inProgress"}
+                    ],"nextCursor":null}),
+                ),
+                ok("turn/steer", json!({"turnId":receipt})),
+            ]);
+            let task = serve(&f, listener, steps, log.clone());
+            let outcome = flow(&f, &journal, true).await;
+            task.await.unwrap();
+            let attempt = journal.load(BATCH).unwrap().unwrap();
+            assert_eq!(attempt.expected_turn.as_deref(), Some(TURN));
+            if receipt == TURN {
+                assert!(matches!(outcome, Outcome::Accepted(id, "turn/steer") if id == TURN));
+                assert_eq!(attempt.phase, Phase::Accepted);
+                assert_eq!(attempt.accepted_turn.as_deref(), Some(TURN));
+            } else {
+                // A receipt naming the stale turn cannot settle this delivery.
+                assert!(matches!(outcome, Outcome::Uncertain(_)));
+                assert_eq!(attempt.phase, Phase::InFlight);
+                assert_eq!(attempt.accepted_turn, None);
+            }
+            assert_eq!(effects(&log), vec!["turn/steer"]);
+            let recorded = log.lock().unwrap();
+            let steer = recorded.last().unwrap();
+            assert_eq!(steer["params"]["expectedTurnId"], TURN);
+            for request in recorded
+                .iter()
+                .filter(|r| r["method"] == "thread/turns/list")
+            {
+                assert_eq!(request["params"]["sortDirection"], "desc");
+                assert_eq!(request["params"]["limit"], PAGE_SIZE);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn idle_becoming_busy_accepts_same_active_turn_without_a_second_submission() {
     let (f, listener) = Fixture::new();
     let journal = f.journal();
@@ -688,7 +743,7 @@ async fn journal_exclusivity_covers_the_whole_submission() {
 async fn bounded_turn_history_refuses_repeated_ids_and_unsupported_states() {
     for page in [
         turn_page("futureState", TURN, Value::Null),
-        json!({"data":[{"id":TURN,"status":"inProgress"},{"id":NEXT,"status":"inProgress"}],"nextCursor":null}),
+        json!({"data":[{"id":TURN,"status":"inProgress"},{"id":TURN,"status":"inProgress"}],"nextCursor":null}),
     ] {
         let (f, listener) = Fixture::new();
         let journal = f.journal();

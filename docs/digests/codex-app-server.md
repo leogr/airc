@@ -1,6 +1,6 @@
 # Codex app-server delivery
 
-Verification: `8a03beadfa18dfcc958711652547e1acdc3569c8` and accompanying changes.
+Verification: `6af217cfb6fe2fb05106ba592b75b9bf8225aa73` and accompanying changes.
 
 [FACT] `airc-codex --app-server --app-server-socket PATH` is separate from
 and conflicts with `--wait-for-idle`. The existing queue mode remains the
@@ -18,7 +18,8 @@ write and response each have a 5-second bound. [2](#source-2)
 
 [FACT] Initialization requests the experimental API. `thread/read` must return
 the exact assigned thread as idle or active. Idle selects `turn/start`. Active
-discovers one `inProgress` ID through at most 64 pages of 16 turns, refusing
+selects the newest `inProgress` ID in descending history through at most 64
+pages of 16 turns. Older unfinished entries do not refuse delivery. It refuses
 unsupported statuses, malformed/repeated IDs or invalid cursors, then selects
 `turn/steer` with `expectedTurnId`. Notifications and server requests, including
 approval requests, are ignored without answering or logging them. [2](#source-2)
@@ -48,7 +49,8 @@ permission they are uncertain and close only the client transport. [2](#source-2
 [3](#source-3)
 
 [FACT] Simulated Unix WebSocket tests cover routes, pagination, completion and
-replacement races, retained receipts/uncertainty, malformed answers, socket
+replacement races, stale unfinished history and exact-turn receipts, retained
+receipts/uncertainty, malformed answers, socket
 replacement, private storage and journal exclusivity. Existing queue tests stay
 in place. These tests do not establish live Codex approval routing, UI visibility
 or a processing deadline. The client answers no approval requests; approval

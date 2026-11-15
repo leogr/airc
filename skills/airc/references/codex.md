@@ -191,8 +191,9 @@ airc subscribe work --wake mentions --sink-timeout 0 -- \
 `subscribe` supplies its private state directory and batch identity directly;
 run the adapter as its direct child. It keeps the same 64 KiB limit, original
 header and sender/context text. Delivery while idle uses `turn/start`; delivery
-while active discovers the actual active turn ID, including bounded history
-pages, and uses `turn/steer` with that expected ID. No model, cwd, permission,
+while active selects the newest `inProgress` turn ID from descending bounded
+history pages, ignoring older unfinished entries, and uses `turn/steer` with
+that expected ID. Its receipt must name the same turn. No model, cwd, permission,
 approval or sandbox overrides are sent. There is no forced interrupt or command
 replay. A message accepted during a blocking tool call may be processed after
 the call completes, within the same turn; there is no response deadline.
