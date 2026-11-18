@@ -143,6 +143,39 @@ class NativeReleaseTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): r.source_members(data)
         with patch.object(r,'ARCHIVE',r.digest(data)),self.assertRaises(RuntimeError):r.source_members(data)
 
+    def test_published_tag_matches_the_committed_package_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / 'source'
+            source.mkdir()
+            manifest = source / 'Cargo.toml'
+            manifest.write_text('[package]\nname = "airc"\nversion = "0.1.3"\n')
+            (source / 'Cargo.lock').write_text('version = 4\n')
+            r.git(source, 'init', '-q', '--template=')
+            r.git(source, 'add', 'Cargo.toml', 'Cargo.lock')
+            r.git(source, '-c', 'user.name=Version fixture',
+                  '-c', 'user.email=version@example.invalid', '-c', 'commit.gpgSign=false',
+                  'commit', '-qm', 'fixture')
+            sha = r.git(source, 'rev-parse', 'HEAD')
+            path = root / 'event.json'
+
+            def event_env(tag):
+                path.write_text(json.dumps({
+                    'action': 'published', 'repository': {'full_name': 'leogr/airc'},
+                    'release': {'id': 17, 'tag_name': tag, 'draft': False},
+                }))
+                ref = f'refs/tags/{tag}'
+                return {
+                    'GITHUB_EVENT_NAME': 'release', 'GITHUB_EVENT_PATH': str(path),
+                    'GITHUB_REPOSITORY': 'leogr/airc', 'GITHUB_SHA': sha, 'SOURCE_SUBJECT': sha,
+                    'BUILD_DEFINITION': sha, 'GITHUB_WORKFLOW_SHA': sha, 'GITHUB_REF': ref,
+                    'GITHUB_WORKFLOW_REF': f'leogr/airc/.github/workflows/native-release.yml@{ref}',
+                }
+
+            self.assertEqual(r.selected_source(source, sha, event_env('v0.1.3'))['source'], sha)
+            with self.assertRaisesRegex(RuntimeError, 'differs from Cargo package version'):
+                r.selected_source(source, sha, event_env('v0.1.2'))
+
     def test_resource_guards_not_silently_lowered(self):
         with patch.object(r.shutil,'disk_usage',return_value=type('Disk',(),{'free':19*r.GIB})()):
             with self.assertRaises(RuntimeError):r.resources(Path('.'),20)

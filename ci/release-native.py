@@ -454,6 +454,9 @@ def selected_source(source, sha, env):
         event = release_event(env)
         require(sha == event['source'], 'release argument differs from actual tagged S')
         require(git(source, 'rev-parse', 'HEAD') == sha, 'release source checkout differs from S')
+        version = tomllib.loads(git(source, 'show', 'HEAD:Cargo.toml'))['package']['version']
+        require(isinstance(version, str) and event['tag'] == f'v{version}',
+                f"published release tag {event['tag']!r} differs from Cargo package version {version!r}")
         lock = source / 'Cargo.lock'
         require(lock.is_file() and not lock.is_symlink() and lock.stat().st_size <= 4 * 1024**2,
                 'bounded regular committed lockfile required')
