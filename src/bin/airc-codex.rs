@@ -734,6 +734,7 @@ esac
         });
         let started = Instant::now();
         let child = sh("sleep 30");
+        #[cfg(target_os = "linux")]
         let pid = child.id();
         let (status, _, _) = run_bounded(child, Duration::from_secs(20), &cancel);
         assert!(status.unwrap_err().contains("cancelled"));

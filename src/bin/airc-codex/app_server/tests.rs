@@ -791,6 +791,7 @@ async fn bounded_turn_history_refuses_repeated_ids_and_unsupported_states() {
     assert!(effects(&log).is_empty());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn unexpected_fifo_record_is_refused_without_waiting_for_a_writer() {
     let state = tempfile::tempdir().unwrap();
