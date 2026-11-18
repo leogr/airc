@@ -1,11 +1,13 @@
 #![cfg(unix)]
 
 //! Real adapter processes, simulated app server. No Codex conversation is used.
+#[path = "support/codex_socket.rs"]
+mod codex_socket;
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    os::unix::fs::{MetadataExt, PermissionsExt},
-    path::PathBuf,
+    os::unix::fs::PermissionsExt,
     process::Stdio,
     sync::{
         Arc,
@@ -27,48 +29,20 @@ const FIRST: &str = "0199a3b2-6c1d-7e00-8f00-000000000003";
 const SECOND: &str = "0199a3b2-6c1d-7e00-8f00-000000000004";
 
 struct Fixture {
-    socket: PathBuf,
-    socket_identity: (u64, u64),
+    socket: codex_socket::PrivateSocket,
     state: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> (Self, UnixListener) {
-        let uid = rustix::process::geteuid().as_raw();
-        let daemon = std::fs::canonicalize("/tmp")
-            .unwrap()
-            .join(format!("codex-daemon-{uid}"));
-        match std::fs::DirBuilder::new().mode(0o700).create(&daemon) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => panic!("{e}"),
-        }
-        let metadata = std::fs::symlink_metadata(&daemon).unwrap();
-        assert!(metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o777 == 0o700);
-        // Only this random fixture socket is owned/removed, never the shared
-        // daemon directory or an existing daemon's endpoint.
-        let socket = daemon.join(format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        let listener = UnixListener::bind(&socket).unwrap();
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let meta = std::fs::symlink_metadata(&socket).unwrap();
+        let (socket, listener) = codex_socket::PrivateSocket::bind();
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        (
-            Self {
-                socket,
-                socket_identity: (meta.dev(), meta.ino()),
-                state,
-            },
-            listener,
-        )
+        (Self { socket, state }, listener)
     }
     async fn child(&self, id: &str, text: &str) -> Child {
         let mut child = Command::new(env!("CARGO_BIN_EXE_airc-codex"))
             .args(["--thread", THREAD, "--app-server", "--app-server-socket"])
-            .arg(&self.socket)
+            .arg(&self.socket.path)
             .args(["--codex", "/never-spawn-codex"])
             .env("AIRC_DELIVERY_ID", id)
             .env("AIRC_SUBSCRIBER_PID", std::process::id().to_string())
@@ -102,16 +76,6 @@ impl Fixture {
             .unwrap(),
         )
         .unwrap()
-    }
-}
-use std::os::unix::fs::DirBuilderExt;
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        if std::fs::symlink_metadata(&self.socket)
-            .is_ok_and(|m| (m.dev(), m.ino()) == self.socket_identity)
-        {
-            std::fs::remove_file(&self.socket).unwrap();
-        }
     }
 }
 

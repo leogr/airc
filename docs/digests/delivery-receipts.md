@@ -1,6 +1,6 @@
 # Named delivery receipts
 
-Verification: `19db126da853896fb81d9eed2cb0295436955b5a` and accompanying changes; source anchors re-located, same symbols, at `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes.
+Verification: `19db126da853896fb81d9eed2cb0295436955b5a` and accompanying changes; source anchors re-located, same symbols, at `f5b539c057a9ab62763dbef4166f0a4a41218a3e` and accompanying changes. App-server regression verified at `84ea507836e82ea0581180e794d289523788c373` and accompanying changes.
 
 [FACT] `subscribe --receipt-timeout S --receipt-scope UUID` is opt-in: 0, the
 default, disables it; enabled values are 1–3600 seconds and at least
@@ -56,6 +56,11 @@ above the delivery floor releases it as `pressure`. Urgent events also bypass
 and ends nothing. A late report for an older record leaves a newer hold.
 [5](#source-5) [6](#source-6) [7](#source-7)
 
+[FACT] A process test drives the actual Codex adapter against a simulated
+app server. After a receipt expires, the same subscriber sends a fresh
+mention once. A later mismatched steer response stops it and retains the
+uncertain batch for inspection. [12](#source-12)
+
 [FACT] The hold is session state, honored by every consumer. A new worker
 epoch restores it for the time left until the saved UTC deadline, clamped to
 zero and the original timeout; that bounds each epoch only, so elapsed time
@@ -91,3 +96,4 @@ simulated FIFO receiver. These are mock checks, not live Codex or model runs.
 9. <a id="source-9"></a> [src/agent_session/state.rs](../../src/agent_session/state.rs#L2568-L2949) — receipt unit tests; `delivery.rs` tests at L780 and L858.
 10. <a id="source-10"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2477-L3100) — helpers that run the printed command, hold, expiry, bypass, early-report, failed-save and IPC regressions; later ones at L3486–3993.
 11. <a id="source-11"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L3102-L3484) — `replay` counting harness with drain mode, `receipt_credit_reduces_records_queued_for_a_busy_receiver` and the ignored `receipt_measurement_matrix`.
+12. <a id="source-12"></a> [tests/named_sessions.rs](../../tests/named_sessions.rs#L2827-L2983) — `app_server_subscription_survives_receipt_expiry`, fresh mention and uncertain response controls.

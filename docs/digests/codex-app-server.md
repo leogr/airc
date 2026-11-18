@@ -65,4 +65,4 @@ routing remains untested. [5](#source-5) [6](#source-6) [7](#source-7)
 5. <a id="source-5"></a> [New route tests](../../src/bin/airc-codex/app_server/tests.rs#L1) — simulated server and journal tests.
 6. <a id="source-6"></a> [Default adapter tests](../../tests/codex_adapter.rs#L1-L319) — unchanged queue route and optional wait-mode integration tests.
 
-7. <a id="source-7"></a> [Adapter process tests](../../tests/codex_app_server.rs#L125-L275) — accepted replay, ordered start/steer and SIGTERM after mutation, without a live Codex conversation.
+7. <a id="source-7"></a> [Adapter process tests](../../tests/codex_app_server.rs#L89-L239) — accepted replay, ordered start/steer and SIGTERM after mutation, without a live Codex conversation.

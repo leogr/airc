@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "support/codex_socket.rs"]
+mod codex_socket;
+
 use airc::{
     client::{self, ClientConfig},
     config::{Account, Channel, Config, Limits, token_hash, write_private},
@@ -2817,6 +2820,165 @@ async fn receipt_holds_expire_without_claiming_receipt() {
         text(&late)
     );
     f.ok(&["disconnect", "trial"]).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_server_subscription_survives_receipt_expiry() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
+
+    let f = Fixture::new();
+    let server = f.start().await;
+    let mut human = client::connect(&f.client(&server, "human")).await.unwrap();
+    f.connect(&server).await;
+    f.ok(&["read", "trial"]).await;
+
+    let (socket, listener) = codex_socket::PrivateSocket::bind();
+    let (submitted, mut submissions) = tokio::sync::mpsc::channel(3);
+    let turn = "019a0000-0000-7000-8000-00000000c0df";
+    let wrong_turn = "019a0000-0000-7000-8000-00000000c0e0";
+    let fixture = tokio::spawn(async move {
+        for (method, receipt) in [
+            (
+                "turn/start",
+                json!({"turn":{"id":turn,"status":"inProgress"}}),
+            ),
+            ("turn/steer", json!({"turnId":turn})),
+            ("turn/steer", json!({"turnId":wrong_turn})),
+        ] {
+            let (conn, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(conn).await.unwrap();
+            loop {
+                let frame = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let req: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                let op = req["method"].as_str().unwrap();
+                let result = match op {
+                    "initialize" => json!({"userAgent":"fixture"}),
+                    "initialized" => continue,
+                    "thread/read" => {
+                        assert_eq!(req["params"]["threadId"], SCOPE);
+                        let status = if method == "turn/start" {
+                            "idle"
+                        } else {
+                            "active"
+                        };
+                        json!({"thread":{"id":SCOPE,"status":{"type":status}}})
+                    }
+                    "thread/turns/list" => {
+                        assert_eq!(req["params"]["threadId"], SCOPE);
+                        json!({"data":[{"id":turn,"status":"inProgress"}],"nextCursor":null})
+                    }
+                    "turn/start" | "turn/steer" => {
+                        assert_eq!(op, method);
+                        assert_eq!(req["params"]["threadId"], SCOPE);
+                        if op == "turn/steer" {
+                            assert_eq!(req["params"]["expectedTurnId"], turn);
+                        }
+                        let text = req["params"]["input"][0]["text"].as_str().unwrap();
+                        submitted.send(text.to_owned()).await.unwrap();
+                        receipt.clone()
+                    }
+                    _ => panic!("unexpected request {op}"),
+                };
+                ws.send(WsMessage::text(
+                    json!({"id":req["id"],"result":result}).to_string(),
+                ))
+                .await
+                .unwrap();
+                if op == method {
+                    break;
+                }
+            }
+        }
+    });
+    let mut child = subscriber(
+        &f,
+        &[
+            "--wake",
+            "mentions",
+            "--receipt-timeout",
+            "3",
+            "--receipt-scope",
+            SCOPE,
+        ],
+        &[
+            env!("CARGO_BIN_EXE_airc-codex"),
+            "--thread",
+            SCOPE,
+            "--app-server",
+            "--app-server-socket",
+            socket.path.to_str().unwrap(),
+        ],
+    );
+    let pid = child.id().unwrap();
+    let registered = format!("delivery consumer: subscribe pid={pid} ");
+    eventually(|| f.ok(&["status", "trial"]), |s| s.contains(&registered)).await;
+
+    send(&mut human, "@alice expire this receipt").await;
+    let first = timeout(Duration::from_secs(15), submissions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.contains("@alice expire this receipt"), "{first}");
+    let first_id = delivery_id(&first);
+    let expired = eventually(
+        || f.ok(&["deliveries", "trial"]),
+        |s| {
+            s.lines().any(|line| {
+                line.starts_with(&format!("receipt {first_id} "))
+                    && line.contains(" received=none released=expired ")
+            })
+        },
+    )
+    .await;
+    assert!(expired.contains(&registered), "{expired}");
+
+    send(&mut human, "@alice fresh after expiry").await;
+    let fresh = timeout(Duration::from_secs(15), submissions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fresh.contains("@alice fresh after expiry"), "{fresh}");
+    assert!(!fresh.contains("@alice expire this receipt"), "{fresh}");
+    assert_ne!(delivery_id(&fresh), first_id);
+    let reported = run_notice(&f, &fresh).await;
+    assert!(reported.status.success(), "{}", text(&reported));
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(f.ok(&["status", "trial"]).await.contains(&registered));
+
+    send(&mut human, "@alice uncertain reply").await;
+    let uncertain = timeout(Duration::from_secs(15), submissions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(uncertain.contains("@alice uncertain reply"), "{uncertain}");
+    let id = delivery_id(&uncertain);
+    let stopped = timeout(Duration::from_secs(15), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status.code(), Some(1));
+    assert!(
+        text(&stopped).contains("app-server delivery uncertain"),
+        "{}",
+        text(&stopped)
+    );
+    assert!(
+        text(&stopped).contains("Nothing was replayed"),
+        "{}",
+        text(&stopped)
+    );
+    let pending = f.ok(&["deliveries", "trial"]).await;
+    assert!(pending.contains(&format!("pending={id} ")), "{pending}");
+    assert!(pending.contains("delivery consumer: none"), "{pending}");
+    let retained = f.ok(&["deliveries", "trial", "--show", &id]).await;
+    assert!(retained.contains("@alice uncertain reply"), "{retained}");
+    timeout(Duration::from_secs(5), fixture)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(submissions.recv().await.is_none());
     server.shutdown().await.unwrap();
 }
 
